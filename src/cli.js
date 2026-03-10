@@ -36,12 +36,22 @@ function parseOutput(args) {
   return idx !== -1 ? args[idx + 1] ?? null : null;
 }
 
+/**
+ * Derive the .wat output path from a .wasm path (replaces or appends extension).
+ * @param {string} wasmPath
+ * @returns {string}
+ */
+function watPathFrom(wasmPath) {
+  return wasmPath.replace(/\.wasm$/, '.wat') + (wasmPath.endsWith('.wasm') ? '' : '.wat');
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 async function cmdCompile(args) {
-  const input  = args[0];
-  const output = parseOutput(args);
-  if (!input)  die('Usage: jswat compile <input.js> -o <output.wasm>');
+  const input     = args[0];
+  const output    = parseOutput(args);
+  const emitWat   = args.includes('--emit-wat');
+  if (!input)  die('Usage: jswat compile <input.js> -o <output.wasm> [--emit-wat]');
   if (!output) die('Missing -o <output> flag');
 
   const result = await compile({ input, output });
@@ -51,6 +61,12 @@ async function cmdCompile(args) {
   mkdirSync(dirname(output), { recursive: true });
   writeFileSync(output, result.wasm);
   stdout(`Compiled ${input} → ${output}`);
+
+  if (emitWat) {
+    const watPath = watPathFrom(output);
+    writeFileSync(watPath, result.wat, 'utf8');
+    stdout(`WAT      ${input} → ${watPath}`);
+  }
 }
 
 async function cmdBuild(args) {

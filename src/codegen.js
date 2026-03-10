@@ -207,10 +207,10 @@ function genExpr(node, filename) {
  */
 function genCastInstrs(src, dst) {
   if (!src || src === dst) return [];
-  // Same WASM type — no-op
+  // Same WASM type — may still need narrow-type masking
   if (src.wasmType === dst.wasmType) {
-    // Narrow masking for sub-32-bit unsigned
-    if (dst.isInteger && dst.bits > 0 && dst.bits < 32 && !dst.isSigned) {
+    // Mask sub-32-bit integers to their declared width (wrapping semantics)
+    if (dst.isInteger && dst.bits > 0 && dst.bits < 32) {
       const mask = (1 << dst.bits) - 1;
       return [i32Const(mask), 'i32.and'];
     }
@@ -278,21 +278,16 @@ function genStatement(stmt, fnReturnType, filename) {
       const condInstrs = genExpr(stmt.test, filename);
       const hasElse    = !!stmt.alternate;
 
-      const thenStmts  = blockBody(stmt.consequent);
-      const elseStmts  = hasElse ? blockBody(stmt.alternate) : [];
-
-      // If both branches end in a ReturnStatement, generate an if/else with result type
-      const thenReturns  = endsWithReturn(stmt.consequent);
-      const elseReturns  = hasElse && endsWithReturn(stmt.alternate);
-
-      if (thenReturns && elseReturns) {
-        // Both branches return — use result-typed if/else block
+      // Use a value-producing if/else block when the function has a return type
+      // and all branches unconditionally return (handles else-if chains recursively).
+      if (hasElse && fnReturnType && toWatType(fnReturnType) &&
+          alwaysReturns(stmt.consequent) && alwaysReturns(stmt.alternate)) {
         const resType    = toWatType(fnReturnType);
-        const thenInstrs = thenStmts.flatMap(s => genReturnValue(s, filename));
-        const elseInstrs = elseStmts.flatMap(s => genReturnValue(s, filename));
+        const thenInstrs = genBranchValue(stmt.consequent, fnReturnType, filename);
+        const elseInstrs = genBranchValue(stmt.alternate,  fnReturnType, filename);
         return [
           ...condInstrs,
-          resType ? `if (result ${resType})` : 'if',
+          `if (result ${resType})`,
           ...thenInstrs.map(i => '  ' + i),
           'else',
           ...elseInstrs.map(i => '  ' + i),
@@ -301,10 +296,12 @@ function genStatement(stmt, fnReturnType, filename) {
         ];
       }
 
-      // Simple if (no result type)
-      const thenInstrs = thenStmts.flatMap(s => genStatement(s, fnReturnType, filename));
+      // Simple if (no result type needed — e.g. side-effects only, or void branch)
+      const thenInstrs = blockBody(stmt.consequent)
+        .flatMap(s => genStatement(s, fnReturnType, filename));
       if (hasElse) {
-        const elseInstrs = elseStmts.flatMap(s => genStatement(s, fnReturnType, filename));
+        const elseInstrs = blockBody(stmt.alternate)
+          .flatMap(s => genStatement(s, fnReturnType, filename));
         return [
           ...condInstrs,
           'if',
@@ -329,7 +326,7 @@ function genStatement(stmt, fnReturnType, filename) {
 
 /**
  * Get the statements inside a block or treat a single statement as a 1-element list.
- * @param {object} node
+ * @param {object|null} node
  * @returns {object[]}
  */
 function blockBody(node) {
@@ -339,30 +336,58 @@ function blockBody(node) {
 }
 
 /**
- * True if the last meaningful statement in a block is a ReturnStatement.
+ * True if a branch (block or statement) unconditionally returns in all code paths.
+ * Handles `else if` chains by recursing into IfStatement alternates.
  * @param {object|null} node
  * @returns {boolean}
  */
-function endsWithReturn(node) {
+function alwaysReturns(node) {
   if (!node) return false;
   const stmts = blockBody(node);
   if (stmts.length === 0) return false;
-  return stmts[stmts.length - 1].type === 'ReturnStatement';
+  const last = stmts[stmts.length - 1];
+  if (last.type === 'ReturnStatement') return true;
+  if (last.type === 'IfStatement' && last.alternate) {
+    return alwaysReturns(last.consequent) && alwaysReturns(last.alternate);
+  }
+  return false;
 }
 
 /**
- * Generate only the value instructions for a ReturnStatement (without the `return` op).
- * Used inside if/else blocks where the value is left on the stack.
- * @param {object} stmt
+ * Generate value instructions for a branch that unconditionally returns.
+ * Emits the VALUE only (no `return` instruction) so the result is left on the stack
+ * inside a result-typed `if` block.  Handles nested `else if` chains recursively.
+ * @param {object} node  branch node (BlockStatement or IfStatement)
+ * @param {TypeInfo} fnReturnType
  * @param {string} filename
  * @returns {string[]}
  */
-function genReturnValue(stmt, filename) {
-  if (stmt.type === 'ReturnStatement') {
-    return stmt.argument ? genExpr(stmt.argument, filename) : [];
+function genBranchValue(node, fnReturnType, filename) {
+  const instrs = [];
+  for (const s of blockBody(node)) {
+    if (s.type === 'ReturnStatement') {
+      instrs.push(...(s.argument ? genExpr(s.argument, filename) : []));
+    } else if (s.type === 'IfStatement' && alwaysReturns(s)) {
+      // Nested always-returning if — generate as a nested value-producing block
+      const resType    = toWatType(fnReturnType);
+      const condInstrs = genExpr(s.test, filename);
+      const thenInstrs = genBranchValue(s.consequent, fnReturnType, filename);
+      const elseInstrs = s.alternate
+        ? genBranchValue(s.alternate, fnReturnType, filename)
+        : [];
+      instrs.push(...condInstrs);
+      instrs.push(`if (result ${resType})`);
+      for (const i of thenInstrs) instrs.push('  ' + i);
+      if (elseInstrs.length > 0) {
+        instrs.push('else');
+        for (const i of elseInstrs) instrs.push('  ' + i);
+      }
+      instrs.push('end');
+    } else {
+      instrs.push(...genStatement(s, fnReturnType, filename));
+    }
   }
-  // Non-return statement inside a returning branch — emit it normally
-  return genStatement(stmt, null, filename);
+  return instrs;
 }
 
 // ── Top-level WAT generation ─────────────────────────────────────────────────
