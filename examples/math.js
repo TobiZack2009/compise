@@ -18,7 +18,7 @@ function min(a = 0, b = 0) {
 function abs(x = 0) {
   if (x < 0) { return -x; } else { return x; }
 }
-
+//@export("clamp")
 function clamp(val = 0, lo = 0, hi = 0) {
   if (val < lo) { return lo; }
   else if (val > hi) { return hi; }
