@@ -1,0 +1,22 @@
+{
+  "name": "jswat",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "jswat": "./src/cli.js"
+  },
+  "scripts": {
+    "check": "node ./src/cli.js check src/main.js",
+    "build": "node ./src/cli.js build src/main.js -o dist/app.wasm",
+    "test": "mocha"
+  },
+  "dependencies": {
+    "acorn": "^8.11.3",
+    "binaryen": "^116.0.0",
+    "wabt": "^1.0.35"
+  },
+  "devDependencies": {
+    "chai": "^4.4.1",
+    "mocha": "^10.2.0"
+  }
+}
