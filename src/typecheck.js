@@ -5,7 +5,7 @@
 
 import { TYPES, CAST_TYPES, PROMOTION_ORDER,
          defaultIntegerType, defaultFloatType, promoteTypes } from './types.js';
-import { resolveStdNamespace, resolveStdDefault } from './std.js';
+import { resolveStdNamespace, resolveStdDefault, resolveStdCollectionMethod, resolveStdCollectionCtor, resolveStdFunction } from './std.js';
 
 /**
  * @typedef {import('./types.js').TypeInfo} TypeInfo
@@ -516,19 +516,37 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
         // User function calls
         for (const arg of node.arguments) inferExpr(arg, scope, signatures, classes, filename, ctx);
         if (callee.type === 'Identifier') {
-          const sig = signatures.get(callee.name);
-          if (sig) {
-            t = sig.returnType ?? TYPES.void;
+          const std = resolveStdFunction(ctx.imports, callee.name);
+          if (std) {
+            t = std.returnType;
           } else {
-            t = TYPES.void;
+            const sig = signatures.get(callee.name);
+            if (sig) {
+              t = sig.returnType ?? TYPES.void;
+            } else {
+              t = TYPES.void;
+            }
           }
         } else if (callee.type === 'MemberExpression') {
           const objType = inferExpr(callee.object, scope, signatures, classes, filename, ctx);
           const methodName = callee.property?.name;
           if (callee.object.type === 'Identifier' && methodName) {
+            if (callee.object.name === 'memory' && (methodName === 'copy' || methodName === 'fill')) {
+              t = TYPES.void;
+            }
+            if (['i32','i64','f32','f64'].includes(callee.object.name)) {
+              if (methodName.startsWith('load')) t = TYPES[callee.object.name];
+              if (methodName.startsWith('store')) t = TYPES.void;
+            }
+          }
+          if (callee.object.type === 'Identifier' && methodName) {
             const ns = resolveStdNamespace(ctx.imports, callee.object.name, methodName);
             const def = resolveStdDefault(ctx.imports, callee.object.name, methodName);
             const std = ns ?? def;
+            if (std) t = std.returnType;
+          }
+          if ((!t || t === TYPES.void) && objType?.kind === 'collection' && methodName) {
+            const std = resolveStdCollectionMethod(objType.name, methodName);
             if (std) t = std.returnType;
           }
           if (!t || t === TYPES.void) {
@@ -631,11 +649,17 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
       break;
 
     case 'NewExpression':
-      if (node.callee?.type === 'Identifier' && classes.has(node.callee.name)) {
-        for (const arg of node.arguments ?? []) {
-          inferExpr(arg, scope, signatures, classes, filename, ctx);
+      if (node.callee?.type === 'Identifier') {
+        if (classes.has(node.callee.name)) {
+          for (const arg of node.arguments ?? []) {
+            inferExpr(arg, scope, signatures, classes, filename, ctx);
+          }
+          t = classes.get(node.callee.name).type;
+        } else if (ctx.imports?.get(node.callee.name)?.module === 'std/collections') {
+          t = TYPES[node.callee.name] ?? TYPES.void;
+        } else {
+          t = TYPES.void;
         }
-        t = classes.get(node.callee.name).type;
       } else {
         t = TYPES.void;
       }

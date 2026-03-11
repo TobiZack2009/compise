@@ -7,7 +7,7 @@ import { TYPES, toWatType } from './types.js';
 import { buildModule, buildFunction, memoryExport, param, local, result,
          localGet, localSet, localTee, i32Const, i64Const, f32Const, f64Const } from './wat.js';
 import { buildAllocator } from './allocator.js';
-import { collectStdStubs, resolveStdNamespace, resolveStdDefault } from './std.js';
+import { collectStdStubs, resolveStdNamespace, resolveStdDefault, resolveStdCollectionMethod, resolveStdCollectionCtor, resolveStdFunction } from './std.js';
 
 /**
  * @typedef {import('./types.js').TypeInfo} TypeInfo
@@ -138,14 +138,97 @@ function buildStdStub(name) {
 }
 
 /**
+ * Build std/mem helper functions.
+ * @returns {string[]}
+ */
+function buildMemFunctions() {
+  const allocCopy = buildFunction({
+    name: '__jswat_alloc_copy',
+    params: [param('dst', 'i32'), param('src', 'i32'), param('n', 'i32')],
+    result: '',
+    body: [
+      'local.get $dst',
+      'local.get $src',
+      'local.get $n',
+      'memory.copy',
+    ],
+  });
+
+  const allocFill = buildFunction({
+    name: '__jswat_alloc_fill',
+    params: [param('dst', 'i32'), param('value', 'i32'), param('n', 'i32')],
+    result: '',
+    body: [
+      'local.get $dst',
+      'local.get $value',
+      'local.get $n',
+      'memory.fill',
+    ],
+  });
+
+  const allocRealloc = buildFunction({
+    name: '__jswat_alloc_realloc',
+    params: [param('ptr', 'i32'), param('newSize', 'i32')],
+    result: 'i32',
+    locals: [local('newPtr', 'i32')],
+    body: [
+      'local.get $newSize',
+      i32Const(0),
+      'call $__jswat_alloc_bytes',
+      'local.set $newPtr',
+      'local.get $newPtr',
+      'local.get $ptr',
+      'local.get $newSize',
+      'memory.copy',
+      'local.get $newPtr',
+    ],
+  });
+
+  const ptrFromAddr = buildFunction({
+    name: '__jswat_ptr_from_addr',
+    params: [param('addr', 'i32')],
+    result: 'i32',
+    body: ['local.get $addr'],
+  });
+
+  const ptrDiff = buildFunction({
+    name: '__jswat_ptr_diff',
+    params: [param('a', 'i32'), param('b', 'i32')],
+    result: 'i32',
+    body: [
+      'local.get $a',
+      'local.get $b',
+      'i32.sub',
+    ],
+  });
+
+  return [allocCopy, allocFill, allocRealloc, ptrFromAddr, ptrDiff];
+}
+
+/**
  * Build WASI fd_write import when std/io is used.
  * @returns {string[]}
  */
-function buildWasiImports() {
-  return [
-    '(import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))',
-    '(import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))',
-  ];
+function buildWasiImports(hasIo, hasFs, hasClock, hasRandom) {
+  const imports = [];
+  if (hasIo || hasFs) {
+    imports.push('(import "wasi_snapshot_preview1" "fd_write" (func $fd_write (param i32 i32 i32 i32) (result i32)))');
+    imports.push('(import "wasi_snapshot_preview1" "fd_read" (func $fd_read (param i32 i32 i32 i32) (result i32)))');
+  }
+  if (hasFs) {
+    imports.push('(import "wasi_snapshot_preview1" "fd_close" (func $fd_close (param i32) (result i32)))');
+    imports.push('(import "wasi_snapshot_preview1" "path_open" (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))');
+    imports.push('(import "wasi_snapshot_preview1" "path_filestat_get" (func $path_filestat_get (param i32 i32 i32 i32 i32) (result i32)))');
+    imports.push('(import "wasi_snapshot_preview1" "path_create_directory" (func $path_create_directory (param i32 i32 i32) (result i32)))');
+    imports.push('(import "wasi_snapshot_preview1" "path_unlink_file" (func $path_unlink_file (param i32 i32 i32) (result i32)))');
+  }
+  if (hasClock) {
+    imports.push('(import "wasi_snapshot_preview1" "clock_time_get" (func $clock_time_get (param i32 i64 i32) (result i32)))');
+  }
+  if (hasRandom) {
+    imports.push('(import "wasi_snapshot_preview1" "random_get" (func $random_get (param i32 i32) (result i32)))');
+  }
+  return imports;
 }
 
 /**
@@ -409,7 +492,89 @@ function buildIoFunctions(ioBase) {
     name: '__jswat_stdin_read_line',
     params: [],
     result: 'i32',
-    body: ['call $__jswat_stdin_read_all'],
+    locals: [
+      local('buf', 'i32'),
+      local('total', 'i32'),
+      local('nread', 'i32'),
+      local('str', 'i32'),
+      local('ch', 'i32'),
+    ],
+    body: [
+      i32Const(1024),
+      i32Const(0),
+      'call $__jswat_alloc_bytes',
+      'local.set $buf',
+      i32Const(0),
+      'local.set $total',
+      'block $done',
+      '  loop $read',
+      i32Const(ioBase + 16),
+      '    local.get $buf',
+      '    local.get $total',
+      '    i32.add',
+      '    i32.store',
+      i32Const(ioBase + 20),
+      i32Const(1),
+      '    i32.store',
+      i32Const(0),
+      i32Const(ioBase + 16),
+      i32Const(1),
+      i32Const(ioBase + 24),
+      '    call $fd_read',
+      '    drop',
+      i32Const(ioBase + 24),
+      '    i32.load',
+      '    local.set $nread',
+      '    local.get $nread',
+      '    i32.eqz',
+      '    br_if $done',
+      '    local.get $buf',
+      '    local.get $total',
+      '    i32.add',
+      '    i32.load8_u',
+      '    local.set $ch',
+      '    local.get $ch',
+      i32Const(10),
+      '    i32.eq',
+      '    br_if $done',
+      '    local.get $total',
+      i32Const(1),
+      '    i32.add',
+      '    local.set $total',
+      '    local.get $total',
+      i32Const(1024),
+      '    i32.ge_u',
+      '    br_if $done',
+      '    br $read',
+      '  end',
+      'end',
+      'local.get $total',
+      'i32.eqz',
+      'if',
+      i32Const(0),
+      '  return',
+      'end',
+      'local.get $total',
+      i32Const(8),
+      'i32.add',
+      'call $__jswat_alloc',
+      'local.set $str',
+      'local.get $str',
+      'local.get $total',
+      'i32.store',
+      'local.get $str',
+      i32Const(4),
+      'i32.add',
+      i32Const(0),
+      'i32.store',
+      'local.get $str',
+      i32Const(8),
+      'i32.add',
+      'local.get $buf',
+      'local.get $total',
+      'memory.copy',
+      'local.get $str',
+    ],
   });
 
   return [
@@ -424,6 +589,374 @@ function buildIoFunctions(ioBase) {
     stdinReadLine,
     stdinReadAll,
   ];
+}
+
+/**
+ * Build std/fs implementations backed by WASI.
+ * @param {number} fsBase
+ * @returns {string[]}
+ */
+function buildFsFunctions(fsBase) {
+  const openForRead = [
+    i32Const(3),
+    i32Const(0),
+    'local.get $path',
+    i32Const(8),
+    'i32.add',
+    'local.get $path',
+    'i32.load',
+    i32Const(0),
+    'i64.const 511',
+    'i64.const 511',
+    i32Const(0),
+    i32Const(fsBase),
+    'call $path_open',
+  ];
+
+  const fsRead = buildFunction({
+    name: '__jswat_fs_read',
+    params: [param('path', 'i32')],
+    result: 'i32',
+    locals: [local('fd', 'i32'), local('buf', 'i32'), local('nread', 'i32'), local('str', 'i32')],
+    body: [
+      ...openForRead,
+      'i32.const 0',
+      'i32.ne',
+      'if',
+      i32Const(0),
+      '  return',
+      'end',
+      i32Const(fsBase),
+      'i32.load',
+      'local.set $fd',
+      i32Const(4096),
+      i32Const(0),
+      'call $__jswat_alloc_bytes',
+      'local.set $buf',
+      i32Const(fsBase + 4),
+      'local.get $buf',
+      'i32.store',
+      i32Const(fsBase + 8),
+      i32Const(4096),
+      'i32.store',
+      'local.get $fd',
+      i32Const(fsBase + 4),
+      i32Const(1),
+      i32Const(fsBase + 12),
+      'call $fd_read',
+      'drop',
+      i32Const(fsBase + 12),
+      'i32.load',
+      'local.set $nread',
+      'local.get $fd',
+      'call $fd_close',
+      'drop',
+      'local.get $nread',
+      'i32.eqz',
+      'if',
+      i32Const(0),
+      '  return',
+      'end',
+      'local.get $nread',
+      i32Const(8),
+      'i32.add',
+      'call $__jswat_alloc',
+      'local.set $str',
+      'local.get $str',
+      'local.get $nread',
+      'i32.store',
+      'local.get $str',
+      i32Const(4),
+      'i32.add',
+      i32Const(0),
+      'i32.store',
+      'local.get $str',
+      i32Const(8),
+      'i32.add',
+      'local.get $buf',
+      'local.get $nread',
+      'memory.copy',
+      'local.get $str',
+    ],
+  });
+
+  const fsWrite = buildFunction({
+    name: '__jswat_fs_write',
+    params: [param('path', 'i32'), param('content', 'i32')],
+    result: 'i32',
+    locals: [local('fd', 'i32')],
+    body: [
+      i32Const(3),
+      i32Const(0),
+      'local.get $path',
+      i32Const(8),
+      'i32.add',
+      'local.get $path',
+      'i32.load',
+      i32Const(9),
+      'i64.const 511',
+      'i64.const 511',
+      i32Const(0),
+      i32Const(fsBase),
+      'call $path_open',
+      'i32.const 0',
+      'i32.ne',
+      'if',
+      i32Const(0),
+      '  return',
+      'end',
+      i32Const(fsBase),
+      'i32.load',
+      'local.set $fd',
+      i32Const(fsBase + 4),
+      'local.get $content',
+      i32Const(8),
+      'i32.add',
+      'i32.store',
+      i32Const(fsBase + 8),
+      'local.get $content',
+      'i32.load',
+      'i32.store',
+      'local.get $fd',
+      i32Const(fsBase + 4),
+      i32Const(1),
+      i32Const(fsBase + 12),
+      'call $fd_write',
+      'drop',
+      'local.get $fd',
+      'call $fd_close',
+      'drop',
+      i32Const(1),
+    ],
+  });
+
+  const fsAppend = buildFunction({
+    name: '__jswat_fs_append',
+    params: [param('path', 'i32'), param('content', 'i32')],
+    result: 'i32',
+    locals: [local('fd', 'i32')],
+    body: [
+      i32Const(3),
+      i32Const(0),
+      'local.get $path',
+      i32Const(8),
+      'i32.add',
+      'local.get $path',
+      'i32.load',
+      i32Const(1),
+      'i64.const 511',
+      'i64.const 511',
+      i32Const(1),
+      i32Const(fsBase),
+      'call $path_open',
+      'i32.const 0',
+      'i32.ne',
+      'if',
+      i32Const(0),
+      '  return',
+      'end',
+      i32Const(fsBase),
+      'i32.load',
+      'local.set $fd',
+      i32Const(fsBase + 4),
+      'local.get $content',
+      i32Const(8),
+      'i32.add',
+      'i32.store',
+      i32Const(fsBase + 8),
+      'local.get $content',
+      'i32.load',
+      'i32.store',
+      'local.get $fd',
+      i32Const(fsBase + 4),
+      i32Const(1),
+      i32Const(fsBase + 12),
+      'call $fd_write',
+      'drop',
+      'local.get $fd',
+      'call $fd_close',
+      'drop',
+      i32Const(1),
+    ],
+  });
+
+  const fsExists = buildFunction({
+    name: '__jswat_fs_exists',
+    params: [param('path', 'i32')],
+    result: 'i32',
+    body: [
+      i32Const(3),
+      i32Const(0),
+      'local.get $path',
+      i32Const(8),
+      'i32.add',
+      'local.get $path',
+      'i32.load',
+      i32Const(fsBase + 32),
+      'call $path_filestat_get',
+      'i32.eqz',
+    ],
+  });
+
+  const fsDelete = buildFunction({
+    name: '__jswat_fs_delete',
+    params: [param('path', 'i32')],
+    result: 'i32',
+    body: [
+      i32Const(3),
+      'local.get $path',
+      i32Const(8),
+      'i32.add',
+      'local.get $path',
+      'i32.load',
+      'call $path_unlink_file',
+      'i32.eqz',
+    ],
+  });
+
+  const fsMkdir = buildFunction({
+    name: '__jswat_fs_mkdir',
+    params: [param('path', 'i32')],
+    result: 'i32',
+    body: [
+      i32Const(3),
+      'local.get $path',
+      i32Const(8),
+      'i32.add',
+      'local.get $path',
+      'i32.load',
+      'call $path_create_directory',
+      'i32.eqz',
+    ],
+  });
+
+  const fsReaddir = buildFunction({
+    name: '__jswat_fs_readdir',
+    params: [param('path', 'i32')],
+    result: 'i32',
+    body: [i32Const(0)],
+  });
+
+  return [fsRead, fsWrite, fsAppend, fsExists, fsDelete, fsMkdir, fsReaddir];
+}
+
+/**
+ * Build std/clock implementations backed by WASI clock_time_get.
+ * @param {number} clockBase
+ * @returns {string[]}
+ */
+function buildClockFunctions(clockBase) {
+  const clockNow = buildFunction({
+    name: '__jswat_clock_now',
+    params: [],
+    result: 'i32',
+    body: [
+      i32Const(0),
+      'i64.const 0',
+      i32Const(clockBase),
+      'call $clock_time_get',
+      'drop',
+      i32Const(clockBase),
+      'i64.load',
+      'i64.const 1000000',
+      'i64.div_u',
+      'i32.wrap_i64',
+    ],
+  });
+
+  const clockMonotonic = buildFunction({
+    name: '__jswat_clock_monotonic',
+    params: [],
+    result: 'i32',
+    body: [
+      i32Const(1),
+      'i64.const 0',
+      i32Const(clockBase),
+      'call $clock_time_get',
+      'drop',
+      i32Const(clockBase),
+      'i64.load',
+      'i32.wrap_i64',
+    ],
+  });
+
+  const clockSleep = buildFunction({
+    name: '__jswat_clock_sleep',
+    params: [param('ms', 'i32')],
+    result: '',
+    body: [],
+  });
+
+  return [clockNow, clockMonotonic, clockSleep];
+}
+
+/**
+ * Build std/random implementations backed by WASI random_get with seed fallback.
+ * @param {number} randomBase
+ * @returns {{ globals: string[], functions: string[] }}
+ */
+function buildRandomFunctions(randomBase) {
+  const globals = ['(global $__jswat_rng_state (mut i32) (i32.const 0))'];
+
+  const seedFn = buildFunction({
+    name: '__jswat_random_seed',
+    params: [param('s', 'i32')],
+    result: '',
+    body: [
+      'local.get $s',
+      'global.set $__jswat_rng_state',
+    ],
+  });
+
+  const floatFn = buildFunction({
+    name: '__jswat_random_float',
+    params: [],
+    result: 'f64',
+    locals: [local('state', 'i32')],
+    body: [
+      'global.get $__jswat_rng_state',
+      'local.tee $state',
+      'i32.eqz',
+      'if',
+      i32Const(randomBase),
+      i32Const(8),
+      'call $random_get',
+      'drop',
+      i32Const(randomBase),
+      'i64.load',
+      'f64.convert_i64_u',
+      'f64.const 18446744073709551616',
+      'f64.div',
+      'return',
+      'end',
+      'local.get $state',
+      'local.get $state',
+      i32Const(13),
+      'i32.shl',
+      'i32.xor',
+      'local.set $state',
+      'local.get $state',
+      'local.get $state',
+      i32Const(17),
+      'i32.shr_u',
+      'i32.xor',
+      'local.set $state',
+      'local.get $state',
+      'local.get $state',
+      i32Const(5),
+      'i32.shl',
+      'i32.xor',
+      'local.set $state',
+      'local.get $state',
+      'global.set $__jswat_rng_state',
+      'local.get $state',
+      'f64.convert_i32_u',
+      'f64.const 4294967296',
+      'f64.div',
+    ],
+  });
+
+  return { globals, functions: [seedFn, floatFn] };
 }
 
 /**
@@ -591,6 +1124,30 @@ export function collectLocals(body, params) {
 // ── Expression code generation ───────────────────────────────────────────────
 
 /**
+ * Emit a std/wasm intrinsic call.
+ * @param {string} fnName
+ * @param {object[]} args
+ * @param {string} filename
+ * @param {GenContext} ctx
+ * @returns {string[]}
+ */
+function genWasmIntrinsicCall(fnName, args, filename, ctx) {
+  const op = fnName.replace('_', '.');
+  const isLoad = fnName.includes('_load');
+  const isStore = fnName.includes('_store');
+  if (isLoad || isStore) {
+    const addrInstrs = genExpr(args[0], filename, ctx);
+    const offsetInstrs = args[1] ? genExpr(args[1], filename, ctx) : [i32Const(0)];
+    const addr = [...addrInstrs, ...offsetInstrs, 'i32.add'];
+    if (isLoad) return [...addr, op];
+    const valueInstrs = args[2] ? genExpr(args[2], filename, ctx) : [i32Const(0)];
+    return [...addr, ...valueInstrs, op];
+  }
+  const argInstrs = args.flatMap(arg => genExpr(arg, filename, ctx));
+  return [...argInstrs, op];
+}
+
+/**
  * Generate WAT instructions for an expression (stack-based postfix order).
  * @param {object} node
  * @param {string} filename
@@ -668,6 +1225,14 @@ function genExpr(node, filename, ctx) {
           const convInstrs = genCastInstrs(srcType, castTarget);
           return [...argInstrs, ...convInstrs];
         }
+        const stdFn = resolveStdFunction(ctx._imports, callee.name);
+        if (stdFn?.intrinsic) {
+          return genWasmIntrinsicCall(callee.name, node.arguments, filename, ctx);
+        }
+        if (stdFn?.stub) {
+          const argInstrs = node.arguments.flatMap(arg => genExpr(arg, filename, ctx));
+          return [...argInstrs, `call $${stdFn.stub}`];
+        }
         const argInstrs = node.arguments.flatMap(arg => genExpr(arg, filename, ctx));
         return [...argInstrs, `call $${callee.name}`];
       }
@@ -675,6 +1240,25 @@ function genExpr(node, filename, ctx) {
         const methodName = callee.property?.name;
         const objType = callee.object?._type;
         const className = objType?.kind === 'class' ? objType.name : null;
+        if (callee.object.type === 'Identifier' && methodName) {
+          if (callee.object.name === 'memory' && (methodName === 'copy' || methodName === 'fill')) {
+            const argInstrs = node.arguments.flatMap(arg => genExpr(arg, filename, ctx));
+            return [...argInstrs, `memory.${methodName}`];
+          }
+          if (['i32','i64','f32','f64'].includes(callee.object.name)) {
+            const argInstrs = node.arguments.flatMap(arg => genExpr(arg, filename, ctx));
+            const op = `${callee.object.name}.${methodName}`;
+            return [...argInstrs, op];
+          }
+        }
+        if (objType?.kind === 'collection' && methodName) {
+          const std = resolveStdCollectionMethod(objType.name, methodName);
+          if (std) {
+            const objInstrs = genExpr(callee.object, filename, ctx);
+            const argInstrs = node.arguments.flatMap(arg => genExpr(arg, filename, ctx));
+            return [...objInstrs, ...argInstrs, `call $${std.stub}`];
+          }
+        }
         if (callee.object.type === 'Identifier' && methodName) {
           const ns = resolveStdNamespace(ctx._imports, callee.object.name, methodName);
           const def = resolveStdDefault(ctx._imports, callee.object.name, methodName);
@@ -806,6 +1390,10 @@ function genExpr(node, filename, ctx) {
     case 'NewExpression': {
       if (node.callee?.type === 'Identifier') {
         const className = node.callee.name;
+        const ctor = resolveStdCollectionCtor(className);
+        if (ctor) {
+          return [`call $${ctor}`];
+        }
         const layout = ctx._layouts.get(className);
         if (!layout) throw new CodegenError(`Unknown class '${className}' (${filename})`);
         const allocInstrs = [i32Const(layout.size), 'call $__alloc'];
@@ -1201,6 +1789,19 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
     stdStubs.has('__jswat_stdin_read') ||
     stdStubs.has('__jswat_stdin_read_line') ||
     stdStubs.has('__jswat_stdin_read_all');
+  const hasFs = stdStubs.has('__jswat_fs_read') ||
+    stdStubs.has('__jswat_fs_write') ||
+    stdStubs.has('__jswat_fs_append') ||
+    stdStubs.has('__jswat_fs_exists') ||
+    stdStubs.has('__jswat_fs_delete') ||
+    stdStubs.has('__jswat_fs_mkdir') ||
+    stdStubs.has('__jswat_fs_readdir');
+  const hasClock = stdStubs.has('__jswat_clock_now') ||
+    stdStubs.has('__jswat_clock_monotonic') ||
+    stdStubs.has('__jswat_clock_sleep');
+  const hasRandom = stdStubs.has('__jswat_random_float') ||
+    stdStubs.has('__jswat_random_seed');
+  const hasMem = Array.from(stdStubs).some(name => name.startsWith('__jswat_alloc_') || name.startsWith('__jswat_ptr_'));
   const topLevelStmts = ast.body.filter(n =>
     n.type !== 'FunctionDeclaration' &&
     n.type !== 'ClassDeclaration' &&
@@ -1226,12 +1827,42 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
         (stub.includes('console') || stub.includes('stdout') || stub.includes('stderr') || stub.includes('stdin'))) {
       continue;
     }
+    if (hasFs && stub.startsWith('__jswat_fs_')) {
+      continue;
+    }
+    if (hasClock && stub.startsWith('__jswat_clock_')) {
+      continue;
+    }
+    if (hasRandom && stub.startsWith('__jswat_random_')) {
+      continue;
+    }
+    if (hasMem && (stub.startsWith('__jswat_alloc_') || stub.startsWith('__jswat_ptr_'))) {
+      continue;
+    }
     functions.push(buildStdStub(stub));
   }
 
+  const ioBase = Math.max(Math.ceil(stringTable.size / 16) * 16, 256);
   if (hasIo) {
-    const ioBase = Math.max(Math.ceil(stringTable.size / 16) * 16, 64);
     functions.push(...buildIoFunctions(ioBase));
+  }
+  if (hasFs) {
+    const fsBase = ioBase + 64;
+    functions.push(...buildFsFunctions(fsBase));
+  }
+  let extraGlobals = [];
+  if (hasClock) {
+    const clockBase = ioBase + 128;
+    functions.push(...buildClockFunctions(clockBase));
+  }
+  if (hasRandom) {
+    const randomBase = ioBase + 192;
+    const random = buildRandomFunctions(randomBase);
+    extraGlobals = extraGlobals.concat(random.globals);
+    for (const fn of random.functions) functions.push(fn);
+  }
+  if (hasMem) {
+    functions.push(...buildMemFunctions());
   }
 
   for (const fn of allocFunctions) functions.push(fn);
@@ -1265,8 +1896,8 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
 
   return buildModule({
     memories:  [memoryExport(1)],
-    globals:   allocGlobals,
-    imports:   hasIo ? buildWasiImports() : [],
+    globals:   allocGlobals.concat(extraGlobals),
+    imports:   (hasIo || hasFs || hasClock || hasRandom) ? buildWasiImports(hasIo, hasFs, hasClock, hasRandom) : [],
     data:      stringTable.data,
     functions,
   });

@@ -46,6 +46,13 @@ const TYPE_REGISTRY = {
   bool: t({ kind: 'bool', name: 'bool', nullable: false, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
   str:  t({ kind: 'str',  name: 'str',  nullable: false, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
   void: t({ kind: 'void', name: 'void', nullable: false, abstract: false, wasmType: '',    isInteger: false, isFloat: false, isSigned: false, bits: 0  }),
+
+  // std/collections opaque handles
+  Map:   t({ kind: 'collection', name: 'Map',   nullable: true, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
+  Set:   t({ kind: 'collection', name: 'Set',   nullable: true, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
+  Queue: t({ kind: 'collection', name: 'Queue', nullable: true, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
+  Stack: t({ kind: 'collection', name: 'Stack', nullable: true, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
+  Deque: t({ kind: 'collection', name: 'Deque', nullable: true, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
 };
 
 export const TYPES = TYPE_REGISTRY;
