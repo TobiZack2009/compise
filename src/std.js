@@ -272,6 +272,10 @@ export function collectStdStubs(imports) {
       if (ns) {
         for (const fn of Object.values(ns)) if (fn.stub) stubs.add(fn.stub);
       }
+      if (info.module === 'std/collections') {
+        const ctor = resolveStdCollectionCtor(info.name);
+        if (ctor) stubs.add(ctor);
+      }
       const direct = STD_FUNCTIONS[info.module]?.[info.name];
       if (direct?.stub) stubs.add(direct.stub);
     } else if (info.kind === 'default') {
