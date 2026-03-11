@@ -17,7 +17,10 @@ function t(obj) { return Object.freeze(obj); }
  * All js.wat types, keyed by name.
  * @type {Readonly<Record<string, TypeInfo>>}
  */
-export const TYPES = Object.freeze({
+const TYPE_REGISTRY = {
+  // Bottom type for fixpoint inference — should never reach codegen.
+  unknown: t({ kind: 'unknown', name: 'unknown', nullable: false, abstract: false, wasmType: '', isInteger: false, isFloat: false, isSigned: false, bits: 0 }),
+
   // Abstract numeric supertypes — constraint use only, never instantiated
   Number:  t({ kind: 'abstract', name: 'Number',  nullable: false, abstract: true,  wasmType: '',    isInteger: false, isFloat: false, isSigned: false, bits: 0  }),
   Integer: t({ kind: 'abstract', name: 'Integer', nullable: false, abstract: true,  wasmType: '',    isInteger: true,  isFloat: false, isSigned: false, bits: 0  }),
@@ -43,7 +46,9 @@ export const TYPES = Object.freeze({
   bool: t({ kind: 'bool', name: 'bool', nullable: false, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
   str:  t({ kind: 'str',  name: 'str',  nullable: false, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
   void: t({ kind: 'void', name: 'void', nullable: false, abstract: false, wasmType: '',    isInteger: false, isFloat: false, isSigned: false, bits: 0  }),
-});
+};
+
+export const TYPES = TYPE_REGISTRY;
 
 /**
  * Promotion order from lowest to highest precision.
@@ -79,6 +84,8 @@ export function defaultFloatType() { return TYPES.f64; }
 export function promoteTypes(a, b) {
   if (!a || !b) return null;
   if (a === b) return a;
+  if (a.kind === 'unknown') return b;
+  if (b.kind === 'unknown') return a;
   if (a.abstract || b.abstract) return null;
   if (a.kind === 'bool' || b.kind === 'bool') return null;
   if (a.kind === 'str'  || b.kind === 'str')  return null;

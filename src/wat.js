@@ -146,11 +146,12 @@ export function buildFunction({ name, params: funcParams = [], result: funcResul
  * @returns {string}
  */
 export function buildModule({ memories = [], functions = [], exports: modExports = [],
-                               imports: modImports = [], globals = [] } = {}) {
+                               imports: modImports = [], globals = [], data = [] } = {}) {
   const lines = ['(module'];
+  for (const imp of modImports) lines.push('  ' + imp);
   for (const m of memories)    lines.push('  ' + m);
   for (const g of globals)     lines.push('  ' + g);
-  for (const imp of modImports) lines.push('  ' + imp);
+  for (const d of data)        lines.push('  ' + d);
   for (const fn of functions) {
     for (const l of fn.split('\n')) lines.push('  ' + l);
   }

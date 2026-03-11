@@ -75,14 +75,14 @@ export async function compileSource(source, filename = '<input>', opts = {}) {
   const { warnings } = validate(ast, filename);
 
   // 3. Type-check
-  const { ast: typedAst, signatures } = inferTypes(ast, filename);
+  const { ast: typedAst, signatures, classes, imports } = inferTypes(ast, filename);
 
   if (checkOnly) {
     return { wat: '', wasm: null, warnings };
   }
 
   // 4. Code generation
-  const wat = generateWat(typedAst, signatures, filename);
+  const wat = generateWat(typedAst, signatures, classes, imports, filename);
 
   // 5. Assemble
   const wasm = await watToWasm(wat, filename.replace(/\.js$/, '.wat'));

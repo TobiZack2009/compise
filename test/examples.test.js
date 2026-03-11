@@ -12,10 +12,11 @@ import { compileSource } from '../src/compiler.js';
  * @param {string} path  path relative to project root
  * @returns {Promise<WebAssembly.Exports>}
  */
-async function instantiateFile(path) {
+async function instantiateFile(path, importObject = undefined) {
   const source = await readFile(new URL('../' + path, import.meta.url), 'utf8');
   const { wasm } = await compileSource(source, path);
-  const { instance } = await WebAssembly.instantiate(wasm);
+  const { instance } = await WebAssembly.instantiate(wasm, importObject);
+  if (instance.exports.__start) instance.exports.__start();
   return instance.exports;
 }
 
@@ -27,6 +28,7 @@ async function instantiateFile(path) {
 async function instantiate(source) {
   const { wasm } = await compileSource(source);
   const { instance } = await WebAssembly.instantiate(wasm);
+  if (instance.exports.__start) instance.exports.__start();
   return instance.exports;
 }
 
@@ -185,7 +187,16 @@ describe('--emit-wat / WAT output', () => {
 
 describe('section 21 examples (Phase 2+)', () => {
 
-  it.skip('21-hello-world.js — requires std/io');
+  it('21-hello-world.js — requires std/io', async () => {
+    const importObject = {
+      wasi_snapshot_preview1: {
+        fd_write: () => 0,
+        fd_read: () => 0,
+      },
+    };
+    const exp = await instantiateFile('examples/21-hello-world.js', importObject);
+    assert.ok(exp, 'expected WASM exports');
+  });
   it.skip('21-fizzbuzz.js    — requires std/io, std/string, std/range, for-of');
   it.skip('21-fibonacci.js   — requires classes, Symbol traits, for-of');
   it.skip('21-stack.js       — requires classes, private fields, arrays');
