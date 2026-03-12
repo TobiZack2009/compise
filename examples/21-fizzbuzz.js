@@ -6,8 +6,8 @@ import { Range } from "std/range";
 for (const i of new Range(1, 101)) {
   const fizz = i % 3 === 0;
   const buzz = i % 5 === 0;
-  if (fizz && buzz) console.log("FizzBuzz");
-  else if (fizz)    console.log("Fizz");
-  else if (buzz)    console.log("Buzz");
+  if (fizz && buzz) console.log("\nFizzBuzz");
+  else if (fizz)    console.log("\nFizz");
+  else if (buzz)    console.log("\nBuzz");
   else              console.log(String.from(i));
 }

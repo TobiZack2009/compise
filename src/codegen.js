@@ -206,6 +206,146 @@ function buildMemFunctions() {
 }
 
 /**
+ * Build std/string implementations.
+ * @returns {string[]}
+ */
+function buildStringFunctions() {
+  const fromI32 = buildFunction({
+    name: '__jswat_string_from_i32',
+    params: [param('value', 'i32')],
+    result: 'i32',
+    locals: [
+      local('abs', 'i32'),
+      local('tmp', 'i32'),
+      local('len', 'i32'),
+      local('ptr', 'i32'),
+      local('isNeg', 'i32'),
+      local('write', 'i32'),
+    ],
+    body: [
+      'local.get $value',
+      'local.set $abs',
+      'local.get $value',
+      i32Const(0),
+      'i32.lt_s',
+      'if',
+      '  i32.const 1',
+      '  local.set $isNeg',
+      '  local.get $value',
+      '  i32.const -1',
+      '  i32.mul',
+      '  local.set $abs',
+      'else',
+      '  i32.const 0',
+      '  local.set $isNeg',
+      'end',
+      'local.get $abs',
+      'i32.eqz',
+      'if',
+      '  i32.const 1',
+      '  local.set $len',
+      'else',
+      '  i32.const 0',
+      '  local.set $len',
+      '  local.get $abs',
+      '  local.set $tmp',
+      '  block $count_done',
+      '    loop $count',
+      '      local.get $tmp',
+      '      i32.eqz',
+      '      br_if $count_done',
+      '      local.get $tmp',
+      i32Const(10),
+      '      i32.div_u',
+      '      local.set $tmp',
+      '      local.get $len',
+      i32Const(1),
+      '      i32.add',
+      '      local.set $len',
+      '      br $count',
+      '    end',
+      '  end',
+      'end',
+      'local.get $isNeg',
+      'if',
+      '  local.get $len',
+      i32Const(1),
+      '  i32.add',
+      '  local.set $len',
+      'end',
+      'local.get $len',
+      i32Const(8),
+      'i32.add',
+      i32Const(0),
+      'call $__jswat_alloc_bytes',
+      'local.set $ptr',
+      'local.get $ptr',
+      'local.get $len',
+      'i32.store',
+      'local.get $ptr',
+      i32Const(0),
+      'i32.store offset=4',
+      'local.get $ptr',
+      i32Const(8),
+      'i32.add',
+      'local.get $len',
+      'i32.add',
+      i32Const(1),
+      'i32.sub',
+      'local.set $write',
+      'local.get $abs',
+      'i32.eqz',
+      'if',
+      '  local.get $write',
+      i32Const(48),
+      '  i32.store8',
+      '  local.get $write',
+      i32Const(1),
+      '  i32.sub',
+      '  local.set $write',
+      'else',
+      '  local.get $abs',
+      '  local.set $tmp',
+      '  block $write_done',
+      '    loop $write_loop',
+      '      local.get $tmp',
+      '      i32.eqz',
+      '      br_if $write_done',
+      '      local.get $write',
+      '      local.get $tmp',
+      i32Const(10),
+      '      i32.rem_u',
+      i32Const(48),
+      '      i32.add',
+      '      i32.store8',
+      '      local.get $write',
+      i32Const(1),
+      '      i32.sub',
+      '      local.set $write',
+      '      local.get $tmp',
+      i32Const(10),
+      '      i32.div_u',
+      '      local.set $tmp',
+      '      br $write_loop',
+      '    end',
+      '  end',
+      'end',
+      'local.get $isNeg',
+      'if',
+      '  local.get $ptr',
+      i32Const(8),
+      '  i32.add',
+      i32Const(45),
+      '  i32.store8',
+      'end',
+      'local.get $ptr',
+    ],
+  });
+
+  return [fromI32];
+}
+
+/**
  * Build std/collections implementations.
  * @returns {string[]}
  */
@@ -445,6 +585,25 @@ function buildCollectionsFunctions() {
   }));
 
   funcs.push(buildFunction({
+    name: '__jswat_map_clear',
+    params: [param('map', 'i32')],
+    result: '',
+    body: [
+      'local.get $map',
+      'i32.eqz',
+      'if',
+      '  return',
+      'end',
+      'local.get $map',
+      i32Const(0),
+      'i32.store offset=4',
+      'local.get $map',
+      i32Const(0),
+      'i32.store offset=8',
+    ],
+  }));
+
+  funcs.push(buildFunction({
     name: '__jswat_set_new',
     params: [],
     result: 'i32',
@@ -632,6 +791,25 @@ function buildCollectionsFunctions() {
   }));
 
   funcs.push(buildFunction({
+    name: '__jswat_set_clear',
+    params: [param('set', 'i32')],
+    result: '',
+    body: [
+      'local.get $set',
+      'i32.eqz',
+      'if',
+      '  return',
+      'end',
+      'local.get $set',
+      i32Const(0),
+      'i32.store offset=4',
+      'local.get $set',
+      i32Const(0),
+      'i32.store offset=8',
+    ],
+  }));
+
+  funcs.push(buildFunction({
     name: '__jswat_stack_new',
     params: [],
     result: 'i32',
@@ -729,6 +907,47 @@ function buildCollectionsFunctions() {
       'else',
       '  local.get $stack',
       '  i32.load offset=8',
+      'end',
+    ],
+  }));
+
+  funcs.push(buildFunction({
+    name: '__jswat_stack_peek',
+    params: [param('stack', 'i32')],
+    result: 'i32',
+    body: [
+      'local.get $stack',
+      'i32.eqz',
+      'if (result i32)',
+      i32Const(0),
+      'else',
+      '  local.get $stack',
+      '  i32.load offset=4',
+      '  i32.eqz',
+      '  if (result i32)',
+      i32Const(0),
+      '  else',
+      '    local.get $stack',
+      '    i32.load offset=4',
+      '    i32.load offset=8',
+      '  end',
+      'end',
+    ],
+  }));
+
+  funcs.push(buildFunction({
+    name: '__jswat_stack_empty',
+    params: [param('stack', 'i32')],
+    result: 'i32',
+    body: [
+      'local.get $stack',
+      'i32.eqz',
+      'if (result i32)',
+      i32Const(1),
+      'else',
+      '  local.get $stack',
+      '  i32.load offset=8',
+      '  i32.eqz',
       'end',
     ],
   }));
@@ -857,6 +1076,47 @@ function buildCollectionsFunctions() {
       'else',
       '  local.get $queue',
       '  i32.load offset=12',
+      'end',
+    ],
+  }));
+
+  funcs.push(buildFunction({
+    name: '__jswat_queue_peek',
+    params: [param('queue', 'i32')],
+    result: 'i32',
+    body: [
+      'local.get $queue',
+      'i32.eqz',
+      'if (result i32)',
+      i32Const(0),
+      'else',
+      '  local.get $queue',
+      '  i32.load offset=4',
+      '  i32.eqz',
+      '  if (result i32)',
+      i32Const(0),
+      '  else',
+      '    local.get $queue',
+      '    i32.load offset=4',
+      '    i32.load offset=8',
+      '  end',
+      'end',
+    ],
+  }));
+
+  funcs.push(buildFunction({
+    name: '__jswat_queue_empty',
+    params: [param('queue', 'i32')],
+    result: 'i32',
+    body: [
+      'local.get $queue',
+      'i32.eqz',
+      'if (result i32)',
+      i32Const(1),
+      'else',
+      '  local.get $queue',
+      '  i32.load offset=12',
+      '  i32.eqz',
       'end',
     ],
   }));
@@ -1092,6 +1352,71 @@ function buildCollectionsFunctions() {
     ],
   }));
 
+  funcs.push(buildFunction({
+    name: '__jswat_deque_peek_front',
+    params: [param('deque', 'i32')],
+    result: 'i32',
+    body: [
+      'local.get $deque',
+      'i32.eqz',
+      'if (result i32)',
+      i32Const(0),
+      'else',
+      '  local.get $deque',
+      '  i32.load offset=4',
+      '  i32.eqz',
+      '  if (result i32)',
+      i32Const(0),
+      '  else',
+      '    local.get $deque',
+      '    i32.load offset=4',
+      '    i32.load offset=12',
+      '  end',
+      'end',
+    ],
+  }));
+
+  funcs.push(buildFunction({
+    name: '__jswat_deque_peek_back',
+    params: [param('deque', 'i32')],
+    result: 'i32',
+    body: [
+      'local.get $deque',
+      'i32.eqz',
+      'if (result i32)',
+      i32Const(0),
+      'else',
+      '  local.get $deque',
+      '  i32.load offset=8',
+      '  i32.eqz',
+      '  if (result i32)',
+      i32Const(0),
+      '  else',
+      '    local.get $deque',
+      '    i32.load offset=8',
+      '    i32.load offset=12',
+      '  end',
+      'end',
+    ],
+  }));
+
+  funcs.push(buildFunction({
+    name: '__jswat_deque_empty',
+    params: [param('deque', 'i32')],
+    result: 'i32',
+    body: [
+      'local.get $deque',
+      'i32.eqz',
+      'if (result i32)',
+      i32Const(1),
+      'else',
+      '  local.get $deque',
+      '  i32.load offset=12',
+      '  i32.eqz',
+      'end',
+    ],
+  }));
+
   return funcs;
 }
 
@@ -1114,6 +1439,7 @@ function buildWasiImports(hasIo, hasFs, hasClock, hasRandom) {
   }
   if (hasClock) {
     imports.push('(import "wasi_snapshot_preview1" "clock_time_get" (func $clock_time_get (param i32 i64 i32) (result i32)))');
+    imports.push('(import "wasi_snapshot_preview1" "sched_yield" (func $sched_yield (result i32)))');
   }
   if (hasRandom) {
     imports.push('(import "wasi_snapshot_preview1" "random_get" (func $random_get (param i32 i32) (result i32)))');
@@ -1742,7 +2068,7 @@ function buildClockFunctions(clockBase) {
     result: 'i32',
     body: [
       i32Const(0),
-      'i64.const 0',
+      'i64.const 1000000',
       i32Const(clockBase),
       'call $clock_time_get',
       'drop',
@@ -1760,7 +2086,7 @@ function buildClockFunctions(clockBase) {
     result: 'i32',
     body: [
       i32Const(1),
-      'i64.const 0',
+      'i64.const 1',
       i32Const(clockBase),
       'call $clock_time_get',
       'drop',
@@ -1774,7 +2100,28 @@ function buildClockFunctions(clockBase) {
     name: '__jswat_clock_sleep',
     params: [param('ms', 'i32')],
     result: '',
-    body: [],
+    locals: [local('end', 'i32')],
+    body: [
+      'local.get $ms',
+      i32Const(1000000),
+      'i32.mul',
+      'call $__jswat_clock_monotonic',
+      'i32.add',
+      'local.set $end',
+      'block $done',
+      '  loop $spin',
+      '    call $__jswat_clock_monotonic',
+      '    local.get $end',
+      '    i32.lt_u',
+      '    if',
+      '      call $sched_yield',
+      '      drop',
+      '      br $spin',
+      '    end',
+      '    br $done',
+      '  end',
+      'end',
+    ],
   });
 
   return [clockNow, clockMonotonic, clockSleep];
@@ -1974,6 +2321,7 @@ export function collectLocals(body, params) {
   const locals = [];
   const seen = new Set(paramNames);
   let needsTmp = false;
+  let forOfCounter = 0;
 
   /** @param {object} node */
   function visit(node) {
@@ -1986,6 +2334,24 @@ export function collectLocals(body, params) {
       }
     }
     if (node.type === 'NewExpression') needsTmp = true;
+    if (node.type === 'ForOfStatement') {
+      const id = forOfCounter++;
+      node._forOfId = id;
+      const names = [
+        `__forof_start_${id}`,
+        `__forof_end_${id}`,
+        `__forof_step_${id}`,
+        `__forof_i_${id}`,
+        `__forof_iter_${id}`,
+        `__forof_result_${id}`,
+      ];
+      for (const name of names) {
+        if (!seen.has(name)) {
+          seen.add(name);
+          locals.push({ name, type: TYPES.isize });
+        }
+      }
+    }
     if (node.type === 'ThisExpression') {
       if (!seen.has('this')) {
         seen.add('this');
@@ -2570,6 +2936,170 @@ function genStatement(stmt, fnReturnType, ctx, filename) {
       return [...initInstrs, ...loopInstrs];
     }
 
+    case 'ForOfStatement': {
+      const id = stmt._forOfId ?? 0;
+      const startLocal = `__forof_start_${id}`;
+      const endLocal = `__forof_end_${id}`;
+      const stepLocal = `__forof_step_${id}`;
+      const iterLocal = `__forof_i_${id}`;
+      const itLocal = `__forof_iter_${id}`;
+      const resLocal = `__forof_result_${id}`;
+      const breakLabel = ctx.nextLabel('forof_break');
+      const loopPos = ctx.nextLabel('forof_pos');
+      const loopNeg = ctx.nextLabel('forof_neg');
+
+      const right = stmt.right;
+      const rightType = right?._type;
+      const rightClass = rightType?.kind === 'class' ? ctx._classes?.get(rightType.name) : null;
+      const iterMethod = rightClass?.methods.get('iter');
+      const iterType = iterMethod?.signature.returnType;
+      const iterClass = iterType?.kind === 'class' ? ctx._classes?.get(iterType.name) : null;
+      const nextMethod = iterClass?.methods.get('next');
+      const resType = nextMethod?.signature.returnType;
+      const resClass = resType?.kind === 'class' ? ctx._classes?.get(resType.name) : null;
+      const resLayout = resClass ? ctx._layouts?.get(resClass.name) : null;
+      const valueField = resLayout?.fields.get('value') ?? null;
+      const doneField = resLayout?.fields.get('done') ?? null;
+
+      if (rightClass && iterClass && resLayout && valueField && doneField) {
+        const iterCall = [
+          ...genExpr(right, filename, ctx),
+          `call $${rightClass.name}_iter`,
+          localSet(itLocal),
+        ];
+        const assignLoopVar = [];
+        if (stmt.left?.type === 'VariableDeclaration') {
+          const decl = stmt.left.declarations[0];
+          if (decl?.id?.name) {
+            assignLoopVar.push(
+              localGet(resLocal),
+              i32Const(valueField.offset),
+              'i32.add',
+              loadInstr(valueField.type),
+              localSet(decl.id.name)
+            );
+          }
+        } else if (stmt.left?.type === 'Identifier') {
+          assignLoopVar.push(
+            localGet(resLocal),
+            i32Const(valueField.offset),
+            'i32.add',
+            loadInstr(valueField.type),
+            localSet(stmt.left.name)
+          );
+        }
+
+        const brk = breakLabel;
+        const lp = loopPos;
+        ctx.pushLoop(brk, lp);
+        const bodyInstrs = genStatement(stmt.body, fnReturnType, ctx, filename);
+        ctx.popLoop();
+
+        return [
+          ...iterCall,
+          `block $${brk}`,
+          `  loop $${lp}`,
+          `    local.get $${itLocal}`,
+          `    call $${iterClass.name}_next`,
+          `    local.set $${resLocal}`,
+          `    local.get $${resLocal}`,
+          i32Const(doneField.offset),
+          '    i32.add',
+          `    ${loadInstr(doneField.type)}`,
+          `    i32.eqz`,
+          `    if`,
+          ...assignLoopVar.map(i => '      ' + i),
+          ...bodyInstrs.map(i => '      ' + i),
+          `      br $${lp}`,
+          `    end`,
+          '  end',
+          'end',
+        ];
+      }
+
+      let startExpr = i32Const(0);
+      let endExpr = i32Const(0);
+      let stepExpr = i32Const(1);
+      if (right?.type === 'NewExpression' && right.callee?.type === 'Identifier') {
+        const args = right.arguments ?? [];
+        if (args[0]) startExpr = genExpr(args[0], filename, ctx);
+        if (args[1]) endExpr = genExpr(args[1], filename, ctx);
+        if (args[2]) stepExpr = genExpr(args[2], filename, ctx);
+      }
+
+      const initInstrs = [
+        ...[].concat(startExpr),
+        localSet(startLocal),
+        ...[].concat(endExpr),
+        localSet(endLocal),
+        ...[].concat(stepExpr),
+        localSet(stepLocal),
+        localGet(startLocal),
+        localSet(iterLocal),
+      ];
+
+      const assignLoopVar = [];
+      if (stmt.left?.type === 'VariableDeclaration') {
+        const decl = stmt.left.declarations[0];
+        if (decl?.id?.name) {
+          assignLoopVar.push(
+            localGet(iterLocal),
+            localSet(decl.id.name)
+          );
+        }
+      } else if (stmt.left?.type === 'Identifier') {
+        assignLoopVar.push(
+          localGet(iterLocal),
+          localSet(stmt.left.name)
+        );
+      }
+
+      ctx.pushLoop(breakLabel, loopPos);
+      const bodyInstrs = genStatement(stmt.body, fnReturnType, ctx, filename);
+      ctx.popLoop();
+
+      const loopInstrs = [
+        `block $${breakLabel}`,
+        '  local.get $' + stepLocal,
+        i32Const(0),
+        '  i32.gt_s',
+        '  if',
+        `    loop $${loopPos}`,
+        '      local.get $' + iterLocal,
+        '      local.get $' + endLocal,
+        '      i32.lt_s',
+        '      if',
+        ...assignLoopVar.map(i => '        ' + i),
+        ...bodyInstrs.map(i => '        ' + i),
+        '        local.get $' + iterLocal,
+        '        local.get $' + stepLocal,
+        '        i32.add',
+        '        local.set $' + iterLocal,
+        '        br $' + loopPos,
+        '      end',
+        '    end',
+        '  else',
+        `    loop $${loopNeg}`,
+        '      local.get $' + iterLocal,
+        '      local.get $' + endLocal,
+        '      i32.gt_s',
+        '      if',
+        ...assignLoopVar.map(i => '        ' + i),
+        ...bodyInstrs.map(i => '        ' + i),
+        '        local.get $' + iterLocal,
+        '        local.get $' + stepLocal,
+        '        i32.add',
+        '        local.set $' + iterLocal,
+        '        br $' + loopNeg,
+        '      end',
+        '    end',
+        '  end',
+        'end',
+      ];
+
+      return [...initInstrs, ...loopInstrs];
+    }
+
     case 'BreakStatement': {
       const loop = ctx.currentLoop();
       if (!loop) throw new CodegenError(`break used outside loop (${filename})`);
@@ -2692,6 +3222,7 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   const hasRandom = stdStubs.has('__jswat_random_float') ||
     stdStubs.has('__jswat_random_seed');
   const hasMem = Array.from(stdStubs).some(name => name.startsWith('__jswat_alloc_') || name.startsWith('__jswat_ptr_'));
+  const hasString = stdStubs.has('__jswat_string_from_i32');
   const hasCollections = Array.from(stdStubs).some(name =>
     name.startsWith('__jswat_map_') ||
     name.startsWith('__jswat_set_') ||
@@ -2736,6 +3267,9 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
     if (hasMem && (stub.startsWith('__jswat_alloc_') || stub.startsWith('__jswat_ptr_'))) {
       continue;
     }
+    if (hasString && stub.startsWith('__jswat_string_')) {
+      continue;
+    }
     if (hasCollections && (
       stub.startsWith('__jswat_map_') ||
       stub.startsWith('__jswat_set_') ||
@@ -2769,6 +3303,9 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   }
   if (hasMem) {
     functions.push(...buildMemFunctions());
+  }
+  if (hasString) {
+    functions.push(...buildStringFunctions());
   }
   if (hasCollections) {
     functions.push(...buildCollectionsFunctions());

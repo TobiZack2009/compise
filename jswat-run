@@ -10,9 +10,9 @@ INPUT="$1"
 shift
 
 TMPDIR="${TMPDIR:-/tmp}"
-OUT="${TMPDIR%/}/jswat-$$.wasm"
+OUT="${TMPDIR%/}/jswat-$$.wat"
 
-node "$(dirname "$0")/src/cli.js" compile "$INPUT" -o "$OUT" >/dev/null
+node "$(dirname "$0")/src/cli.js" compile "$INPUT" --save-wat -o "$OUT" >"/dev/null"
 
 if ! command -v wasmtime >/dev/null 2>&1; then
   echo "error: wasmtime not found in PATH" >&2

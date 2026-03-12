@@ -1,5 +1,5 @@
 // Demonstrates: while/for/do-while, break/continue, logical ops, compound assignments.
-
+import {console,stdin} from "std/io"
 function whileSum(n = 0) {
   let i = 0;
   let sum = 0;
@@ -53,4 +53,13 @@ function update(a = 0) {
   const y = x++;
   const z = ++x;
   return x + y + z;
+}
+
+let i=0
+while(2<5){
+i++;
+console.log("\nHi\n")
+console.log(stdin.readLine())
+console.log("\n")
+console.log(doWhileSum(i))
 }

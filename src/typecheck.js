@@ -232,6 +232,38 @@ function inferStatement(stmt, scope, signatures, classes, filename, ctx) {
       scope.pop();
       break;
 
+    case 'ForOfStatement': {
+      scope.push();
+      inferExpr(stmt.right, scope, signatures, classes, filename, ctx);
+      let loopType = TYPES.isize;
+      const rightType = stmt.right?._type;
+      if (rightType?.kind === 'class') {
+        const rightInfo = classes.get(rightType.name);
+        const iterMethod = rightInfo?.methods.get('iter');
+        const iterType = iterMethod?.signature.returnType;
+        if (iterType?.kind === 'class') {
+          const iterInfo = classes.get(iterType.name);
+          const nextMethod = iterInfo?.methods.get('next');
+          const resType = nextMethod?.signature.returnType;
+          if (resType?.kind === 'class') {
+            const resInfo = classes.get(resType.name);
+            const valueType = resInfo?.fields.get('value');
+            if (valueType) loopType = valueType;
+          }
+        }
+      }
+      if (stmt.left?.type === 'VariableDeclaration') {
+        const decl = stmt.left.declarations[0];
+        if (decl?.id?.name) {
+          decl._type = loopType;
+          scope.define(decl.id.name, loopType);
+        }
+      }
+      inferStatement(stmt.body, scope, signatures, classes, filename, ctx);
+      scope.pop();
+      break;
+    }
+
     case 'BlockStatement':
       scope.push();
       for (const s of stmt.body) inferStatement(s, scope, signatures, classes, filename, ctx);

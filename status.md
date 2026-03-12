@@ -27,90 +27,46 @@
 - `readDebugNames: true` crashes on WASM without name section — fixed to `readDebugNames: false`
 - Nested `else if` (clamp, saturate) generated invalid WAT — replaced `endsWithReturn` with recursive `alwaysReturns` + `genBranchValue`
 
+### Phase 2 — Loops, Logical Ops, Compound Assignments, User Functions
+- Added `TYPES.unknown` and fixpoint inference for recursive function signatures
+- Implemented logical ops, update/assignment expressions, and user function calls
+- Added loop codegen (while/for/do-while) with break/continue handling
+- Added new examples and tests (`examples/loops.js`, `examples/fibonacci.js`, `test/phase2.test.js`)
+
+### Phase 3 — Classes, Methods, `this`, `for-of`
+- Implemented class layout, allocation, method calls, constructors, and `this`
+- Added `for-of` lowering for `Range` plus iterator-protocol lowering via `iter()/next()` + `IteratorResult`
+- Added allocator updates (size-class freelists + bytes/realloc helpers)
+
+### Phase 4 — std Imports + WASI Backing
+- std registry + import resolution for namespace/default/direct function imports
+- std/io, std/fs, std/clock, std/random runtime implementations (WASI-backed)
+- std/collections runtime (Map/Set/Queue/Stack/Deque) and memory intrinsics
+- std/wasm intrinsics (i32/i64/f32/f64 ops + memory.*) mapped as compiler intrinsics
+- Added WASI tests for io/fs/clock/random and memory ops
+
+### std/jswat Sources
+- Added jswat sources for std modules: `std/wasm.js`, `std/mem.js`, `std/collections.js`, `std/io.js`, `std/fs.js`, `std/random.js`, `std/encoding.js`, `std/string.js`, `std/range.js`, `std/clock.js`
+
 ---
 
 ## In Progress
 
-Nothing — Phase 1 is complete and committed (95fb828).
+std/iter + std/string are not feature-complete yet.
 
 ---
 
 ## Plan
 
-### Phase 2 — Loops, Logical Ops, Compound Assignments, User Function Calls
+### Phase 5 — Compiler Features for std/string + std/iter
+- Implement computed member access for byte buffers/arrays (`obj[index]`) with type rules
+- Add array literals, `length`, and `push` for simple array types (needed by iter/collections)
+- Add `IteratorResult` as a std/core class with fields `value` and `done`
+- Add string buffer view intrinsic (`String.asStr`) and raw byte ops (load/store helpers)
+- Add function value support (function references + `call_indirect`) for iterator combinators
+- Expand tests to cover iterator chains and string byte-level methods
 
-**`src/types.js`**
-- Add `TYPES.unknown` (bottom type, `kind: 'unknown'`) for fixpoint inference of recursive functions
-- Update `promoteTypes`: `if (a.kind === 'unknown') return b; if (b.kind === 'unknown') return a;`
-
-**`src/typecheck.js`**
-- Add `WhileStatement`, `ForStatement`, `DoWhileStatement` to `collectReturnTypes` (recurse into body)
-- Add `WhileStatement`, `ForStatement`, `DoWhileStatement` to `inferStatement`
-- Add `LogicalExpression` (`&&`, `||`) to `inferExpr` → returns `bool`
-- Add `UpdateExpression` (`x++`, `x--`, `++x`, `--x`) to `inferExpr` → returns operand type
-- Add `AssignmentExpression` (`=`, `+=`, `-=`, `*=`, `/=`, `%=`) to `inferExpr` → returns rhs type
-- Update `CallExpression` to look up user function signatures and return their declared return type
-- Add fixpoint iteration in `inferTypes`: register all function names with `TYPES.unknown` return type first, then re-infer until signatures stabilise (for recursive functions)
-
-**`src/codegen.js`**
-- Add `GenContext` class: label counter, loop stack (`[{ breakLabel, continueLabel }]`), push/pop loop
-- Update all statement generators to accept a `GenContext` parameter
-- Add `WhileStatement` codegen:
-  ```wat
-  block $brk_N
-    loop $lp_N
-      [condition] i32.eqz br_if $brk_N
-      [body]
-      br $lp_N
-    end
-  end
-  ```
-- Add `ForStatement` codegen (init + inner block for continue-to-update):
-  ```wat
-  [init]
-  block $brk_N
-    loop $lp_N
-      [condition] i32.eqz br_if $brk_N
-      block $inner_N
-        [body]
-      end
-      [update]
-      br $lp_N
-    end
-  end
-  ```
-- Add `DoWhileStatement` codegen:
-  ```wat
-  block $brk_N
-    loop $lp_N
-      [body]
-      [condition] br_if $lp_N
-    end
-  end
-  ```
-- Add `BreakStatement` → `br $brk_N`
-- Add `ContinueStatement` → `br $inner_N` (for-loop) or `br $lp_N` (while/do-while)
-- Add `AssignmentExpression` (`=`) → `[rhs] local.tee $name`
-- Add `AssignmentExpression` (`+=`, `-=`, etc.) → `local.get $name [rhs] op local.tee $name`
-- Add `UpdateExpression` (`x++`) → `local.get $x local.get $x i32.const 1 i32.add local.set $x` (pre: tee instead of get+set)
-- Add `LogicalExpression` (`&&`) → short-circuit via WAT `if (result i32)`: `[a] if (result i32) [b] else i32.const 0 end`
-- Add `LogicalExpression` (`||`) → `[a] if (result i32) i32.const 1 else [b] end`
-- Add user function calls in `CallExpression` → `[args...] call $fnname`
-- Fix `ExpressionStatement` to emit `drop` when the expression has a non-void/non-missing type (assignment expressions, calls with return value, etc.)
-
-**New files**
-- `examples/loops.js` — demonstrates while, for, do-while, break, continue
-- `examples/fibonacci.js` — recursive function (tests fixpoint inference)
-- `test/phase2.test.js` — loop execution, logical ops, compound assignments, user calls, recursion
-
-### Phase 3 — Classes, `this`, Method Calls, `for-of`
-- Class layout (field ordering, struct-like memory layout)
-- `new Foo(...)` allocation
-- `this` in method context
-- Method calls (`obj.method(args)`)
-- `for-of` over ranges/arrays
-
-### Phase 4 — Imports, Standard Library Stubs
-- `import { ... } from 'std/math'`, `'std/io'`, `'std/string'`, etc.
-- External function declarations (`import` → WASM import section)
-- Enable section-21 examples (currently all pending/skipped)
+### Phase 6 — std/string + std/iter Sources
+- Implement full std/string per `std.md` using the new compiler intrinsics
+- Implement std/iter Chain + combinators per `std.md`
+- Add examples/tests to exercise the std sources

@@ -7,6 +7,7 @@ import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { compile, wasmToWat } from './compiler.js';
 
+
 const [,, cmd, ...rest] = process.argv;
 
 /**
@@ -51,7 +52,8 @@ async function cmdCompile(args) {
   const input     = args[0];
   const output    = parseOutput(args);
   const emitWat   = args.includes('--emit-wat');
-  if (!input)  die('Usage: jswat compile <input.js> -o <output.wasm> [--emit-wat]');
+  const saveWat   = args.includes('--save-wat');
+  if (!input)  die('Usage: jswat compile <input.js> -o <output.wasm> [--emit-wat] [--save-wat]');
   if (!output) die('Missing -o <output> flag');
 
   const result = await compile({ input, output });
@@ -59,11 +61,11 @@ async function cmdCompile(args) {
   for (const w of result.warnings) stderr(`warning: ${w}`);
 
   mkdirSync(dirname(output), { recursive: true });
+  if(!saveWat) {
   writeFileSync(output, result.wasm);
-  stdout(`Compiled ${input} → ${output}`);
-
-  if (emitWat) {
-    const watPath = watPathFrom(output);
+  stdout(`Compiled ${input} → ${output}`)};
+  if (emitWat||saveWat) {
+    const watPath =saveWat?output : watPathFrom(output);
     writeFileSync(watPath, result.wat, 'utf8');
     stdout(`WAT      ${input} → ${watPath}`);
   }
