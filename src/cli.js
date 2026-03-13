@@ -4,8 +4,20 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { readFile } from 'fs/promises';
 import { dirname } from 'path';
-import { compile, wasmToWat } from './compiler.js';
+import { compileSource, wasmToWat } from './compiler.js';
+
+/**
+ * Read a file from disk and compile it.
+ * @param {{ input: string, checkOnly?: boolean }} opts
+ * @returns {Promise<import('./compiler.js').CompileResult>}
+ */
+async function compile(opts) {
+  const { input, checkOnly = false } = opts;
+  const source = await readFile(input, 'utf8');
+  return compileSource(source, input, { checkOnly });
+}
 
 
 const [,, cmd, ...rest] = process.argv;

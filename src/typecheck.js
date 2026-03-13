@@ -531,6 +531,9 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
         t = TYPES[node.name]; // abstract type reference e.g. `Integer`
       } else if (classes.has(node.name)) {
         t = classes.get(node.name).type;
+      } else if (signatures.has(node.name)) {
+        t = TYPES.funcref;
+        node._fnRef = node.name;
       } else {
         t = TYPES.void; // unresolved — tolerate in phase 1
       }
@@ -556,7 +559,13 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
             if (sig) {
               t = sig.returnType ?? TYPES.void;
             } else {
-              t = TYPES.void;
+              const ref = scope.lookup(callee.name);
+              if (ref?.kind === 'funcref') {
+                node._callIndirect = true;
+                t = TYPES.isize;
+              } else {
+                t = TYPES.void;
+              }
             }
           }
         } else if (callee.type === 'MemberExpression') {
@@ -577,9 +586,20 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
             const std = ns ?? def;
             if (std) t = std.returnType;
           }
+          if ((!t || t === TYPES.void) && objType?.kind === 'array' && methodName) {
+            if (methodName === 'push') t = TYPES.usize;
+          }
           if ((!t || t === TYPES.void) && objType?.kind === 'collection' && methodName) {
             const std = resolveStdCollectionMethod(objType.name, methodName);
             if (std) t = std.returnType;
+          }
+          if ((!t || t === TYPES.void) && objType?.kind === 'class' && methodName) {
+            const classInfo = classes.get(objType.name);
+            const fieldType = classInfo?.fields.get(methodName);
+            if (fieldType?.kind === 'funcref') {
+              node._callIndirect = true;
+              t = TYPES.isize;
+            }
           }
           if (!t || t === TYPES.void) {
             const classInfo = objType && objType.kind === 'class' ? classes.get(objType.name) : null;
@@ -662,6 +682,11 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
     case 'MemberExpression':
       {
         const objType = inferExpr(node.object, scope, signatures, classes, filename, ctx);
+        if (node.computed && objType?.kind === 'array') {
+          inferExpr(node.property, scope, signatures, classes, filename, ctx);
+          t = TYPES.isize;
+          break;
+        }
         if (objType && objType.kind === 'class') {
           const classInfo = classes.get(objType.name);
           const fieldName = node.property?.name;
@@ -670,10 +695,19 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           } else {
             t = TYPES.unknown;
           }
+        } else if (objType?.kind === 'array' && node.property?.name === 'length') {
+          t = TYPES.usize;
         } else {
           t = TYPES.void;
         }
       }
+      break;
+
+    case 'ArrayExpression':
+      for (const el of node.elements ?? []) {
+        if (el) inferExpr(el, scope, signatures, classes, filename, ctx);
+      }
+      t = TYPES.array;
       break;
 
     case 'ThisExpression':

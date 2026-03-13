@@ -160,9 +160,9 @@ export function validate(ast, filename = '<input>') {
             err("Math.* requires importing Math from 'std/math'", node);
           }
         }
-        // Computed (bracket) access — banned on non-arrays (Phase 1: ban all)
+        // Bracket (computed) access is not supported — use direct field access.
         if (node.computed) {
-          err("Computed (bracket) member access obj[key] is not allowed on objects; use dot notation", node);
+          err("Bracket notation (computed member access) is not allowed; use direct field access", node);
         }
       },
 

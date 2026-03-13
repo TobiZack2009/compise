@@ -48,25 +48,46 @@
 ### std/jswat Sources
 - Added jswat sources for std modules: `std/wasm.js`, `std/mem.js`, `std/collections.js`, `std/io.js`, `std/fs.js`, `std/random.js`, `std/encoding.js`, `std/string.js`, `std/range.js`, `std/clock.js`
 
+### Recent Compiler Feature Work (in progress)
+- Added iterator-protocol lowering for `for-of` (via `iter()`/`next()` + `IteratorResult`)
+- Added Range-based `for-of` lowering (new Range(start,end,step))
+- Added std/string int-to-string runtime (`__jswat_string_from_i32`)
+- Added std/collections method coverage (clear/peek/empty)
+- Added std/clock sleep runtime (sched_yield + monotonic)
+- Started adding array/computed access support and function references for std/iter
+
 ---
 
 ## In Progress
 
-std/iter + std/string are not feature-complete yet.
+Implement compiler features required for full std/iter + std/string, then replace placeholder std sources with complete jswat implementations.
 
 ---
 
 ## Plan
 
-### Phase 5 — Compiler Features for std/string + std/iter
-- Implement computed member access for byte buffers/arrays (`obj[index]`) with type rules
-- Add array literals, `length`, and `push` for simple array types (needed by iter/collections)
-- Add `IteratorResult` as a std/core class with fields `value` and `done`
-- Add string buffer view intrinsic (`String.asStr`) and raw byte ops (load/store helpers)
-- Add function value support (function references + `call_indirect`) for iterator combinators
-- Expand tests to cover iterator chains and string byte-level methods
-
-### Phase 6 — std/string + std/iter Sources
-- Implement full std/string per `std.md` using the new compiler intrinsics
-- Implement std/iter Chain + combinators per `std.md`
-- Add examples/tests to exercise the std sources
+### Step-by-step plan (compiler features → std sources → tests)
+1. Add array support end-to-end:
+   - Allow `ArrayExpression` literals, `arr[index]`, `arr[index]=`, `arr.length`, `arr.push`.
+   - Implement runtime helpers (`__jswat_array_new/get/set/push/length`) and wire into codegen.
+   - Add tests for array push/get/set/length and bracket access.
+2. Add function references + indirect calls:
+   - Track function identifiers as `funcref` in typecheck.
+   - Emit wasm `table` + `elem` for eligible functions (i32 params/returns).
+   - Emit `call_indirect` for function-typed values and iterator combinators.
+   - Add tests for higher-order functions and indirect calls.
+3. Implement `IteratorResult` in std/core (and ensure class layout fields `value`, `done`):
+   - Add jswat source in std (or compiler-synthesized class) and tests for `next()` semantics.
+4. Add string byte-level intrinsics:
+   - Provide raw byte load/store helpers for str/alloc buffers.
+   - Implement `String.asStr` as a compiler intrinsic (str header view).
+   - Add tests for `length`, `asStr`, and byte-level operations.
+5. Implement full `std/string` per `std.md`:
+   - `constructor`, `append`, `slice`, `indexOf`, `includes`, `startsWith`, `endsWith`,
+     `toUpperCase`, `toLowerCase`, `trim`, `split`, `replace`, `padStart`, `padEnd`, `repeat`, `at`,
+     `equals`, `hash`, `dispose`, and static `from`.
+   - Add tests to cover each method and edge cases.
+6. Implement full `std/iter` per `std.md`:
+   - Chain, map/filter/take/skip/etc., `collect`, `forEach`, `find`, `some`, `every`, `count`, etc.
+   - Add tests to cover chaining and iterator correctness.
+7. Update examples to use std/string and std/iter, run tests, and commit.

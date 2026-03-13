@@ -1,51 +1,54 @@
 /**
- * @fileoverview WASI-backed std/io tests.
+ * @fileoverview std/io tests — runs programs through jswat-run + wasmtime.
+ * Skips the entire suite when wasmtime is not installed.
  */
 
 import { strict as assert } from 'assert';
-import { mkdtempSync, readFileSync, openSync, closeSync, writeFileSync } from 'fs';
+import { execFileSync, execSync } from 'child_process';
+import { writeFileSync, unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { WASI } from 'node:wasi';
-import { compileSource } from '../src/compiler.js';
 
-describe('std/io with WASI', () => {
-  it('console.log writes to stdout', async () => {
-    const source = 'import { console } from \"std/io\"; console.log(\"Hello from js.wat!\");';
-    const { wasm } = await compileSource(source, 'hello.js');
-    const dir = mkdtempSync(join(tmpdir(), 'jswat-'));
-    const stdoutPath = join(dir, 'stdout.txt');
-    const stderrPath = join(dir, 'stderr.txt');
-    const stdoutFd = openSync(stdoutPath, 'w+');
-    const stderrFd = openSync(stderrPath, 'w+');
-    const wasi = new WASI({ version: 'preview1', stdout: stdoutFd, stderr: stderrFd });
-    const { instance } = await WebAssembly.instantiate(wasm, wasi.getImportObject());
-    wasi.start(instance);
-    closeSync(stdoutFd);
-    closeSync(stderrFd);
-    const out = readFileSync(stdoutPath, 'utf8');
+const ROOT = new URL('..', import.meta.url).pathname;
+const JSWAT_RUN = join(ROOT, 'jswat-run');
+
+function wasmtimeAvailable() {
+  try { execSync('wasmtime --version', { stdio: 'ignore' }); return true; }
+  catch { return false; }
+}
+
+/**
+ * Write source to a temp file, run through jswat-run, return stdout.
+ * @param {string} source
+ * @param {{ input?: string }} [opts]
+ */
+function run(source, opts = {}) {
+  const tmp = join(tmpdir(), `jswat-test-${process.pid}-${Date.now()}.js`);
+  writeFileSync(tmp, source, 'utf8');
+  try {
+    return execFileSync(JSWAT_RUN, [tmp], {
+      encoding: 'utf8',
+      timeout: 10000,
+      ...(opts.input !== undefined ? { input: opts.input } : {}),
+    });
+  } finally {
+    unlinkSync(tmp);
+  }
+}
+
+describe('std/io with WASI', function() {
+  before(function() {
+    if (!wasmtimeAvailable()) this.skip();
+  });
+
+  it('console.log writes to stdout', function() {
+    const out = run('import { console } from "std/io"; console.log("Hello from js.wat!");');
     assert.ok(out.includes('Hello from js.wat!'), `expected output, got: ${out}`);
   });
 
-  it('stdin.readAll echoes input', async () => {
-    const source = 'import { console, stdin } from \"std/io\"; const s = stdin.readAll(); console.log(s);';
-    const { wasm } = await compileSource(source, 'stdin.js');
-    const dir = mkdtempSync(join(tmpdir(), 'jswat-'));
-    const stdinPath = join(dir, 'stdin.txt');
-    const stdoutPath = join(dir, 'stdout.txt');
-    const stderrPath = join(dir, 'stderr.txt');
-    const input = 'Echo test';
-    const stdinFd = openSync(stdinPath, 'w+');
-    const stdoutFd = openSync(stdoutPath, 'w+');
-    const stderrFd = openSync(stderrPath, 'w+');
-    writeFileSync(stdinPath, input, 'utf8');
-    const wasi = new WASI({ version: 'preview1', stdin: stdinFd, stdout: stdoutFd, stderr: stderrFd });
-    const { instance } = await WebAssembly.instantiate(wasm, wasi.getImportObject());
-    wasi.start(instance);
-    closeSync(stdinFd);
-    closeSync(stdoutFd);
-    closeSync(stderrFd);
-    const out = readFileSync(stdoutPath, 'utf8');
-    assert.ok(out.includes(input), `expected output, got: ${out}`);
+  it('stdin.readAll echoes input', function() {
+    const source = 'import { console, stdin } from "std/io"; const s = stdin.readAll(); console.log(s);';
+    const out = run(source, { input: 'Echo test' });
+    assert.ok(out.includes('Echo test'), `expected echo, got: ${out}`);
   });
 });

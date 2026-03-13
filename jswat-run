@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: jswat-run <input.js> [-- wasmtime-args]" >&2
+  echo "usage: jswat-run <input.js> [wasmtime-flags...]" >&2
   exit 1
 fi
 
@@ -10,13 +10,14 @@ INPUT="$1"
 shift
 
 TMPDIR="${TMPDIR:-/tmp}"
-OUT="${TMPDIR%/}/jswat-$$.wat"
+OUT="${TMPDIR%/}/jswat-$$.wasm"
 
-node "$(dirname "$0")/src/cli.js" compile "$INPUT" --save-wat -o "$OUT" >"/dev/null"
+node "$(dirname "$0")/src/cli.js" compile "$INPUT" -o "$OUT" >"/dev/null"
 
 if ! command -v wasmtime >/dev/null 2>&1; then
   echo "error: wasmtime not found in PATH" >&2
   exit 1
 fi
 
-wasmtime run "$OUT" "$@"
+# Extra args (e.g. --dir /tmp) are passed to wasmtime BEFORE the WAT file.
+wasmtime run "$@" "$OUT"

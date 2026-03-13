@@ -53,6 +53,12 @@ const TYPE_REGISTRY = {
   Queue: t({ kind: 'collection', name: 'Queue', nullable: true, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
   Stack: t({ kind: 'collection', name: 'Stack', nullable: true, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
   Deque: t({ kind: 'collection', name: 'Deque', nullable: true, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
+
+  // Array handles (dynamic buffer of i32 values)
+  array: t({ kind: 'array', name: 'array', nullable: true, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
+
+  // Function reference (table index)
+  funcref: t({ kind: 'funcref', name: 'funcref', nullable: false, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
 };
 
 export const TYPES = TYPE_REGISTRY;

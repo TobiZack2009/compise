@@ -1,683 +1,297 @@
 /**
- * @fileoverview Runtime allocator WAT helpers (size classes + free lists).
- * Modeled after AssemblyScript's allocator: size classes, bump pointer, freelists.
+ * @fileoverview Runtime allocator (binaryen IR).
+ * Size classes + free lists + bump pointer.
  */
 
-import { buildFunction, param, local, i32Const } from './wat.js';
+import binaryen from 'binaryen';
 
 const CLASS_SIZES = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
 
 /**
- * Build allocator globals and functions.
- * @returns {{ globals: string[], functions: string[] }}
+ * Build nested if/else chain for size class selection.
+ * Sets classSize (local 2) and classIndex (local 3).
  */
-export function buildAllocator() {
-  const globals = [
-    '(global $__jswat_bump (mut i32) (i32.const 1024))',
-    '(global $__jswat_fl_0 (mut i32) (i32.const 0))',
-    '(global $__jswat_fl_1 (mut i32) (i32.const 0))',
-    '(global $__jswat_fl_2 (mut i32) (i32.const 0))',
-    '(global $__jswat_fl_3 (mut i32) (i32.const 0))',
-    '(global $__jswat_fl_4 (mut i32) (i32.const 0))',
-    '(global $__jswat_fl_5 (mut i32) (i32.const 0))',
-    '(global $__jswat_fl_6 (mut i32) (i32.const 0))',
-    '(global $__jswat_fl_7 (mut i32) (i32.const 0))',
-    '(global $__jswat_fl_8 (mut i32) (i32.const 0))',
-    '(global $__jswat_fl_9 (mut i32) (i32.const 0))',
-  ];
+function buildSizeClassSelect(mod, getR) {
+  let expr = mod.block(null, [
+    mod.local.set(2, getR()),               // classSize = rounded (large)
+    mod.local.set(3, mod.i32.const(10)),    // classIndex = 10 (no free list)
+  ], binaryen.none);
+  for (let i = CLASS_SIZES.length - 1; i >= 0; i--) {
+    expr = mod.if(
+      mod.i32.le_u(getR(), mod.i32.const(CLASS_SIZES[i])),
+      mod.block(null, [
+        mod.local.set(2, mod.i32.const(CLASS_SIZES[i])),
+        mod.local.set(3, mod.i32.const(i)),
+      ], binaryen.none),
+      expr
+    );
+  }
+  return expr;
+}
 
-  const allocFn = buildFunction({
-    name: '__jswat_alloc',
-    export: '__jswat_alloc',
-    params: [param('size', 'i32')],
-    result: 'i32',
-    locals: [
-      local('rounded', 'i32'),
-      local('classSize', 'i32'),
-      local('classIndex', 'i32'),
-      local('head', 'i32'),
-      local('next', 'i32'),
-      local('ptr', 'i32'),
-      local('newBump', 'i32'),
-      local('mem', 'i32'),
-      local('pages', 'i32'),
-    ],
-    body: [
-      // round up to 8 bytes
-      'local.get $size',
-      i32Const(7),
-      'i32.add',
-      i32Const(-8),
-      'i32.and',
-      'local.set $rounded',
+/** Build if/else chain: head = freelist[classIndex] */
+function buildGetFreeList(mod, getCI) {
+  let expr = mod.local.set(4, mod.global.get('__jswat_fl_9', binaryen.i32));
+  for (let i = 8; i >= 0; i--) {
+    expr = mod.if(
+      mod.i32.eq(getCI(), mod.i32.const(i)),
+      mod.local.set(4, mod.global.get(`__jswat_fl_${i}`, binaryen.i32)),
+      expr
+    );
+  }
+  return expr;
+}
 
-      // pick size class
-      'local.get $rounded',
-      i32Const(CLASS_SIZES[0]),
-      'i32.le_u',
-      'if',
-      `  ${i32Const(CLASS_SIZES[0])}`,
-      '  local.set $classSize',
-      i32Const(0),
-      '  local.set $classIndex',
-      'else',
-      '  local.get $rounded',
-      i32Const(CLASS_SIZES[1]),
-      '  i32.le_u',
-      '  if',
-      `    ${i32Const(CLASS_SIZES[1])}`,
-      '    local.set $classSize',
-      i32Const(1),
-      '    local.set $classIndex',
-      '  else',
-      '    local.get $rounded',
-      i32Const(CLASS_SIZES[2]),
-      '    i32.le_u',
-      '    if',
-      `      ${i32Const(CLASS_SIZES[2])}`,
-      '      local.set $classSize',
-      i32Const(2),
-      '      local.set $classIndex',
-      '    else',
-      '      local.get $rounded',
-      i32Const(CLASS_SIZES[3]),
-      '      i32.le_u',
-      '      if',
-      `        ${i32Const(CLASS_SIZES[3])}`,
-      '        local.set $classSize',
-      i32Const(3),
-      '        local.set $classIndex',
-      '      else',
-      '        local.get $rounded',
-      i32Const(CLASS_SIZES[4]),
-      '        i32.le_u',
-      '        if',
-      `          ${i32Const(CLASS_SIZES[4])}`,
-      '          local.set $classSize',
-      i32Const(4),
-      '          local.set $classIndex',
-      '        else',
-      '          local.get $rounded',
-      i32Const(CLASS_SIZES[5]),
-      '          i32.le_u',
-      '          if',
-      `            ${i32Const(CLASS_SIZES[5])}`,
-      '            local.set $classSize',
-      i32Const(5),
-      '            local.set $classIndex',
-      '          else',
-      '            local.get $rounded',
-      i32Const(CLASS_SIZES[6]),
-      '            i32.le_u',
-      '            if',
-      `              ${i32Const(CLASS_SIZES[6])}`,
-      '              local.set $classSize',
-      i32Const(6),
-      '              local.set $classIndex',
-      '            else',
-      '              local.get $rounded',
-      i32Const(CLASS_SIZES[7]),
-      '              i32.le_u',
-      '              if',
-      `                ${i32Const(CLASS_SIZES[7])}`,
-      '                local.set $classSize',
-      i32Const(7),
-      '                local.set $classIndex',
-      '              else',
-      '                local.get $rounded',
-      i32Const(CLASS_SIZES[8]),
-      '                i32.le_u',
-      '                if',
-      `                  ${i32Const(CLASS_SIZES[8])}`,
-      '                  local.set $classSize',
-      i32Const(8),
-      '                  local.set $classIndex',
-      '                else',
-      '                  local.get $rounded',
-      i32Const(CLASS_SIZES[9]),
-      '                  i32.le_u',
-      '                  if',
-      `                    ${i32Const(CLASS_SIZES[9])}`,
-      '                    local.set $classSize',
-      i32Const(9),
-      '                    local.set $classIndex',
-      '                  else',
-      '                    local.get $rounded',
-      '                    local.set $classSize',
-      i32Const(10),
-      '                    local.set $classIndex',
-      '                  end',
-      '                end',
-      '              end',
-      '            end',
-      '          end',
-      '        end',
-      '      end',
-      '    end',
-      '  end',
-      'end',
+/** Build if/else chain: freelist[classIndex] = next */
+function buildSetFreeList(mod, getCI, getNext) {
+  let expr = mod.global.set('__jswat_fl_9', getNext());
+  for (let i = 8; i >= 0; i--) {
+    expr = mod.if(
+      mod.i32.eq(getCI(), mod.i32.const(i)),
+      mod.global.set(`__jswat_fl_${i}`, getNext()),
+      expr
+    );
+  }
+  return expr;
+}
 
-      // small class: try free list
-      'block $bump',
-      '  local.get $classIndex',
-      i32Const(9),
-      '  i32.le_u',
-      '  if',
-      '    local.get $classIndex',
-      '    i32.const 0',
-      '    i32.eq',
-      '    if',
-      '      global.get $__jswat_fl_0',
-      '      local.set $head',
-      '    else',
-      '      local.get $classIndex',
-      '      i32.const 1',
-      '      i32.eq',
-      '      if',
-      '        global.get $__jswat_fl_1',
-      '        local.set $head',
-      '      else',
-      '        local.get $classIndex',
-      '        i32.const 2',
-      '        i32.eq',
-      '        if',
-      '          global.get $__jswat_fl_2',
-      '          local.set $head',
-      '        else',
-      '          local.get $classIndex',
-      '          i32.const 3',
-      '          i32.eq',
-      '          if',
-      '            global.get $__jswat_fl_3',
-      '            local.set $head',
-      '          else',
-      '            local.get $classIndex',
-      '            i32.const 4',
-      '            i32.eq',
-      '            if',
-      '              global.get $__jswat_fl_4',
-      '              local.set $head',
-      '            else',
-      '              local.get $classIndex',
-      '              i32.const 5',
-      '              i32.eq',
-      '              if',
-      '                global.get $__jswat_fl_5',
-      '                local.set $head',
-      '              else',
-      '                local.get $classIndex',
-      '                i32.const 6',
-      '                i32.eq',
-      '                if',
-      '                  global.get $__jswat_fl_6',
-      '                  local.set $head',
-      '                else',
-      '                  local.get $classIndex',
-      '                  i32.const 7',
-      '                  i32.eq',
-      '                  if',
-      '                    global.get $__jswat_fl_7',
-      '                    local.set $head',
-      '                  else',
-      '                    local.get $classIndex',
-      '                    i32.const 8',
-      '                    i32.eq',
-      '                    if',
-      '                      global.get $__jswat_fl_8',
-      '                      local.set $head',
-      '                    else',
-      '                      global.get $__jswat_fl_9',
-      '                      local.set $head',
-      '                    end',
-      '                  end',
-      '                end',
-      '              end',
-      '            end',
-      '          end',
-      '        end',
-      '      end',
-      '    end',
-      '    local.get $head',
-      '    i32.eqz',
-      '    br_if $bump',
-      '    local.get $head',
-      '    i32.load',
-      '    local.set $next',
-      '    local.get $classIndex',
-      '    i32.const 0',
-      '    i32.eq',
-      '    if',
-      '      local.get $next',
-      '      global.set $__jswat_fl_0',
-      '    else',
-      '      local.get $classIndex',
-      '      i32.const 1',
-      '      i32.eq',
-      '      if',
-      '        local.get $next',
-      '        global.set $__jswat_fl_1',
-      '      else',
-      '        local.get $classIndex',
-      '        i32.const 2',
-      '        i32.eq',
-      '        if',
-      '          local.get $next',
-      '          global.set $__jswat_fl_2',
-      '        else',
-      '          local.get $classIndex',
-      '          i32.const 3',
-      '          i32.eq',
-      '          if',
-      '            local.get $next',
-      '            global.set $__jswat_fl_3',
-      '          else',
-      '            local.get $classIndex',
-      '            i32.const 4',
-      '            i32.eq',
-      '            if',
-      '              local.get $next',
-      '              global.set $__jswat_fl_4',
-      '            else',
-      '              local.get $classIndex',
-      '              i32.const 5',
-      '              i32.eq',
-      '              if',
-      '                local.get $next',
-      '                global.set $__jswat_fl_5',
-      '              else',
-      '                local.get $classIndex',
-      '                i32.const 6',
-      '                i32.eq',
-      '                if',
-      '                  local.get $next',
-      '                  global.set $__jswat_fl_6',
-      '                else',
-      '                  local.get $classIndex',
-      '                  i32.const 7',
-      '                  i32.eq',
-      '                  if',
-      '                    local.get $next',
-      '                    global.set $__jswat_fl_7',
-      '                  else',
-      '                    local.get $classIndex',
-      '                    i32.const 8',
-      '                    i32.eq',
-      '                    if',
-      '                      local.get $next',
-      '                      global.set $__jswat_fl_8',
-      '                    else',
-      '                      local.get $next',
-      '                      global.set $__jswat_fl_9',
-      '                    end',
-      '                  end',
-      '                end',
-      '              end',
-      '            end',
-      '          end',
-      '        end',
-      '      end',
-      '    end',
-      '    local.get $head',
-      i32Const(-1),
-      '    i32.store',
-      '    local.get $head',
-      '    return',
-      '  end',
-      'end',
+function buildAllocFn(mod) {
+  // params: size(0)
+  // vars: rounded(1), classSize(2), classIndex(3), head(4), next(5), ptr(6), newBump(7), mem(8), pages(9)
+  const getSize = () => mod.local.get(0, binaryen.i32);
+  const getRnd  = () => mod.local.get(1, binaryen.i32);
+  const getCS   = () => mod.local.get(2, binaryen.i32);
+  const getCI   = () => mod.local.get(3, binaryen.i32);
+  const getHead = () => mod.local.get(4, binaryen.i32);
+  const getNext = () => mod.local.get(5, binaryen.i32);
+  const getPtr  = () => mod.local.get(6, binaryen.i32);
+  const getNB   = () => mod.local.get(7, binaryen.i32);
+  const getMem  = () => mod.local.get(8, binaryen.i32);
+  const getPgs  = () => mod.local.get(9, binaryen.i32);
 
-      // bump allocation
-      'global.get $__jswat_bump',
-      'local.set $ptr',
-      'local.get $ptr',
-      'local.get $classSize',
-      'i32.add',
-      'local.set $newBump',
-      'memory.size',
-      i32Const(65536),
-      'i32.mul',
-      'local.set $mem',
-      'local.get $newBump',
-      'local.get $mem',
-      'i32.gt_u',
-      'if',
-      '  local.get $newBump',
-      '  local.get $mem',
-      '  i32.sub',
-      i32Const(65535),
-      '  i32.add',
-      i32Const(65536),
-      '  i32.div_u',
-      '  local.set $pages',
-      '  local.get $pages',
-      '  memory.grow',
-      i32Const(-1),
-      '  i32.eq',
-      '  if',
-      '    unreachable',
-      '  end',
-      'end',
-      'local.get $newBump',
-      'global.set $__jswat_bump',
-      'local.get $ptr',
-      i32Const(-1),
-      'i32.store',
-      'local.get $ptr',
-    ],
-  });
+  const body = mod.block(null, [
+    // rounded = (size + 7) & -8
+    mod.local.set(1, mod.i32.and(
+      mod.i32.add(getSize(), mod.i32.const(7)),
+      mod.i32.const(-8)
+    )),
 
-  const freeFn = buildFunction({
-    name: '__jswat_free',
-    export: '__jswat_free',
-    params: [param('ptr', 'i32'), param('size', 'i32')],
-    result: '',
-    locals: [
-      local('rounded', 'i32'),
-      local('classIndex', 'i32'),
-    ],
-    body: [
-      'local.get $ptr',
-      'i32.eqz',
-      'if',
-      '  return',
-      'end',
-      'local.get $size',
-      i32Const(7),
-      'i32.add',
-      i32Const(-8),
-      'i32.and',
-      'local.set $rounded',
-      'local.get $rounded',
-      i32Const(CLASS_SIZES[0]),
-      'i32.le_u',
-      'if',
-      i32Const(0),
-      '  local.set $classIndex',
-      'else',
-      '  local.get $rounded',
-      i32Const(CLASS_SIZES[1]),
-      '  i32.le_u',
-      '  if',
-      i32Const(1),
-      '    local.set $classIndex',
-      '  else',
-      '    local.get $rounded',
-      i32Const(CLASS_SIZES[2]),
-      '    i32.le_u',
-      '    if',
-      i32Const(2),
-      '      local.set $classIndex',
-      '    else',
-      '      local.get $rounded',
-      i32Const(CLASS_SIZES[3]),
-      '      i32.le_u',
-      '      if',
-      i32Const(3),
-      '        local.set $classIndex',
-      '      else',
-      '        local.get $rounded',
-      i32Const(CLASS_SIZES[4]),
-      '        i32.le_u',
-      '        if',
-      i32Const(4),
-      '          local.set $classIndex',
-      '        else',
-      '          local.get $rounded',
-      i32Const(CLASS_SIZES[5]),
-      '          i32.le_u',
-      '          if',
-      i32Const(5),
-      '            local.set $classIndex',
-      '          else',
-      '            local.get $rounded',
-      i32Const(CLASS_SIZES[6]),
-      '            i32.le_u',
-      '            if',
-      i32Const(6),
-      '              local.set $classIndex',
-      '            else',
-      '              local.get $rounded',
-      i32Const(CLASS_SIZES[7]),
-      '              i32.le_u',
-      '              if',
-      i32Const(7),
-      '                local.set $classIndex',
-      '              else',
-      '                local.get $rounded',
-      i32Const(CLASS_SIZES[8]),
-      '                i32.le_u',
-      '                if',
-      i32Const(8),
-      '                  local.set $classIndex',
-      '                else',
-      '                  local.get $rounded',
-      i32Const(CLASS_SIZES[9]),
-      '                  i32.le_u',
-      '                  if',
-      i32Const(9),
-      '                    local.set $classIndex',
-      '                  else',
-      '                    return',
-      '                  end',
-      '                end',
-      '              end',
-      '            end',
-      '          end',
-      '        end',
-      '      end',
-      '    end',
-      '  end',
-      'end',
+    // pick size class
+    buildSizeClassSelect(mod, getRnd),
 
-      'local.get $classIndex',
-      'i32.const 0',
-      'i32.eq',
-      'if',
-      '  local.get $ptr',
-      '  global.get $__jswat_fl_0',
-      '  i32.store',
-      '  local.get $ptr',
-      '  global.set $__jswat_fl_0',
-      '  return',
-      'end',
-      'local.get $classIndex',
-      'i32.const 1',
-      'i32.eq',
-      'if',
-      '  local.get $ptr',
-      '  global.get $__jswat_fl_1',
-      '  i32.store',
-      '  local.get $ptr',
-      '  global.set $__jswat_fl_1',
-      '  return',
-      'end',
-      'local.get $classIndex',
-      'i32.const 2',
-      'i32.eq',
-      'if',
-      '  local.get $ptr',
-      '  global.get $__jswat_fl_2',
-      '  i32.store',
-      '  local.get $ptr',
-      '  global.set $__jswat_fl_2',
-      '  return',
-      'end',
-      'local.get $classIndex',
-      'i32.const 3',
-      'i32.eq',
-      'if',
-      '  local.get $ptr',
-      '  global.get $__jswat_fl_3',
-      '  i32.store',
-      '  local.get $ptr',
-      '  global.set $__jswat_fl_3',
-      '  return',
-      'end',
-      'local.get $classIndex',
-      'i32.const 4',
-      'i32.eq',
-      'if',
-      '  local.get $ptr',
-      '  global.get $__jswat_fl_4',
-      '  i32.store',
-      '  local.get $ptr',
-      '  global.set $__jswat_fl_4',
-      '  return',
-      'end',
-      'local.get $classIndex',
-      'i32.const 5',
-      'i32.eq',
-      'if',
-      '  local.get $ptr',
-      '  global.get $__jswat_fl_5',
-      '  i32.store',
-      '  local.get $ptr',
-      '  global.set $__jswat_fl_5',
-      '  return',
-      'end',
-      'local.get $classIndex',
-      'i32.const 6',
-      'i32.eq',
-      'if',
-      '  local.get $ptr',
-      '  global.get $__jswat_fl_6',
-      '  i32.store',
-      '  local.get $ptr',
-      '  global.set $__jswat_fl_6',
-      '  return',
-      'end',
-      'local.get $classIndex',
-      'i32.const 7',
-      'i32.eq',
-      'if',
-      '  local.get $ptr',
-      '  global.get $__jswat_fl_7',
-      '  i32.store',
-      '  local.get $ptr',
-      '  global.set $__jswat_fl_7',
-      '  return',
-      'end',
-      'local.get $classIndex',
-      'i32.const 8',
-      'i32.eq',
-      'if',
-      '  local.get $ptr',
-      '  global.get $__jswat_fl_8',
-      '  i32.store',
-      '  local.get $ptr',
-      '  global.set $__jswat_fl_8',
-      '  return',
-      'end',
-      'local.get $ptr',
-      'global.get $__jswat_fl_9',
-      'i32.store',
-      'local.get $ptr',
-      'global.set $__jswat_fl_9',
-    ],
-  });
+    // try free list
+    mod.block('bump', [
+      mod.if(
+        mod.i32.le_u(getCI(), mod.i32.const(9)),
+        mod.block(null, [
+          buildGetFreeList(mod, getCI),
+          mod.br_if('bump', mod.i32.eqz(getHead())),
+          mod.local.set(5, mod.i32.load(0, 0, getHead())),
+          buildSetFreeList(mod, getCI, getNext),
+          mod.i32.store(0, 0, getHead(), mod.i32.const(-1)),
+          mod.return(getHead()),
+        ], binaryen.none)
+      ),
+    ], binaryen.none),
 
-  const allocBytesFn = buildFunction({
-    name: '__jswat_alloc_bytes',
-    export: '__jswat_alloc_bytes',
-    params: [param('n', 'i32'), param('fill', 'i32')],
-    result: 'i32',
-    locals: [local('ptr', 'i32'), local('size', 'i32')],
-    body: [
-      'local.get $n',
-      i32Const(4),
-      'i32.add',
-      'local.set $size',
-      'local.get $size',
-      'call $__jswat_alloc',
-      'local.tee $ptr',
-      i32Const(4),
-      'i32.add',
-      'local.get $fill',
-      'local.get $n',
-      'memory.fill',
-      'local.get $ptr',
-      i32Const(4),
-      'i32.add',
-    ],
-  });
+    // bump allocation
+    mod.local.set(6, mod.global.get('__jswat_bump', binaryen.i32)),
+    mod.local.set(7, mod.i32.add(getPtr(), getCS())),
+    mod.local.set(8, mod.i32.mul(mod.memory.size(), mod.i32.const(65536))),
+    mod.if(
+      mod.i32.gt_u(getNB(), getMem()),
+      mod.block(null, [
+        mod.local.set(9,
+          mod.i32.div_u(
+            mod.i32.add(mod.i32.sub(getNB(), getMem()), mod.i32.const(65535)),
+            mod.i32.const(65536)
+          )
+        ),
+        mod.if(
+          mod.i32.eq(mod.memory.grow(getPgs()), mod.i32.const(-1)),
+          mod.unreachable()
+        ),
+      ], binaryen.none)
+    ),
+    mod.global.set('__jswat_bump', getNB()),
+    mod.i32.store(0, 0, getPtr(), mod.i32.const(-1)),
+    mod.return(getPtr()),
+  ], binaryen.i32);
 
-  const freeBytesFn = buildFunction({
-    name: '__jswat_free_bytes',
-    export: '__jswat_free_bytes',
-    params: [param('ptr', 'i32'), param('n', 'i32')],
-    result: '',
-    locals: [local('hdr', 'i32'), local('size', 'i32')],
-    body: [
-      'local.get $ptr',
-      i32Const(4),
-      'i32.sub',
-      'local.set $hdr',
-      'local.get $n',
-      i32Const(4),
-      'i32.add',
-      'local.set $size',
-      'local.get $hdr',
-      'local.get $size',
-      'call $__jswat_free',
-    ],
-  });
+  mod.addFunction('__jswat_alloc',
+    binaryen.createType([binaryen.i32]), binaryen.i32,
+    new Array(9).fill(binaryen.i32),
+    body);
+  mod.addFunctionExport('__jswat_alloc', '__jswat_alloc');
+}
 
-  const reallocFn = buildFunction({
-    name: '__jswat_realloc',
-    export: '__jswat_realloc',
-    params: [param('ptr', 'i32'), param('oldSize', 'i32'), param('newSize', 'i32')],
-    result: 'i32',
-    locals: [local('newPtr', 'i32'), local('copyLen', 'i32')],
-    body: [
-      'local.get $newSize',
-      'local.get $oldSize',
-      'i32.eq',
-      'if',
-      '  local.get $ptr',
-      '  return',
-      'end',
-      'local.get $newSize',
-      i32Const(0),
-      'call $__jswat_alloc_bytes',
-      'local.set $newPtr',
-      'local.get $oldSize',
-      'local.get $newSize',
-      'i32.lt_u',
-      'if',
-      '  local.get $oldSize',
-      '  local.set $copyLen',
-      'else',
-      '  local.get $newSize',
-      '  local.set $copyLen',
-      'end',
-      'local.get $newPtr',
-      'local.get $ptr',
-      'local.get $copyLen',
-      'memory.copy',
-      'local.get $ptr',
-      'local.get $oldSize',
-      'call $__jswat_free_bytes',
-      'local.get $newPtr',
-    ],
-  });
+function buildFreeFn(mod) {
+  // params: ptr(0), size(1)
+  // vars: rounded(2), classIndex(3)
+  const getPtr = () => mod.local.get(0, binaryen.i32);
+  const getSize = () => mod.local.get(1, binaryen.i32);
+  const getRnd  = () => mod.local.get(2, binaryen.i32);
+  const getCI   = () => mod.local.get(3, binaryen.i32);
 
-  const allocWrapper = buildFunction({
-    name: '__alloc',
-    export: '__alloc',
-    params: [param('size', 'i32')],
-    result: 'i32',
-    body: ['local.get $size', 'call $__jswat_alloc'],
-  });
+  // Build the free-list return cases:
+  // if classIndex == i: ptr.store(fl_i); fl_i = ptr; return
+  const buildFreeCase = (i) => mod.if(
+    mod.i32.eq(getCI(), mod.i32.const(i)),
+    mod.block(null, [
+      mod.i32.store(0, 0, getPtr(), mod.global.get(`__jswat_fl_${i}`, binaryen.i32)),
+      mod.global.set(`__jswat_fl_${i}`, getPtr()),
+      mod.return(),
+    ], binaryen.none)
+  );
 
-  const freeWrapper = buildFunction({
-    name: '__free',
-    export: '__free',
-    params: [param('ptr', 'i32'), param('size', 'i32')],
-    result: '',
-    body: ['local.get $ptr', 'local.get $size', 'call $__jswat_free'],
-  });
+  // Size class selection for free (sets classIndex only, no classSize needed)
+  // Build from inside out
+  let sizeSelect = mod.block(null, [
+    mod.return(), // classIndex >= 10 (large): just return (no free list)
+  ], binaryen.none);
+  for (let i = CLASS_SIZES.length - 1; i >= 0; i--) {
+    sizeSelect = mod.if(
+      mod.i32.le_u(getRnd(), mod.i32.const(CLASS_SIZES[i])),
+      mod.local.set(3, mod.i32.const(i)),
+      sizeSelect
+    );
+  }
 
-  return {
-    globals,
-    functions: [allocFn, freeFn, allocBytesFn, freeBytesFn, reallocFn, allocWrapper, freeWrapper],
-  };
+  const freeCases = [];
+  for (let i = 0; i < CLASS_SIZES.length - 1; i++) {
+    freeCases.push(buildFreeCase(i));
+  }
+  freeCases.push(mod.block(null, [
+    mod.i32.store(0, 0, getPtr(), mod.global.get('__jswat_fl_9', binaryen.i32)),
+    mod.global.set('__jswat_fl_9', getPtr()),
+  ], binaryen.none));
+
+  const body = mod.block(null, [
+    mod.if(mod.i32.eqz(getPtr()), mod.return()),
+    // rounded = (size + 7) & -8
+    mod.local.set(2, mod.i32.and(
+      mod.i32.add(getSize(), mod.i32.const(7)),
+      mod.i32.const(-8)
+    )),
+    sizeSelect,
+    ...freeCases,
+  ], binaryen.none);
+
+  mod.addFunction('__jswat_free',
+    binaryen.createType([binaryen.i32, binaryen.i32]), binaryen.none,
+    [binaryen.i32, binaryen.i32],
+    body);
+  mod.addFunctionExport('__jswat_free', '__jswat_free');
+}
+
+function buildAllocBytesFn(mod) {
+  // params: n(0), fill(1)
+  // vars: ptr(2), size(3)
+  const getN    = () => mod.local.get(0, binaryen.i32);
+  const getFill = () => mod.local.get(1, binaryen.i32);
+  const getPtr  = () => mod.local.get(2, binaryen.i32);
+  const getSize = () => mod.local.get(3, binaryen.i32);
+
+  const body = mod.block(null, [
+    mod.local.set(3, mod.i32.add(getN(), mod.i32.const(4))),
+    // ptr = alloc(size); then fill ptr+4..ptr+4+n with fill
+    mod.memory.fill(
+      mod.i32.add(
+        mod.local.tee(2, mod.call('__jswat_alloc', [getSize()], binaryen.i32), binaryen.i32),
+        mod.i32.const(4)
+      ),
+      getFill(),
+      getN()
+    ),
+    mod.return(mod.i32.add(getPtr(), mod.i32.const(4))),
+  ], binaryen.i32);
+
+  mod.addFunction('__jswat_alloc_bytes',
+    binaryen.createType([binaryen.i32, binaryen.i32]), binaryen.i32,
+    [binaryen.i32, binaryen.i32],
+    body);
+  mod.addFunctionExport('__jswat_alloc_bytes', '__jswat_alloc_bytes');
+}
+
+function buildFreeBytesFn(mod) {
+  // params: ptr(0), n(1)
+  // vars: hdr(2), size(3)
+  const getPtr  = () => mod.local.get(0, binaryen.i32);
+  const getN    = () => mod.local.get(1, binaryen.i32);
+  const getHdr  = () => mod.local.get(2, binaryen.i32);
+  const getSize = () => mod.local.get(3, binaryen.i32);
+
+  const body = mod.block(null, [
+    mod.local.set(2, mod.i32.sub(getPtr(), mod.i32.const(4))),
+    mod.local.set(3, mod.i32.add(getN(), mod.i32.const(4))),
+    mod.call('__jswat_free', [getHdr(), getSize()], binaryen.none),
+  ], binaryen.none);
+
+  mod.addFunction('__jswat_free_bytes',
+    binaryen.createType([binaryen.i32, binaryen.i32]), binaryen.none,
+    [binaryen.i32, binaryen.i32],
+    body);
+  mod.addFunctionExport('__jswat_free_bytes', '__jswat_free_bytes');
+}
+
+function buildReallocFn(mod) {
+  // params: ptr(0), oldSize(1), newSize(2)
+  // vars: newPtr(3), copyLen(4)
+  const getPtr     = () => mod.local.get(0, binaryen.i32);
+  const getOldSize = () => mod.local.get(1, binaryen.i32);
+  const getNewSize = () => mod.local.get(2, binaryen.i32);
+  const getNewPtr  = () => mod.local.get(3, binaryen.i32);
+  const getCopyLen = () => mod.local.get(4, binaryen.i32);
+
+  const body = mod.block(null, [
+    mod.if(
+      mod.i32.eq(getNewSize(), getOldSize()),
+      mod.return(getPtr())
+    ),
+    mod.local.set(3, mod.call('__jswat_alloc_bytes', [getNewSize(), mod.i32.const(0)], binaryen.i32)),
+    mod.if(
+      mod.i32.lt_u(getOldSize(), getNewSize()),
+      mod.local.set(4, getOldSize()),
+      mod.local.set(4, getNewSize())
+    ),
+    mod.memory.copy(getNewPtr(), getPtr(), getCopyLen()),
+    mod.call('__jswat_free_bytes', [getPtr(), getOldSize()], binaryen.none),
+    mod.return(getNewPtr()),
+  ], binaryen.i32);
+
+  mod.addFunction('__jswat_realloc',
+    binaryen.createType([binaryen.i32, binaryen.i32, binaryen.i32]), binaryen.i32,
+    [binaryen.i32, binaryen.i32],
+    body);
+  mod.addFunctionExport('__jswat_realloc', '__jswat_realloc');
+}
+
+/**
+ * Add allocator globals and functions to the binaryen module.
+ * @param {any} mod  binaryen Module
+ */
+export function buildAllocator(mod) {
+  mod.addGlobal('__jswat_bump', binaryen.i32, true, mod.i32.const(1024));
+  for (let i = 0; i < CLASS_SIZES.length; i++) {
+    mod.addGlobal(`__jswat_fl_${i}`, binaryen.i32, true, mod.i32.const(0));
+  }
+
+  buildAllocFn(mod);
+  buildFreeFn(mod);
+  buildAllocBytesFn(mod);
+  buildFreeBytesFn(mod);
+  buildReallocFn(mod);
+
+  // __alloc / __free wrappers
+  mod.addFunction('__alloc',
+    binaryen.createType([binaryen.i32]), binaryen.i32, [],
+    mod.call('__jswat_alloc', [mod.local.get(0, binaryen.i32)], binaryen.i32));
+  mod.addFunctionExport('__alloc', '__alloc');
+
+  mod.addFunction('__free',
+    binaryen.createType([binaryen.i32, binaryen.i32]), binaryen.none, [],
+    mod.call('__jswat_free',
+      [mod.local.get(0, binaryen.i32), mod.local.get(1, binaryen.i32)],
+      binaryen.none));
+  mod.addFunctionExport('__free', '__free');
 }

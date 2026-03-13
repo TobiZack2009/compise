@@ -19,9 +19,10 @@ describe('codegen — WAT structure', () => {
     assert.ok(wat.includes('(func $add'), `missing (func $add in:\n${wat}`);
   });
 
-  it('emits (param $x i32)', async () => {
+  it('emits i32 param for integer function', async () => {
     const { wat } = await compileSource('function add(x = 0, y = 0) { return x + y; }');
-    assert.ok(wat.includes('(param $x i32)'), `missing (param $x i32) in:\n${wat}`);
+    // binaryen emits indexed names like $0, $1 rather than user-defined names
+    assert.ok(wat.includes('(param $0 i32)'), `missing i32 param in:\n${wat}`);
   });
 
   it('emits (result i32)', async () => {
@@ -31,17 +32,20 @@ describe('codegen — WAT structure', () => {
 
   it('emits memory export', async () => {
     const { wat } = await compileSource('function add(x = 0, y = 0) { return x + y; }');
-    assert.ok(wat.includes('(memory (export "memory") 1)'), `missing memory export in:\n${wat}`);
+    // binaryen emits (export "memory" (memory $0)) rather than inline (export "memory")
+    assert.ok(wat.includes('(export "memory"'), `missing memory export in:\n${wat}`);
   });
 
   it('emits function export', async () => {
     const { wat } = await compileSource('function add(x = 0, y = 0) { return x + y; }');
-    assert.ok(wat.includes('(export "add")'), `missing function export in:\n${wat}`);
+    // binaryen emits (export "add" (func $add))
+    assert.ok(wat.includes('(export "add" (func $add))'), `missing function export in:\n${wat}`);
   });
 
   it('emits f64 param for float function', async () => {
     const { wat } = await compileSource('function fadd(a = 0.0, b = 0.0) { return a + b; }');
-    assert.ok(wat.includes('(param $a f64)'), `missing f64 param in:\n${wat}`);
+    // binaryen emits indexed names like $0 not user-defined names
+    assert.ok(wat.includes('(param $0 f64)'), `missing f64 param in:\n${wat}`);
     assert.ok(wat.includes('(result f64)'), `missing f64 result in:\n${wat}`);
   });
 

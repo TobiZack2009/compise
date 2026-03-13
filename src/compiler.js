@@ -1,13 +1,13 @@
 /**
  * @fileoverview Pipeline orchestrator — wires parser → validator → typecheck → codegen → wabt.
+ * Zero Node.js-specific imports; safe to bundle for the browser.
  */
 
-import { readFile } from 'fs/promises';
 import initWabt from 'wabt';
 import { parseSource } from './parser.js';
 import { validate }    from './validator.js';
 import { inferTypes }  from './typecheck.js';
-import { generateWat } from './codegen.js';
+import { generateWat } from './codegen/index.js';
 
 /**
  * @typedef {{ wat: string, wasm: Uint8Array|null, warnings: string[] }} CompileResult
@@ -81,25 +81,9 @@ export async function compileSource(source, filename = '<input>', opts = {}) {
     return { wat: '', wasm: null, warnings };
   }
 
-  // 4. Code generation
-  const wat = generateWat(typedAst, signatures, classes, imports, filename);
-
-  // 5. Assemble
-  const wasm = await watToWasm(wat, filename.replace(/\.js$/, '.wat'));
+  // 4. Code generation + assemble (binaryen emits binary directly)
+  const { wat, binary: wasm } = generateWat(typedAst, signatures, classes, imports, filename);
 
   return { wat, wasm, warnings };
 }
 
-/**
- * Main compile entry point — reads from a file path.
- *
- * @param {{ input: string, output?: string|null,
- *            checkOnly?: boolean, emitWat?: boolean }} opts
- * @returns {Promise<CompileResult>}
- */
-export async function compile(opts) {
-  const { input, checkOnly = false } = opts;
-
-  const source = await readFile(input, 'utf8');
-  return compileSource(source, input, { checkOnly });
-}

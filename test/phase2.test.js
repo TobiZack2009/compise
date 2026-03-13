@@ -11,10 +11,18 @@ import { compileSource } from '../src/compiler.js';
  * @param {string} path  path relative to project root
  * @returns {Promise<WebAssembly.Exports>}
  */
+// Minimal WASI stubs so examples that import std/io compile without missing imports.
+const WASI_STUBS = {
+  wasi_snapshot_preview1: {
+    fd_write: () => 0, fd_read: () => 0, proc_exit: () => {},
+    environ_get: () => 0, environ_sizes_get: () => 0,
+  },
+};
+
 async function instantiateFile(path) {
   const source = await readFile(new URL('../' + path, import.meta.url), 'utf8');
   const { wasm } = await compileSource(source, path);
-  const { instance } = await WebAssembly.instantiate(wasm);
+  const { instance } = await WebAssembly.instantiate(wasm, WASI_STUBS);
   if (instance.exports.__start) instance.exports.__start();
   return instance.exports;
 }
