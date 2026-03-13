@@ -307,6 +307,138 @@ export function buildStringFunctions(mod) {
   mod.addFunction('__jswat_string_from_i32',
     binaryen.createType([i32]), i32,
     [i32, i32, i32, i32, i32, i32], body);
+
+  // __jswat_str_length(str:i32) -> i32
+  mod.addFunction('__jswat_str_length',
+    binaryen.createType([i32]), i32, [],
+    mod.if(mod.i32.eqz(mod.local.get(0, i32)), mod.i32.const(0),
+      mod.i32.load(0, 0, mod.local.get(0, i32))));
+
+  // __jswat_str_char_at(str:i32, idx:i32) -> i32
+  // Returns the byte value at position idx; -1 if out of range.
+  {
+    const gstr = () => mod.local.get(0, i32);
+    const gidx = () => mod.local.get(1, i32);
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(gstr()), mod.return(mod.i32.const(-1))),
+      mod.if(mod.i32.ge_u(gidx(), mod.i32.load(0, 0, gstr())), mod.return(mod.i32.const(-1))),
+      mod.return(mod.i32.load8_u(0, 0,
+        mod.i32.add(mod.i32.add(gstr(), mod.i32.const(8)), gidx()))),
+    ], i32);
+    mod.addFunction('__jswat_str_char_at', binaryen.createType([i32, i32]), i32, [], body);
+  }
+
+  // __jswat_str_concat(a:i32, b:i32) -> i32
+  // params: a(0:i32), b(1:i32); locals: la(2:i32), lb(3:i32), total(4:i32), ptr(5:i32)
+  {
+    const ga  = () => mod.local.get(0, i32);
+    const gb  = () => mod.local.get(1, i32);
+    const gla = () => mod.local.get(2, i32);
+    const glb = () => mod.local.get(3, i32);
+    const gtotal = () => mod.local.get(4, i32);
+    const gptr   = () => mod.local.get(5, i32);
+    const body = mod.block(null, [
+      mod.local.set(2, mod.if(mod.i32.eqz(ga()), mod.i32.const(0), mod.i32.load(0, 0, ga()), i32)),
+      mod.local.set(3, mod.if(mod.i32.eqz(gb()), mod.i32.const(0), mod.i32.load(0, 0, gb()), i32)),
+      mod.local.set(4, mod.i32.add(gla(), glb())),
+      mod.local.set(5, mod.call('__jswat_alloc_bytes',
+        [mod.i32.add(gtotal(), mod.i32.const(8)), mod.i32.const(0)], i32)),
+      mod.i32.store(0, 0, gptr(), gtotal()),
+      mod.i32.store(4, 0, gptr(), mod.i32.const(0)),
+      mod.if(mod.i32.gt_u(gla(), mod.i32.const(0)),
+        mod.memory.copy(
+          mod.i32.add(gptr(), mod.i32.const(8)),
+          mod.i32.add(ga(), mod.i32.const(8)), gla())),
+      mod.if(mod.i32.gt_u(glb(), mod.i32.const(0)),
+        mod.memory.copy(
+          mod.i32.add(mod.i32.add(gptr(), mod.i32.const(8)), gla()),
+          mod.i32.add(gb(), mod.i32.const(8)), glb())),
+      mod.return(gptr()),
+    ], i32);
+    mod.addFunction('__jswat_str_concat', binaryen.createType([i32, i32]), i32, [i32, i32, i32, i32], body);
+  }
+
+  // __jswat_str_slice(str:i32, start:i32, end:i32) -> i32
+  // params: str(0:i32), start(1:i32), end(2:i32); locals: len(3:i32), slen(4:i32), ptr(5:i32)
+  {
+    const gstr   = () => mod.local.get(0, i32);
+    const gstart = () => mod.local.get(1, i32);
+    const gend   = () => mod.local.get(2, i32);
+    const gstrlen = () => mod.local.get(3, i32);
+    const gslen  = () => mod.local.get(4, i32);
+    const gptr   = () => mod.local.get(5, i32);
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(gstr()), mod.return(mod.i32.const(0))),
+      mod.local.set(3, mod.i32.load(0, 0, gstr())),    // strlen
+      // clamp start/end
+      mod.if(mod.i32.lt_s(gstart(), mod.i32.const(0)),
+        mod.local.set(1, mod.i32.const(0))),
+      mod.if(mod.i32.gt_u(gstart(), gstrlen()),
+        mod.local.set(1, gstrlen())),
+      mod.if(mod.i32.lt_s(gend(), mod.i32.const(0)),
+        mod.local.set(2, mod.i32.const(0))),
+      mod.if(mod.i32.gt_u(gend(), gstrlen()),
+        mod.local.set(2, gstrlen())),
+      mod.if(mod.i32.le_u(gend(), gstart()), mod.return(mod.i32.const(0))),
+      mod.local.set(4, mod.i32.sub(gend(), gstart())),  // slice length
+      mod.local.set(5, mod.call('__jswat_alloc_bytes',
+        [mod.i32.add(gslen(), mod.i32.const(8)), mod.i32.const(0)], i32)),
+      mod.i32.store(0, 0, gptr(), gslen()),
+      mod.i32.store(4, 0, gptr(), mod.i32.const(0)),
+      mod.memory.copy(
+        mod.i32.add(gptr(), mod.i32.const(8)),
+        mod.i32.add(mod.i32.add(gstr(), mod.i32.const(8)), gstart()),
+        gslen()),
+      mod.return(gptr()),
+    ], i32);
+    mod.addFunction('__jswat_str_slice', binaryen.createType([i32, i32, i32]), i32, [i32, i32, i32], body);
+  }
+
+  // __jswat_str_index_of(str:i32, needle:i32) -> i32  (returns -1 if not found)
+  // params: str(0:i32), needle(1:i32); locals: slen(2:i32), nlen(3:i32), i(4:i32), j(5:i32)
+  {
+    const gstr    = () => mod.local.get(0, i32);
+    const gneedle = () => mod.local.get(1, i32);
+    const gslen   = () => mod.local.get(2, i32);
+    const gnlen   = () => mod.local.get(3, i32);
+    const gi      = () => mod.local.get(4, i32);
+    const gj      = () => mod.local.get(5, i32);
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(gstr()), mod.return(mod.i32.const(-1))),
+      mod.if(mod.i32.eqz(gneedle()), mod.return(mod.i32.const(-1))),
+      mod.local.set(2, mod.i32.load(0, 0, gstr())),
+      mod.local.set(3, mod.i32.load(0, 0, gneedle())),
+      mod.if(mod.i32.eqz(gnlen()), mod.return(mod.i32.const(0))),
+      mod.local.set(4, mod.i32.const(0)),
+      mod.block('search_done', [
+        mod.loop('search_outer', mod.block(null, [
+          // if i > slen - nlen: not found
+          mod.br_if('search_done',
+            mod.i32.gt_s(gi(), mod.i32.sub(gslen(), gnlen()))),
+          // inner match loop
+          mod.local.set(5, mod.i32.const(0)),
+          mod.block('match_done', [
+            mod.loop('match_inner', mod.block(null, [
+              mod.br_if('match_done', mod.i32.ge_u(gj(), gnlen())),
+              mod.if(
+                mod.i32.ne(
+                  mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gstr(), mod.i32.const(8)), mod.i32.add(gi(), gj()))),
+                  mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gneedle(), mod.i32.const(8)), gj()))),
+                mod.block(null, [mod.local.set(5, mod.i32.const(-1)), mod.br('match_done')], none)),
+              mod.local.set(5, mod.i32.add(gj(), mod.i32.const(1))),
+              mod.br('match_inner'),
+            ], none)),
+          ], none),
+          // if j == nlen: found at i
+          mod.if(mod.i32.eq(gj(), gnlen()), mod.return(gi())),
+          mod.local.set(4, mod.i32.add(gi(), mod.i32.const(1))),
+          mod.br('search_outer'),
+        ], none)),
+      ], none),
+      mod.return(mod.i32.const(-1)),
+    ], i32);
+    mod.addFunction('__jswat_str_index_of', binaryen.createType([i32, i32]), i32, [i32, i32, i32, i32], body);
+  }
 }
 
 // ── std/collections ───────────────────────────────────────────────────────────
@@ -1356,6 +1488,408 @@ export function buildClockFunctions(mod, clockBase) {
     ], none);
     mod.addFunction('__jswat_clock_sleep',
       binaryen.createType([i32]), none, [i32], body);
+  }
+}
+
+// ── std/math ──────────────────────────────────────────────────────────────────
+
+/**
+ * Build std/math functions.
+ * Native ops are thin wrappers; pow/sin/cos/exp/log use polynomial approximations.
+ * @param {any} mod
+ */
+export function buildMathFunctions(mod) {
+  // ── Native single-arg wrappers ─────────────────────────────────────────────
+  for (const [name, op] of [
+    ['__jswat_math_sqrt',  'sqrt'],
+    ['__jswat_math_floor', 'floor'],
+    ['__jswat_math_ceil',  'ceil'],
+    ['__jswat_math_abs',   'abs'],
+    ['__jswat_math_trunc', 'trunc'],
+  ]) {
+    mod.addFunction(name, binaryen.createType([f64]), f64, [],
+      mod.return(mod.f64[op](mod.local.get(0, f64))));
+  }
+
+  // ── Native two-arg wrappers ────────────────────────────────────────────────
+  for (const [name, op] of [['__jswat_math_min', 'min'], ['__jswat_math_max', 'max']]) {
+    mod.addFunction(name, binaryen.createType([f64, f64]), f64, [],
+      mod.return(mod.f64[op](mod.local.get(0, f64), mod.local.get(1, f64))));
+  }
+
+  // ── exp(x): Taylor series sum(x^n/n!) for n=0..20 ────────────────────────
+  // params: x(0:f64); locals: result(1:f64), term(2:f64), i(3:i32)
+  {
+    const gx = () => mod.local.get(0, f64);
+    const gr = () => mod.local.get(1, f64);
+    const gt = () => mod.local.get(2, f64);
+    const gi = () => mod.local.get(3, i32);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.f64.const(1.0)),
+      mod.local.set(2, mod.f64.const(1.0)),
+      mod.local.set(3, mod.i32.const(1)),
+      mod.block('exp_done', [
+        mod.loop('exp_loop', mod.block(null, [
+          mod.br_if('exp_done', mod.i32.gt_s(gi(), mod.i32.const(20))),
+          mod.local.set(2, mod.f64.div(mod.f64.mul(gt(), gx()), mod.f64.convert_s.i32(gi()))),
+          mod.local.set(1, mod.f64.add(gr(), gt())),
+          mod.local.set(3, mod.i32.add(gi(), mod.i32.const(1))),
+          mod.br('exp_loop'),
+        ], none)),
+      ], none),
+      mod.return(gr()),
+    ], f64);
+    mod.addFunction('__jswat_math_exp', binaryen.createType([f64]), f64, [f64, f64, i32], body);
+  }
+
+  // ── log(x): 2*atanh((x-1)/(x+1)), atanh(t)=sum(t^(2k+1)/(2k+1)) ─────────
+  // params: x(0:f64); locals: t(1:f64), t2(2:f64), term(3:f64), result(4:f64), k(5:i32)
+  {
+    const gx    = () => mod.local.get(0, f64);
+    const gt    = () => mod.local.get(1, f64);
+    const gt2   = () => mod.local.get(2, f64);
+    const gterm = () => mod.local.get(3, f64);
+    const gr    = () => mod.local.get(4, f64);
+    const gk    = () => mod.local.get(5, i32);
+    const body = mod.block(null, [
+      mod.if(mod.f64.le(gx(), mod.f64.const(0.0)), mod.return(mod.f64.const(0.0))),
+      mod.local.set(1, mod.f64.div(
+        mod.f64.sub(gx(), mod.f64.const(1.0)),
+        mod.f64.add(gx(), mod.f64.const(1.0)))),
+      mod.local.set(2, mod.f64.mul(gt(), gt())),
+      mod.local.set(3, gt()),
+      mod.local.set(4, mod.f64.const(0.0)),
+      mod.local.set(5, mod.i32.const(0)),
+      mod.block('log_done', [
+        mod.loop('log_loop', mod.block(null, [
+          mod.br_if('log_done', mod.i32.gt_s(gk(), mod.i32.const(24))),
+          mod.local.set(4, mod.f64.add(gr(), mod.f64.div(
+            gterm(),
+            mod.f64.convert_s.i32(mod.i32.add(mod.i32.mul(gk(), mod.i32.const(2)), mod.i32.const(1)))))),
+          mod.local.set(3, mod.f64.mul(gterm(), gt2())),
+          mod.local.set(5, mod.i32.add(gk(), mod.i32.const(1))),
+          mod.br('log_loop'),
+        ], none)),
+      ], none),
+      mod.return(mod.f64.mul(mod.f64.const(2.0), gr())),
+    ], f64);
+    mod.addFunction('__jswat_math_log', binaryen.createType([f64]), f64, [f64, f64, f64, f64, i32], body);
+  }
+
+  // ── sin(x): Taylor with arg reduction to [-π, π] ─────────────────────────
+  // params: x(0:f64); locals: k(1:f64), xsq(2:f64), result(3:f64), term(4:f64), n(5:i32), sign(6:f64)
+  {
+    const TWO_PI = 6.283185307179586;
+    const PI     = 3.141592653589793;
+    const gx    = () => mod.local.get(0, f64);
+    const gk    = () => mod.local.get(1, f64);
+    const gxsq  = () => mod.local.get(2, f64);
+    const gr    = () => mod.local.get(3, f64);
+    const gterm = () => mod.local.get(4, f64);
+    const gn    = () => mod.local.get(5, i32);
+    const gsign = () => mod.local.get(6, f64);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.f64.floor(mod.f64.div(gx(), mod.f64.const(TWO_PI)))),
+      mod.local.set(0, mod.f64.sub(gx(), mod.f64.mul(gk(), mod.f64.const(TWO_PI)))),
+      mod.if(mod.f64.gt(gx(), mod.f64.const(PI)),
+        mod.local.set(0, mod.f64.sub(gx(), mod.f64.const(TWO_PI)))),
+      mod.if(mod.f64.lt(gx(), mod.f64.const(-PI)),
+        mod.local.set(0, mod.f64.add(gx(), mod.f64.const(TWO_PI)))),
+      mod.local.set(2, mod.f64.mul(gx(), gx())),
+      mod.local.set(3, mod.f64.const(0.0)),
+      mod.local.set(4, gx()),
+      mod.local.set(5, mod.i32.const(0)),
+      mod.local.set(6, mod.f64.const(1.0)),
+      mod.block('sin_done', [
+        mod.loop('sin_loop', mod.block(null, [
+          mod.br_if('sin_done', mod.i32.gt_s(gn(), mod.i32.const(12))),
+          mod.local.set(3, mod.f64.add(gr(), mod.f64.mul(gsign(), gterm()))),
+          mod.local.set(4, mod.f64.div(
+            mod.f64.mul(gterm(), gxsq()),
+            mod.f64.convert_s.i32(mod.i32.mul(
+              mod.i32.add(mod.i32.mul(gn(), mod.i32.const(2)), mod.i32.const(2)),
+              mod.i32.add(mod.i32.mul(gn(), mod.i32.const(2)), mod.i32.const(3)))))),
+          mod.local.set(6, mod.f64.sub(mod.f64.const(0.0), gsign())),
+          mod.local.set(5, mod.i32.add(gn(), mod.i32.const(1))),
+          mod.br('sin_loop'),
+        ], none)),
+      ], none),
+      mod.return(gr()),
+    ], f64);
+    mod.addFunction('__jswat_math_sin',
+      binaryen.createType([f64]), f64, [f64, f64, f64, f64, i32, f64], body);
+  }
+
+  // ── cos(x): Taylor with arg reduction to [-π, π] ─────────────────────────
+  // params: x(0:f64); locals: k(1:f64), xsq(2:f64), result(3:f64), term(4:f64), n(5:i32), sign(6:f64)
+  {
+    const TWO_PI = 6.283185307179586;
+    const PI     = 3.141592653589793;
+    const gx    = () => mod.local.get(0, f64);
+    const gk    = () => mod.local.get(1, f64);
+    const gxsq  = () => mod.local.get(2, f64);
+    const gr    = () => mod.local.get(3, f64);
+    const gterm = () => mod.local.get(4, f64);
+    const gn    = () => mod.local.get(5, i32);
+    const gsign = () => mod.local.get(6, f64);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.f64.floor(mod.f64.div(gx(), mod.f64.const(TWO_PI)))),
+      mod.local.set(0, mod.f64.sub(gx(), mod.f64.mul(gk(), mod.f64.const(TWO_PI)))),
+      mod.if(mod.f64.gt(gx(), mod.f64.const(PI)),
+        mod.local.set(0, mod.f64.sub(gx(), mod.f64.const(TWO_PI)))),
+      mod.if(mod.f64.lt(gx(), mod.f64.const(-PI)),
+        mod.local.set(0, mod.f64.add(gx(), mod.f64.const(TWO_PI)))),
+      mod.local.set(2, mod.f64.mul(gx(), gx())),
+      mod.local.set(3, mod.f64.const(0.0)),
+      mod.local.set(4, mod.f64.const(1.0)),
+      mod.local.set(5, mod.i32.const(0)),
+      mod.local.set(6, mod.f64.const(1.0)),
+      mod.block('cos_done', [
+        mod.loop('cos_loop', mod.block(null, [
+          mod.br_if('cos_done', mod.i32.gt_s(gn(), mod.i32.const(12))),
+          mod.local.set(3, mod.f64.add(gr(), mod.f64.mul(gsign(), gterm()))),
+          mod.local.set(4, mod.f64.div(
+            mod.f64.mul(gterm(), gxsq()),
+            mod.f64.convert_s.i32(mod.i32.mul(
+              mod.i32.add(mod.i32.mul(gn(), mod.i32.const(2)), mod.i32.const(1)),
+              mod.i32.add(mod.i32.mul(gn(), mod.i32.const(2)), mod.i32.const(2)))))),
+          mod.local.set(6, mod.f64.sub(mod.f64.const(0.0), gsign())),
+          mod.local.set(5, mod.i32.add(gn(), mod.i32.const(1))),
+          mod.br('cos_loop'),
+        ], none)),
+      ], none),
+      mod.return(gr()),
+    ], f64);
+    mod.addFunction('__jswat_math_cos',
+      binaryen.createType([f64]), f64, [f64, f64, f64, f64, i32, f64], body);
+  }
+
+  // ── pow(base, exp) = exp(exp * log(base)) ─────────────────────────────────
+  mod.addFunction('__jswat_math_pow',
+    binaryen.createType([f64, f64]), f64, [],
+    mod.return(mod.call('__jswat_math_exp', [
+      mod.f64.mul(mod.local.get(1, f64),
+        mod.call('__jswat_math_log', [mod.local.get(0, f64)], f64)),
+    ], f64)));
+}
+
+// ── std/iter ──────────────────────────────────────────────────────────────────
+// Iterator struct: [tag:i32 @ 0][state_ptr:i32 @ 4]  (8 bytes)
+// Tags: 0=ArrayIter, 1=MapIter, 2=FilterIter, 3=TakeIter
+// ArrayIter state: [arr_ptr:i32 @ 0][idx:i32 @ 4][len:i32 @ 8]  (12 bytes)
+// MapIter/FilterIter state: [inner:i32 @ 0][fn_idx:i32 @ 4]  (8 bytes)
+// TakeIter state: [inner:i32 @ 0][remaining:i32 @ 4]  (8 bytes)
+
+/**
+ * Build std/iter functions.
+ * Requires the function table '0' to already exist (for call_indirect in map/filter/forEach).
+ * @param {any} mod
+ */
+export function buildIterFunctions(mod) {
+  // ── __jswat_iter_from_array(arr:i32) -> i32 ───────────────────────────────
+  // params: arr(0:i32); locals: iter(1:i32), state(2:i32)
+  {
+    const garr   = () => mod.local.get(0, i32);
+    const giter  = () => mod.local.get(1, i32);
+    const gstate = () => mod.local.get(2, i32);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.call('__alloc', [mod.i32.const(8)], i32)),
+      mod.local.set(2, mod.call('__alloc', [mod.i32.const(12)], i32)),
+      mod.i32.store(0, 0, giter(), mod.i32.const(0)),        // tag = 0 (ArrayIter)
+      mod.i32.store(4, 0, giter(), gstate()),                 // state ptr
+      mod.i32.store(0, 0, gstate(), garr()),                  // state.arr = arr
+      mod.i32.store(4, 0, gstate(), mod.i32.const(0)),        // state.idx = 0
+      mod.i32.store(8, 0, gstate(),
+        mod.call('__jswat_array_length', [garr()], i32)),     // state.len = len(arr)
+      mod.return(giter()),
+    ], i32);
+    mod.addFunction('__jswat_iter_from_array', binaryen.createType([i32]), i32, [i32, i32], body);
+  }
+
+  // ── __jswat_iter_next(iter:i32) -> i32  (returns -1 if exhausted) ─────────
+  // params: iter(0:i32); locals: tag(1:i32), state(2:i32), idx(3:i32), len(4:i32), val(5:i32)
+  {
+    const giter  = () => mod.local.get(0, i32);
+    const gtag   = () => mod.local.get(1, i32);
+    const gstate = () => mod.local.get(2, i32);
+    const gidx   = () => mod.local.get(3, i32);
+    const glen   = () => mod.local.get(4, i32);
+    const gval   = () => mod.local.get(5, i32);
+    const M1     = () => mod.i32.const(-1);
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(giter()), mod.return(M1())),
+      mod.local.set(1, mod.i32.load(0, 0, giter())),    // tag
+      mod.local.set(2, mod.i32.load(4, 0, giter())),    // state
+
+      // ArrayIter (tag=0)
+      mod.if(mod.i32.eq(gtag(), mod.i32.const(0)),
+        mod.block(null, [
+          mod.local.set(3, mod.i32.load(4, 0, gstate())),  // idx
+          mod.local.set(4, mod.i32.load(8, 0, gstate())),  // len
+          mod.if(mod.i32.ge_u(gidx(), glen()), mod.return(M1())),
+          mod.local.set(5, mod.call('__jswat_array_get',
+            [mod.i32.load(0, 0, gstate()), gidx()], i32)),
+          mod.i32.store(4, 0, gstate(), mod.i32.add(gidx(), mod.i32.const(1))),
+          mod.return(gval()),
+        ], none)),
+
+      // MapIter (tag=1)
+      mod.if(mod.i32.eq(gtag(), mod.i32.const(1)),
+        mod.block(null, [
+          mod.local.set(5, mod.call('__jswat_iter_next',
+            [mod.i32.load(0, 0, gstate())], i32)),
+          mod.if(mod.i32.eq(gval(), M1()), mod.return(M1())),
+          mod.return(mod.call_indirect('0', mod.i32.load(4, 0, gstate()), [gval()],
+            binaryen.createType([i32]), i32)),
+        ], none)),
+
+      // FilterIter (tag=2)
+      mod.if(mod.i32.eq(gtag(), mod.i32.const(2)),
+        mod.block(null, [
+          mod.block('filter_done', [
+            mod.loop('filter_loop', mod.block(null, [
+              mod.local.set(5, mod.call('__jswat_iter_next',
+                [mod.i32.load(0, 0, gstate())], i32)),
+              mod.br_if('filter_done', mod.i32.eq(gval(), M1())),
+              mod.if(mod.call_indirect('0', mod.i32.load(4, 0, gstate()), [gval()],
+                binaryen.createType([i32]), i32), mod.return(gval())),
+              mod.br('filter_loop'),
+            ], none)),
+          ], none),
+          mod.return(M1()),
+        ], none)),
+
+      // TakeIter (tag=3)
+      mod.if(mod.i32.eq(gtag(), mod.i32.const(3)),
+        mod.block(null, [
+          mod.local.set(3, mod.i32.load(4, 0, gstate())),  // remaining
+          mod.if(mod.i32.eqz(gidx()), mod.return(M1())),
+          mod.local.set(5, mod.call('__jswat_iter_next',
+            [mod.i32.load(0, 0, gstate())], i32)),
+          mod.if(mod.i32.eq(gval(), M1()), mod.return(M1())),
+          mod.i32.store(4, 0, gstate(), mod.i32.sub(gidx(), mod.i32.const(1))),
+          mod.return(gval()),
+        ], none)),
+
+      mod.return(M1()),
+    ], i32);
+    mod.addFunction('__jswat_iter_next', binaryen.createType([i32]), i32, [i32, i32, i32, i32, i32], body);
+  }
+
+  // ── __jswat_iter_map(iter:i32, fn_idx:i32) -> i32 ─────────────────────────
+  {
+    const giter   = () => mod.local.get(0, i32);
+    const gfn     = () => mod.local.get(1, i32);
+    const gnew    = () => mod.local.get(2, i32);
+    const gstate  = () => mod.local.get(3, i32);
+    const body = mod.block(null, [
+      mod.local.set(2, mod.call('__alloc', [mod.i32.const(8)], i32)),
+      mod.local.set(3, mod.call('__alloc', [mod.i32.const(8)], i32)),
+      mod.i32.store(0, 0, gnew(), mod.i32.const(1)),   // tag = 1 (MapIter)
+      mod.i32.store(4, 0, gnew(), gstate()),
+      mod.i32.store(0, 0, gstate(), giter()),
+      mod.i32.store(4, 0, gstate(), gfn()),
+      mod.return(gnew()),
+    ], i32);
+    mod.addFunction('__jswat_iter_map', binaryen.createType([i32, i32]), i32, [i32, i32], body);
+  }
+
+  // ── __jswat_iter_filter(iter:i32, fn_idx:i32) -> i32 ─────────────────────
+  {
+    const giter   = () => mod.local.get(0, i32);
+    const gfn     = () => mod.local.get(1, i32);
+    const gnew    = () => mod.local.get(2, i32);
+    const gstate  = () => mod.local.get(3, i32);
+    const body = mod.block(null, [
+      mod.local.set(2, mod.call('__alloc', [mod.i32.const(8)], i32)),
+      mod.local.set(3, mod.call('__alloc', [mod.i32.const(8)], i32)),
+      mod.i32.store(0, 0, gnew(), mod.i32.const(2)),   // tag = 2 (FilterIter)
+      mod.i32.store(4, 0, gnew(), gstate()),
+      mod.i32.store(0, 0, gstate(), giter()),
+      mod.i32.store(4, 0, gstate(), gfn()),
+      mod.return(gnew()),
+    ], i32);
+    mod.addFunction('__jswat_iter_filter', binaryen.createType([i32, i32]), i32, [i32, i32], body);
+  }
+
+  // ── __jswat_iter_take(iter:i32, n:i32) -> i32 ────────────────────────────
+  {
+    const giter   = () => mod.local.get(0, i32);
+    const gn      = () => mod.local.get(1, i32);
+    const gnew    = () => mod.local.get(2, i32);
+    const gstate  = () => mod.local.get(3, i32);
+    const body = mod.block(null, [
+      mod.local.set(2, mod.call('__alloc', [mod.i32.const(8)], i32)),
+      mod.local.set(3, mod.call('__alloc', [mod.i32.const(8)], i32)),
+      mod.i32.store(0, 0, gnew(), mod.i32.const(3)),   // tag = 3 (TakeIter)
+      mod.i32.store(4, 0, gnew(), gstate()),
+      mod.i32.store(0, 0, gstate(), giter()),
+      mod.i32.store(4, 0, gstate(), gn()),
+      mod.return(gnew()),
+    ], i32);
+    mod.addFunction('__jswat_iter_take', binaryen.createType([i32, i32]), i32, [i32, i32], body);
+  }
+
+  // ── __jswat_iter_collect(iter:i32) -> i32 ────────────────────────────────
+  // params: iter(0:i32); locals: arr(1:i32), val(2:i32)
+  {
+    const giter = () => mod.local.get(0, i32);
+    const garr  = () => mod.local.get(1, i32);
+    const gval  = () => mod.local.get(2, i32);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.call('__jswat_array_new', [mod.i32.const(8)], i32)),
+      mod.block('collect_done', [
+        mod.loop('collect_loop', mod.block(null, [
+          mod.local.set(2, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('collect_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.drop(mod.call('__jswat_array_push', [garr(), gval()], i32)),
+          mod.br('collect_loop'),
+        ], none)),
+      ], none),
+      mod.return(garr()),
+    ], i32);
+    mod.addFunction('__jswat_iter_collect', binaryen.createType([i32]), i32, [i32, i32], body);
+  }
+
+  // ── __jswat_iter_count(iter:i32) -> i32 ──────────────────────────────────
+  // params: iter(0:i32); locals: n(1:i32), val(2:i32)
+  {
+    const giter = () => mod.local.get(0, i32);
+    const gn    = () => mod.local.get(1, i32);
+    const gval  = () => mod.local.get(2, i32);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.i32.const(0)),
+      mod.block('count_done', [
+        mod.loop('count_loop', mod.block(null, [
+          mod.local.set(2, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('count_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.local.set(1, mod.i32.add(gn(), mod.i32.const(1))),
+          mod.br('count_loop'),
+        ], none)),
+      ], none),
+      mod.return(gn()),
+    ], i32);
+    mod.addFunction('__jswat_iter_count', binaryen.createType([i32]), i32, [i32, i32], body);
+  }
+
+  // ── __jswat_iter_for_each(iter:i32, fn_idx:i32) -> void ──────────────────
+  // params: iter(0:i32), fn_idx(1:i32); locals: val(2:i32)
+  {
+    const giter   = () => mod.local.get(0, i32);
+    const gfn_idx = () => mod.local.get(1, i32);
+    const gval    = () => mod.local.get(2, i32);
+    const body = mod.block(null, [
+      mod.block('fe_done', [
+        mod.loop('fe_loop', mod.block(null, [
+          mod.local.set(2, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('fe_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.drop(mod.call_indirect('0', gfn_idx(), [gval()],
+            binaryen.createType([i32]), i32)),
+          mod.br('fe_loop'),
+        ], none)),
+      ], none),
+    ], none);
+    mod.addFunction('__jswat_iter_for_each', binaryen.createType([i32, i32]), none, [i32], body);
   }
 }
 

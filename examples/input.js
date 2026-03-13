@@ -2,4 +2,14 @@
 import { console, stdin } from "std/io";
 
 let x=stdin.readLine();
-console.log("Hello")
+console.log("Hello\n")
+console.log(x)
+let len=4;
+while(true){
+    len++;
+    x=stdin.readLine();
+    console.log("\n")
+    console.log(x)
+    console.log("\n")
+    
+}

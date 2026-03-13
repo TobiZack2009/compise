@@ -8,6 +8,7 @@ import { compileSource } from '../src/compiler.js';
 describe('memory ops', () => {
   it('i32.store/i32.load round trip', async () => {
     const source = `
+      //@export
       function roundTrip(x = 0) {
         i32.store(0, x);
         return i32.load(0);
@@ -20,6 +21,7 @@ describe('memory ops', () => {
 
   it('memory.fill and memory.copy work', async () => {
     const source = `
+      //@export
       function fillAndCopy() {
         memory.fill(0, 65, 4);
         memory.copy(4, 0, 4);

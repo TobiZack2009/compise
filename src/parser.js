@@ -42,14 +42,44 @@ function walk(node, visitor) {
 export function parseSource(source, filename = '<input>') {
   /** @type {object} */
   let ast;
+  /** @type {Array<{ line: number, exportName: string }>} */
+  const exportAnnotations = [];
   try {
     ast = parse(source, {
       ecmaVersion: 2022,
       sourceType: 'module',
       locations: true,
+      onComment(isBlock, text, _start, _end, startLoc) {
+        if (isBlock) return;
+        const m = text.match(/^@export(?:\("([^"]+)"\))?/);
+        if (!m) return;
+        // m[1] is the custom name (or undefined for bare @export)
+        exportAnnotations.push({ line: startLoc?.line ?? 0, exportName: m[1] ?? null });
+      },
     });
   } catch (/** @type {any} */ e) {
     throw new Error(`Parse error in ${filename}: ${e.message}`);
+  }
+
+  // Attach export annotations to function declarations
+  if (exportAnnotations.length > 0) {
+    // Build a map from line number to export name
+    /** @type {Map<number, string|null>} */
+    const exportByLine = new Map();
+    for (const ann of exportAnnotations) exportByLine.set(ann.line, ann.exportName);
+
+    for (const node of ast.body) {
+      if (node.type !== 'FunctionDeclaration') continue;
+      const fnLine = node.loc?.start?.line ?? 0;
+      for (const [annLine, exportName] of exportByLine) {
+        // Allow @export on the same line or the line immediately before the function
+        if (annLine === fnLine || annLine === fnLine - 1) {
+          node._exportName = exportName ?? node.id?.name ?? null;
+          exportByLine.delete(annLine);
+          break;
+        }
+      }
+    }
   }
 
   const errors = [];

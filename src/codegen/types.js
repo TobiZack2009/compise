@@ -90,7 +90,7 @@ export function genBinOp(mod, op, typeInfo, left, right) {
   const isFloat = typeInfo.isFloat;
   const s = typeInfo.isSigned ? '_s' : '_u';
 
-  if (op === '**') throw new CodegenError('exponentiation requires std/math (Phase 2)');
+  if (op === '**') return mod.call('__jswat_math_pow', [left, right], binaryen.f64);
 
   switch (op) {
     case '+':   return mod[wt].add(left, right);

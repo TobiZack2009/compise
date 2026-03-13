@@ -37,7 +37,7 @@ describe('codegen — WAT structure', () => {
   });
 
   it('emits function export', async () => {
-    const { wat } = await compileSource('function add(x = 0, y = 0) { return x + y; }');
+    const { wat } = await compileSource('//@export\nfunction add(x = 0, y = 0) { return x + y; }');
     // binaryen emits (export "add" (func $add))
     assert.ok(wat.includes('(export "add" (func $add))'), `missing function export in:\n${wat}`);
   });
@@ -71,37 +71,38 @@ describe('codegen — WASM binary', () => {
 describe('codegen — WASM execution', () => {
 
   it('add(2, 3) → 5', async () => {
-    const { wasm } = await compileSource('function add(a = 0, b = 0) { return a + b; }');
+    const { wasm } = await compileSource('//@export\nfunction add(a = 0, b = 0) { return a + b; }');
     const { instance } = await WebAssembly.instantiate(wasm);
     assert.equal(instance.exports.add(2, 3), 5);
   });
 
   it('float add(1.5, 2.5) → 4.0', async () => {
-    const { wasm } = await compileSource('function add(a = 0.0, b = 0.0) { return a + b; }');
+    const { wasm } = await compileSource('//@export\nfunction add(a = 0.0, b = 0.0) { return a + b; }');
     const { instance } = await WebAssembly.instantiate(wasm);
     assert.equal(instance.exports.add(1.5, 2.5), 4.0);
   });
 
   it('sub(10, 3) → 7', async () => {
-    const { wasm } = await compileSource('function sub(a = 0, b = 0) { return a - b; }');
+    const { wasm } = await compileSource('//@export\nfunction sub(a = 0, b = 0) { return a - b; }');
     const { instance } = await WebAssembly.instantiate(wasm);
     assert.equal(instance.exports.sub(10, 3), 7);
   });
 
   it('mul(4, 5) → 20', async () => {
-    const { wasm } = await compileSource('function mul(a = 0, b = 0) { return a * b; }');
+    const { wasm } = await compileSource('//@export\nfunction mul(a = 0, b = 0) { return a * b; }');
     const { instance } = await WebAssembly.instantiate(wasm);
     assert.equal(instance.exports.mul(4, 5), 20);
   });
 
   it('id(42) → 42', async () => {
-    const { wasm } = await compileSource('function id(x = 0) { return x; }');
+    const { wasm } = await compileSource('//@export\nfunction id(x = 0) { return x; }');
     const { instance } = await WebAssembly.instantiate(wasm);
     assert.equal(instance.exports.id(42), 42);
   });
 
   it('max(a, b) returns the larger value', async () => {
     const src = `
+      //@export
       function max(a = 0, b = 0) {
         if (a > b) { return a; }
         else { return b; }
@@ -116,6 +117,7 @@ describe('codegen — WASM execution', () => {
 
   it('double(x) via local variable', async () => {
     const src = `
+      //@export
       function double(x = 0) {
         const y = x + x;
         return y;
@@ -129,7 +131,9 @@ describe('codegen — WASM execution', () => {
 
   it('multiple functions in one module', async () => {
     const src = `
+      //@export
       function add(a = 0, b = 0) { return a + b; }
+      //@export
       function mul(a = 0, b = 0) { return a * b; }
     `;
     const { wasm } = await compileSource(src);
@@ -139,7 +143,7 @@ describe('codegen — WASM execution', () => {
   });
 
   it('lerp(0.0, 1.0, 0.5) → 0.5', async () => {
-    const src = `function lerp(a = 0.0, b = 0.0, t = 0.0) { return a + (b - a) * t; }`;
+    const src = `//@export\nfunction lerp(a = 0.0, b = 0.0, t = 0.0) { return a + (b - a) * t; }`;
     const { wasm } = await compileSource(src);
     const { instance } = await WebAssembly.instantiate(wasm);
     const result = instance.exports.lerp(0.0, 1.0, 0.5);

@@ -13,6 +13,22 @@ import { TYPES } from './types.js';
  * @type {Record<string, Record<string, Record<string, StdFn>>>}
  */
 export const STD_NAMESPACES = {
+  'std/math': {
+    Math: {
+      sqrt:  { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_sqrt' },
+      floor: { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_floor' },
+      ceil:  { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_ceil' },
+      abs:   { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_abs' },
+      min:   { params: [TYPES.f64, TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_min' },
+      max:   { params: [TYPES.f64, TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_max' },
+      trunc: { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_trunc' },
+      pow:   { params: [TYPES.f64, TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_pow' },
+      sin:   { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_sin' },
+      cos:   { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_cos' },
+      log:   { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_log' },
+      exp:   { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_exp' },
+    },
+  },
   'std/io': {
     console: {
       log:   { params: [TYPES.str], returnType: TYPES.void, stub: '__jswat_console_log' },
@@ -110,6 +126,23 @@ export const STD_NAMESPACES = {
  * @type {Record<string, { name: string, statics: Record<string, StdFn> }>}
  */
 export const STD_DEFAULTS = {
+  'std/math': {
+    name: 'Math',
+    statics: {
+      sqrt:  { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_sqrt' },
+      floor: { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_floor' },
+      ceil:  { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_ceil' },
+      abs:   { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_abs' },
+      min:   { params: [TYPES.f64, TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_min' },
+      max:   { params: [TYPES.f64, TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_max' },
+      trunc: { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_trunc' },
+      pow:   { params: [TYPES.f64, TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_pow' },
+      sin:   { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_sin' },
+      cos:   { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_cos' },
+      log:   { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_log' },
+      exp:   { params: [TYPES.f64], returnType: TYPES.f64, stub: '__jswat_math_exp' },
+    },
+  },
   'std/string': {
     name: 'String',
     statics: {
@@ -130,6 +163,9 @@ export const STD_DEFAULTS = {
  * @type {Record<string, Record<string, StdFn>>}
  */
 export const STD_FUNCTIONS = {
+  'std/iter': {
+    iter: { params: [TYPES.array], returnType: TYPES.iter, stub: '__jswat_iter_from_array' },
+  },
   'std/wasm': {
     i32_clz: { params: [TYPES.i32], returnType: TYPES.i32, intrinsic: 'i32.clz' },
     i32_ctz: { params: [TYPES.i32], returnType: TYPES.i32, intrinsic: 'i32.ctz' },

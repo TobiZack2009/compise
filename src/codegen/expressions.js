@@ -279,6 +279,30 @@ export function genExpr(node, filename, ctx) {
             return mod.call(std.stub, [objExpr, ...argExprs], retType);
           }
         }
+        if (objType?.kind === 'iter' && methodName) {
+          const objExpr = genExpr(callee.object, filename, ctx);
+          const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
+          switch (methodName) {
+            case 'map':    return mod.call('__jswat_iter_map',     [objExpr, ...argExprs], binaryen.i32);
+            case 'filter': return mod.call('__jswat_iter_filter',  [objExpr, ...argExprs], binaryen.i32);
+            case 'take':   return mod.call('__jswat_iter_take',    [objExpr, ...argExprs], binaryen.i32);
+            case 'collect':return mod.call('__jswat_iter_collect', [objExpr], binaryen.i32);
+            case 'count':  return mod.call('__jswat_iter_count',   [objExpr], binaryen.i32);
+            case 'forEach':return mod.call('__jswat_iter_for_each',[objExpr, ...argExprs], binaryen.none);
+            default: throw new CodegenError(`Unknown iter method '${methodName}' (${filename})`);
+          }
+        }
+        if (objType?.kind === 'str' && methodName) {
+          const objExpr = genExpr(callee.object, filename, ctx);
+          const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
+          switch (methodName) {
+            case 'slice':   return mod.call('__jswat_str_slice',    [objExpr, ...argExprs], binaryen.i32);
+            case 'indexOf': return mod.call('__jswat_str_index_of', [objExpr, ...argExprs], binaryen.i32);
+            case 'concat':  return mod.call('__jswat_str_concat',   [objExpr, ...argExprs], binaryen.i32);
+            case 'charAt':  return mod.call('__jswat_str_char_at',  [objExpr, ...argExprs], binaryen.i32);
+            default: throw new CodegenError(`Unknown str method '${methodName}' (${filename})`);
+          }
+        }
         if (callee.object.type === 'Identifier' && methodName) {
           const ns = resolveStdNamespace(ctx._imports, callee.object.name, methodName);
           const def = resolveStdDefault(ctx._imports, callee.object.name, methodName);

@@ -136,7 +136,9 @@ export function genFunction(node, mod, signatures, classes, layouts, imports, st
   const resultType = toBinType(sig.returnType);
 
   mod.addFunction(name, paramType, resultType, ctx._varTypes, bodyExpr);
-  mod.addFunctionExport(name, name);
+  if (node._exportName !== undefined) {
+    mod.addFunctionExport(name, node._exportName ?? name);
+  }
 }
 
 /**

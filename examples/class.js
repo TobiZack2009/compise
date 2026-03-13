@@ -18,6 +18,7 @@ class Point {
   }
 }
 
+//@export
 function main(a = 0, b = 0) {
   const p = new Point(a, b);
   return p.move(1, 2);

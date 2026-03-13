@@ -589,6 +589,17 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           if ((!t || t === TYPES.void) && objType?.kind === 'array' && methodName) {
             if (methodName === 'push') t = TYPES.usize;
           }
+          if ((!t || t === TYPES.void) && objType?.kind === 'iter' && methodName) {
+            if (['map', 'filter', 'take', 'skip'].includes(methodName)) t = TYPES.iter;
+            else if (methodName === 'collect') t = TYPES.array;
+            else if (methodName === 'forEach') t = TYPES.void;
+            else if (['count', 'find'].includes(methodName)) t = TYPES.isize;
+            else if (methodName === 'some' || methodName === 'every') t = TYPES.bool;
+          }
+          if ((!t || t === TYPES.void) && objType?.kind === 'str' && methodName) {
+            if (methodName === 'slice' || methodName === 'concat') t = TYPES.str;
+            else if (methodName === 'indexOf' || methodName === 'charAt') t = TYPES.isize;
+          }
           if ((!t || t === TYPES.void) && objType?.kind === 'collection' && methodName) {
             const std = resolveStdCollectionMethod(objType.name, methodName);
             if (std) t = std.returnType;
@@ -697,6 +708,10 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           }
         } else if (objType?.kind === 'array' && node.property?.name === 'length') {
           t = TYPES.usize;
+        } else if (objType?.kind === 'str' && !node.computed) {
+          const propName = node.property?.name;
+          if (propName === 'length') t = TYPES.isize;
+          else t = TYPES.str; // str method access — type refined at call site
         } else {
           t = TYPES.void;
         }

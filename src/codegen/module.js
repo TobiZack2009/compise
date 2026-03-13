@@ -11,7 +11,7 @@ import { buildClassLayouts } from './classes.js';
 import {
   buildStdStub, buildMemFunctions, buildArrayFunctions, buildStringFunctions,
   buildCollectionsFunctions, buildWasiImports, buildIoFunctions, buildFsFunctions,
-  buildClockFunctions, buildRandomFunctions,
+  buildClockFunctions, buildRandomFunctions, buildMathFunctions, buildIterFunctions,
 } from './runtime.js';
 import { astHasArray, buildStringTable, genFunction, genMethod, genConstructor } from './functions.js';
 import { collectLocals } from './expressions.js';
@@ -44,6 +44,29 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
       passive: false,
     })));
 
+  // ── Feature detection (must precede table creation) ───────────────────────
+  const stdStubs = collectStdStubs(imports);
+  const hasArray = astHasArray(ast);
+
+  /** Quick AST walk to detect binary ** operator */
+  function astHasPow(node) {
+    if (!node || typeof node !== 'object') return false;
+    if (node.type === 'BinaryExpression' && node.operator === '**') return true;
+    return Object.values(node).some(v =>
+      Array.isArray(v) ? v.some(astHasPow) : astHasPow(v));
+  }
+
+  function astHasStrMethods(node) {
+    if (!node || typeof node !== 'object') return false;
+    if (node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
+      const m = node.callee.property?.name;
+      if (['slice','indexOf','concat','charAt'].includes(m) &&
+          node.callee.object?._type?.kind === 'str') return true;
+    }
+    return Object.values(node).some(v =>
+      Array.isArray(v) ? v.some(astHasStrMethods) : astHasStrMethods(v));
+  }
+
   // ── Function table ────────────────────────────────────────────────────────
   const fnTable    = [];
   const fnTableMap = new Map();
@@ -56,15 +79,13 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
       fnTable.push(name);
     }
   }
-  if (fnTable.length > 0) {
-    mod.addTable('0', fnTable.length, -1, binaryen.funcref);
+  const hasIter = Array.from(stdStubs).some(n => n.startsWith('__jswat_iter_'));
+  if (fnTable.length > 0 || hasIter) {
+    const tableSize = Math.max(fnTable.length, 1);
+    mod.addTable('0', tableSize, -1, binaryen.funcref);
     // Element segment added AFTER user functions are defined (see below)
   }
   const fnTypeNames = { 1: '$fn1', 2: '$fn2' };
-
-  // ── Feature detection ─────────────────────────────────────────────────────
-  const stdStubs = collectStdStubs(imports);
-  const hasArray = astHasArray(ast);
 
   const hasIo = stdStubs.has('__jswat_console_log') ||
     stdStubs.has('__jswat_console_error') ||
@@ -93,7 +114,8 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   const hasMem = Array.from(stdStubs).some(n =>
     n.startsWith('__jswat_alloc_') || n.startsWith('__jswat_ptr_'));
 
-  const hasString = stdStubs.has('__jswat_string_from_i32');
+  const hasString = Array.from(stdStubs).some(n => n.startsWith('__jswat_string_') || n.startsWith('__jswat_str_')) ||
+    astHasStrMethods(ast);
 
   const hasCollections = Array.from(stdStubs).some(n =>
     n.startsWith('__jswat_map_')   ||
@@ -101,6 +123,9 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
     n.startsWith('__jswat_queue_') ||
     n.startsWith('__jswat_stack_') ||
     n.startsWith('__jswat_deque_'));
+
+  const hasMath = Array.from(stdStubs).some(n => n.startsWith('__jswat_math_')) ||
+    astHasPow(ast);
 
   // ── WASI imports ──────────────────────────────────────────────────────────
   buildWasiImports(mod, hasIo, hasFs, hasClock, hasRandom);
@@ -117,6 +142,8 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   if (hasString)      buildStringFunctions(mod);
   if (hasArray)       buildArrayFunctions(mod);
   if (hasCollections) buildCollectionsFunctions(mod);
+  if (hasMath)        buildMathFunctions(mod);
+  if (hasIter)        { if (!hasArray) buildArrayFunctions(mod); buildIterFunctions(mod); }
 
   // ── Std stubs (no-ops for unused imports) ─────────────────────────────────
   for (const stub of stdStubs) {
@@ -134,6 +161,8 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
       stub.startsWith('__jswat_stack_') ||
       stub.startsWith('__jswat_deque_')
     )) continue;
+    if (hasMath && stub.startsWith('__jswat_math_')) continue;
+    if (hasIter && stub.startsWith('__jswat_iter_')) continue;
     buildStdStub(mod, stub);
   }
 

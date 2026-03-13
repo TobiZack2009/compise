@@ -59,6 +59,9 @@ const TYPE_REGISTRY = {
 
   // Function reference (table index)
   funcref: t({ kind: 'funcref', name: 'funcref', nullable: false, abstract: false, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
+
+  // Iterator handle (tagged pointer)
+  iter: t({ kind: 'iter', name: 'iter', nullable: true, abstract: true, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
 };
 
 export const TYPES = TYPE_REGISTRY;
