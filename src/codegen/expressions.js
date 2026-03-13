@@ -296,10 +296,16 @@ export function genExpr(node, filename, ctx) {
           const objExpr = genExpr(callee.object, filename, ctx);
           const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
           switch (methodName) {
-            case 'slice':   return mod.call('__jswat_str_slice',    [objExpr, ...argExprs], binaryen.i32);
-            case 'indexOf': return mod.call('__jswat_str_index_of', [objExpr, ...argExprs], binaryen.i32);
-            case 'concat':  return mod.call('__jswat_str_concat',   [objExpr, ...argExprs], binaryen.i32);
-            case 'charAt':  return mod.call('__jswat_str_char_at',  [objExpr, ...argExprs], binaryen.i32);
+            case 'slice':      return mod.call('__jswat_str_slice',       [objExpr, ...argExprs], binaryen.i32);
+            case 'indexOf':    return mod.call('__jswat_str_index_of',    [objExpr, ...argExprs], binaryen.i32);
+            case 'concat':     return mod.call('__jswat_str_concat',      [objExpr, ...argExprs], binaryen.i32);
+            case 'charAt':     return mod.call('__jswat_str_char_at',     [objExpr, ...argExprs], binaryen.i32);
+            case 'startsWith': return mod.call('__jswat_str_starts_with', [objExpr, ...argExprs], binaryen.i32);
+            case 'endsWith':   return mod.call('__jswat_str_ends_with',   [objExpr, ...argExprs], binaryen.i32);
+            case 'includes':   return mod.i32.ge_s(
+                                 mod.call('__jswat_str_index_of', [objExpr, ...argExprs], binaryen.i32),
+                                 mod.i32.const(0));
+            case 'equals':     return mod.call('__jswat_str_equals',      [objExpr, ...argExprs], binaryen.i32);
             default: throw new CodegenError(`Unknown str method '${methodName}' (${filename})`);
           }
         }

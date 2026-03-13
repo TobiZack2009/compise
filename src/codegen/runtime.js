@@ -439,6 +439,106 @@ export function buildStringFunctions(mod) {
     ], i32);
     mod.addFunction('__jswat_str_index_of', binaryen.createType([i32, i32]), i32, [i32, i32, i32, i32], body);
   }
+
+  // __jswat_str_starts_with(str:i32, prefix:i32) -> i32  (1=true, 0=false)
+  // params: str(0:i32), prefix(1:i32); locals: slen(2:i32), plen(3:i32), i(4:i32)
+  {
+    const gstr   = () => mod.local.get(0, i32);
+    const gprefix= () => mod.local.get(1, i32);
+    const gslen  = () => mod.local.get(2, i32);
+    const gplen  = () => mod.local.get(3, i32);
+    const gi     = () => mod.local.get(4, i32);
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(gstr()),    mod.return(mod.i32.const(0))),
+      mod.if(mod.i32.eqz(gprefix()), mod.return(mod.i32.const(1))),  // empty prefix always matches
+      mod.local.set(2, mod.i32.load(0, 0, gstr())),
+      mod.local.set(3, mod.i32.load(0, 0, gprefix())),
+      mod.if(mod.i32.gt_u(gplen(), gslen()), mod.return(mod.i32.const(0))),
+      mod.local.set(4, mod.i32.const(0)),
+      mod.block('sw_done', [
+        mod.loop('sw_loop', mod.block(null, [
+          mod.br_if('sw_done', mod.i32.ge_u(gi(), gplen())),
+          mod.if(
+            mod.i32.ne(
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gstr(),    mod.i32.const(8)), gi())),
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gprefix(), mod.i32.const(8)), gi()))),
+            mod.return(mod.i32.const(0))),
+          mod.local.set(4, mod.i32.add(gi(), mod.i32.const(1))),
+          mod.br('sw_loop'),
+        ], none)),
+      ], none),
+      mod.return(mod.i32.const(1)),
+    ], i32);
+    mod.addFunction('__jswat_str_starts_with', binaryen.createType([i32, i32]), i32, [i32, i32, i32], body);
+  }
+
+  // __jswat_str_ends_with(str:i32, suffix:i32) -> i32  (1=true, 0=false)
+  // params: str(0:i32), suffix(1:i32); locals: slen(2:i32), sfxlen(3:i32), i(4:i32), soff(5:i32)
+  {
+    const gstr   = () => mod.local.get(0, i32);
+    const gsuffix= () => mod.local.get(1, i32);
+    const gslen  = () => mod.local.get(2, i32);
+    const gsfxlen= () => mod.local.get(3, i32);
+    const gi     = () => mod.local.get(4, i32);
+    const gsoff  = () => mod.local.get(5, i32);
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(gstr()),    mod.return(mod.i32.const(0))),
+      mod.if(mod.i32.eqz(gsuffix()), mod.return(mod.i32.const(1))),
+      mod.local.set(2, mod.i32.load(0, 0, gstr())),
+      mod.local.set(3, mod.i32.load(0, 0, gsuffix())),
+      mod.if(mod.i32.gt_u(gsfxlen(), gslen()), mod.return(mod.i32.const(0))),
+      // soff = slen - sfxlen  (offset in str where suffix must start)
+      mod.local.set(5, mod.i32.sub(gslen(), gsfxlen())),
+      mod.local.set(4, mod.i32.const(0)),
+      mod.block('ew_done', [
+        mod.loop('ew_loop', mod.block(null, [
+          mod.br_if('ew_done', mod.i32.ge_u(gi(), gsfxlen())),
+          mod.if(
+            mod.i32.ne(
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gstr(),    mod.i32.const(8)), mod.i32.add(gsoff(), gi()))),
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gsuffix(), mod.i32.const(8)), gi()))),
+            mod.return(mod.i32.const(0))),
+          mod.local.set(4, mod.i32.add(gi(), mod.i32.const(1))),
+          mod.br('ew_loop'),
+        ], none)),
+      ], none),
+      mod.return(mod.i32.const(1)),
+    ], i32);
+    mod.addFunction('__jswat_str_ends_with', binaryen.createType([i32, i32]), i32, [i32, i32, i32, i32], body);
+  }
+
+  // __jswat_str_equals(a:i32, b:i32) -> i32  (1=equal, 0=not equal)
+  // params: a(0:i32), b(1:i32); locals: la(2:i32), lb(3:i32), i(4:i32)
+  {
+    const ga  = () => mod.local.get(0, i32);
+    const gb  = () => mod.local.get(1, i32);
+    const gla = () => mod.local.get(2, i32);
+    const glb = () => mod.local.get(3, i32);
+    const gi  = () => mod.local.get(4, i32);
+    const body = mod.block(null, [
+      mod.if(mod.i32.eq(ga(), gb()), mod.return(mod.i32.const(1))),  // same pointer (incl both null)
+      mod.if(mod.i32.eqz(ga()), mod.return(mod.i32.const(0))),
+      mod.if(mod.i32.eqz(gb()), mod.return(mod.i32.const(0))),
+      mod.local.set(2, mod.i32.load(0, 0, ga())),
+      mod.local.set(3, mod.i32.load(0, 0, gb())),
+      mod.if(mod.i32.ne(gla(), glb()), mod.return(mod.i32.const(0))),
+      mod.local.set(4, mod.i32.const(0)),
+      mod.block('eq_done', [
+        mod.loop('eq_loop', mod.block(null, [
+          mod.br_if('eq_done', mod.i32.ge_u(gi(), gla())),
+          mod.if(
+            mod.i32.ne(
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(ga(), mod.i32.const(8)), gi())),
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gb(), mod.i32.const(8)), gi()))),
+            mod.return(mod.i32.const(0))),
+          mod.local.set(4, mod.i32.add(gi(), mod.i32.const(1))),
+          mod.br('eq_loop'),
+        ], none)),
+      ], none),
+      mod.return(mod.i32.const(1)),
+    ], i32);
+    mod.addFunction('__jswat_str_equals', binaryen.createType([i32, i32]), i32, [i32, i32, i32], body);
+  }
 }
 
 // ── std/collections ───────────────────────────────────────────────────────────

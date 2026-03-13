@@ -60,7 +60,7 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
     if (!node || typeof node !== 'object') return false;
     if (node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
       const m = node.callee.property?.name;
-      if (['slice','indexOf','concat','charAt'].includes(m) &&
+      if (['slice','indexOf','concat','charAt','startsWith','endsWith','includes','equals'].includes(m) &&
           node.callee.object?._type?.kind === 'str') return true;
     }
     return Object.values(node).some(v =>

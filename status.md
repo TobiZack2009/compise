@@ -48,19 +48,38 @@
 ### std/jswat Sources
 - Added jswat sources for std modules: `std/wasm.js`, `std/mem.js`, `std/collections.js`, `std/io.js`, `std/fs.js`, `std/random.js`, `std/encoding.js`, `std/string.js`, `std/range.js`, `std/clock.js`
 
-### Recent Compiler Feature Work (in progress)
-- Added iterator-protocol lowering for `for-of` (via `iter()`/`next()` + `IteratorResult`)
-- Added Range-based `for-of` lowering (new Range(start,end,step))
-- Added std/string int-to-string runtime (`__jswat_string_from_i32`)
-- Added std/collections method coverage (clear/peek/empty)
-- Added std/clock sleep runtime (sched_yield + monotonic)
-- Started adding array/computed access support and function references for std/iter
+### std/math (complete)
+- Native ops: sqrt, floor, ceil, abs, min, max, trunc (binaryen f64 ops)
+- Transcendental: exp, log, sin, cos (Taylor/atanh series), pow = exp(e·log(base))
+- `**` operator lowered to `__jswat_math_pow` in genBinOp
+- 23 unit tests passing (`test/std-math.test.js`)
+
+### std/iter (complete)
+- `iter(arr)` → lazy iterator from array
+- `.count()`, `.take(n)`, `.map(fn)`, `.filter(fn)`, `.collect()`, `.forEach(fn)`
+- Callbacks via `call_indirect` into function table
+- 9 unit tests passing (`test/std-iter.test.js`)
+
+### std/string (complete)
+- `.length`, `.charAt(i)`, `.slice(start, end)`, `.concat(other)`, `.indexOf(needle)`
+- `.startsWith(prefix)`, `.endsWith(suffix)`, `.includes(needle)`, `.equals(other)`
+- `String.from(n)` — integer to decimal string
+- String table starts at offset 8 (reserves address 0 as null pointer sentinel)
+- 29 unit tests passing (`test/std-string.test.js`)
+- Example: `examples/strings.js`
+
+### @export annotation (complete)
+- `//@export` or `//@export("name")` controls WASM host visibility
+- Unannotated functions compile but are internal-only
+- All example files and test sources updated
+
+**Total: 209 passing, 7 pending, 0 failing**
 
 ---
 
 ## In Progress
 
-Implement compiler features required for full std/iter + std/string, then replace placeholder std sources with complete jswat implementations.
+std/range — Range class for `for (const i of new Range(0, 10))`.
 
 ---
 

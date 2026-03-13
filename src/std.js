@@ -119,6 +119,11 @@ export const STD_NAMESPACES = {
       diff: { params: [TYPES.usize, TYPES.usize], returnType: TYPES.isize, stub: '__jswat_ptr_diff' },
     },
   },
+  'std/string': {
+    String: {
+      from: { params: [TYPES.isize], returnType: TYPES.str, stub: '__jswat_string_from_i32' },
+    },
+  },
 };
 
 /**

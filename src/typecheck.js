@@ -599,6 +599,8 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           if ((!t || t === TYPES.void) && objType?.kind === 'str' && methodName) {
             if (methodName === 'slice' || methodName === 'concat') t = TYPES.str;
             else if (methodName === 'indexOf' || methodName === 'charAt') t = TYPES.isize;
+            else if (methodName === 'startsWith' || methodName === 'endsWith' ||
+                     methodName === 'includes'   || methodName === 'equals') t = TYPES.bool;
           }
           if ((!t || t === TYPES.void) && objType?.kind === 'collection' && methodName) {
             const std = resolveStdCollectionMethod(objType.name, methodName);

@@ -44,7 +44,7 @@ export function astHasArray(ast) {
 export function buildStringTable(ast) {
   const encoder = new TextEncoder();
   const strings = new Map();
-  let offset = 0;
+  let offset = 8;  // Reserve address 0 as null pointer sentinel
 
   /** @param {object} node */
   function visit(node) {
