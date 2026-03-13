@@ -73,13 +73,19 @@
 - Unannotated functions compile but are internal-only
 - All example files and test sources updated
 
-**Total: 209 passing, 7 pending, 0 failing**
+### std/range (complete)
+- `for (const i of new Range(start, end))` and `new Range(start, end, step)`
+- Positive and negative step; empty range (start === end) is zero iterations
+- Nested ranges and `break`/`continue` work correctly
+- Root bug fixed: `collectReturnTypes` in `typecheck.js` was missing a `ForOfStatement` case — identifiers inside for-of bodies had no `_type`, causing "No WAT type for operator '+'" at codegen time
+- 11 unit tests passing (`test/std-range.test.js`)
+- Example: `examples/range.js`
+
+**Total: 220 passing, 7 pending, 0 failing**
 
 ---
 
 ## In Progress
-
-std/range — Range class for `for (const i of new Range(0, 10))`.
 
 ---
 
