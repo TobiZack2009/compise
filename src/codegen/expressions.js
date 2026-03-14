@@ -77,7 +77,8 @@ export function collectLocals(body, params) {
 
   visit(body);
   if (needsTmp && !seen.has('__tmp')) {
-    locals.push({ name: '__tmp', type: TYPES.isize });
+    locals.push({ name: '__tmp',     type: TYPES.isize });
+    locals.push({ name: '__tmp_f64', type: TYPES.f64 });
   }
   return locals;
 }
@@ -203,12 +204,27 @@ export function genExpr(node, filename, ctx) {
                    : mod.i32.const(0);
         return mod[argType.wasmType].sub(zero, genExpr(node.argument, filename, ctx));
       }
+      if (node.operator === '!') {
+        return mod.i32.eqz(genExpr(node.argument, filename, ctx));
+      }
       return genExpr(node.argument, filename, ctx);
     }
 
     case 'CallExpression': {
       const callee = node.callee;
       // Cast call: u8(x), i32(x), f64(x), etc.
+      if (callee.type === 'Super') {
+        const parentName = ctx._currentClassInfo?.superClassName;
+        if (!parentName) throw new CodegenError(`super() used without parent class (${filename})`);
+        const parentCtorInfo = ctx._classes?.get(parentName)?.constructor;
+        const provided = node.arguments ?? [];
+        const ctorParams = parentCtorInfo?.node.params ?? [];
+        const argExprs = ctorParams.map((p, i) => {
+          if (i < provided.length) return genExpr(provided[i], filename, ctx);
+          return p.type === 'AssignmentPattern' ? genExpr(p.right, filename, ctx) : mod.i32.const(0);
+        });
+        return mod.call(`${parentName}__ctor`, [ctx.localGet('this'), ...argExprs], binaryen.none);
+      }
       if (callee.type === 'Identifier') {
         const castTarget = TYPES[callee.name];
         if (castTarget && !castTarget.abstract) {
@@ -314,9 +330,24 @@ export function genExpr(node, filename, ctx) {
           const def = resolveStdDefault(ctx._imports, callee.object.name, methodName);
           const std = ns ?? def;
           if (std) {
-            const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
+            const argExprs = node.arguments.map((arg, i) => {
+              const expr = genExpr(arg, filename, ctx);
+              const expected = std.params?.[i];
+              const actual = arg._type;
+              if (expected && actual && expected !== actual) return genCast(mod, expr, actual, expected);
+              return expr;
+            });
             const retType = node._type ? toBinType(node._type) : binaryen.none;
             return mod.call(std.stub, argExprs, retType);
+          }
+        }
+        // Static method call: ClassName.method(args) — no 'this'
+        if (className) {
+          const ci = ctx._classes?.get(className);
+          if (ci?.staticMethods?.has(methodName)) {
+            const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
+            const retType = node._type ? toBinType(node._type) : binaryen.none;
+            return mod.call(`${className}__sm_${methodName}`, argExprs, retType);
           }
         }
         const objExpr = genExpr(callee.object, filename, ctx);
@@ -371,17 +402,50 @@ export function genExpr(node, filename, ctx) {
             ctx.localGet('__tmp'),
           ], binaryen.i32);
         }
+        // Static field assignment: ClassName.field = value
+        const leftObjType = left.object?._type;
+        if (!left.computed && leftObjType?.kind === 'class') {
+          const ci = ctx._classes?.get(leftObjType.name);
+          const fn = left.property?.name;
+          if (ci && fn && ci.staticFields?.has(fn)) {
+            const valueExpr = genExpr(node.right, filename, ctx);
+            return mod.block(null, [
+              ctx.localSet('__tmp', valueExpr),
+              mod.global.set(`${leftObjType.name}__sf_${fn}`, ctx.localGet('__tmp')),
+              ctx.localGet('__tmp'),
+            ], binaryen.i32);
+          }
+        }
         if (node.operator !== '=') {
-          throw new CodegenError(`Compound assignments on fields not supported yet (${filename})`);
+          // Compound assignment on instance field: load, op, store
+          const field = resolveFieldAccess(left, ctx, filename);
+          const objExpr = genExpr(left.object, filename, ctx);
+          const op = node.operator.slice(0, -1);
+          const currentVal = genLoad(mod, objExpr, field.type, field.offset);
+          const rightExpr = genExpr(node.right, filename, ctx);
+          const newVal = genBinOp(mod, op, field.type, currentVal, rightExpr);
+          const binType = toBinType(field.type);
+          const tmpName = (field.type.wasmType === 'f64') ? '__tmp_f64' : '__tmp';
+          return mod.block(null, [
+            ctx.localSet(tmpName, newVal),
+            genStore(mod, genExpr(left.object, filename, ctx), ctx.localGet(tmpName), field.type, field.offset),
+            ctx.localGet(tmpName),
+          ], binType);
         }
         const field = resolveFieldAccess(left, ctx, filename);
         const objExpr = genExpr(left.object, filename, ctx);
-        const valueExpr = genExpr(node.right, filename, ctx);
+        const rawValueExpr = genExpr(node.right, filename, ctx);
+        // Auto-cast if right-side type differs from field type (e.g. Math.max f64 into i32 field)
+        const rightType = node.right._type;
+        const valueExpr = (rightType && rightType !== field.type)
+          ? genCast(mod, rawValueExpr, rightType, field.type)
+          : rawValueExpr;
         const binType = toBinType(field.type);
+        const tmpName = (field.type.wasmType === 'f64') ? '__tmp_f64' : '__tmp';
         return mod.block(null, [
-          ctx.localSet('__tmp', valueExpr),
-          genStore(mod, objExpr, ctx.localGet('__tmp'), field.type, field.offset),
-          ctx.localGet('__tmp'),
+          ctx.localSet(tmpName, valueExpr),
+          genStore(mod, objExpr, ctx.localGet(tmpName), field.type, field.offset),
+          ctx.localGet(tmpName),
         ], binType);
       }
       throw new CodegenError(`Unsupported assignment target (${filename})`);
@@ -436,6 +500,29 @@ export function genExpr(node, filename, ctx) {
       if (!node.computed && objType?.kind === 'str' && node.property?.name === 'length') {
         return mod.i32.load(0, 0, genExpr(node.object, filename, ctx));
       }
+      // Static field/getter access: ClassName.field or ClassName.#field
+      if (!node.computed && objType?.kind === 'class') {
+        const ci = ctx._classes?.get(objType.name);
+        const fn = node.property?.name;
+        if (ci && fn) {
+          if (ci.staticFields?.has(fn)) {
+            const sfType = ci.staticFields.get(fn);
+            return mod.global.get(`${objType.name}__sf_${fn}`, toBinType(sfType));
+          }
+          if (ci.staticGetters?.has(fn)) {
+            const retType = ci.staticGetters.get(fn).signature.returnType;
+            return mod.call(`${objType.name}__sg_${fn}`, [], toBinType(retType));
+          }
+          // Instance getter access on a class instance — call as method
+          // Only for public Identifiers (not PrivateIdentifier which are field accesses)
+          if (node.property?.type !== 'PrivateIdentifier' && ci.methods?.has(fn)) {
+            const method = ci.methods.get(fn);
+            const retType = method.signature?.returnType ?? TYPES.isize;
+            const objExpr = genExpr(node.object, filename, ctx);
+            return mod.call(`${objType.name}_${fn}`, [objExpr], toBinType(retType));
+          }
+        }
+      }
       // Struct field read
       const field = resolveFieldAccess(node, ctx, filename);
       const base = genExpr(node.object, filename, ctx);
@@ -454,7 +541,12 @@ export function genExpr(node, filename, ctx) {
         const ctorInfo = ctx._classes?.get(className)?.constructor ?? null;
         if (ctorInfo) {
           const ctorName = `${className}__ctor`;
-          const argExprs = (node.arguments ?? []).map(arg => genExpr(arg, filename, ctx));
+          const provided = node.arguments ?? [];
+          const ctorParams = ctorInfo.node.params ?? [];
+          const argExprs = ctorParams.map((p, i) => {
+            if (i < provided.length) return genExpr(provided[i], filename, ctx);
+            return p.type === 'AssignmentPattern' ? genExpr(p.right, filename, ctx) : mod.i32.const(0);
+          });
           return mod.block(null, [
             ctx.localSet('__tmp', mod.call('__alloc', [mod.i32.const(layout.size)], binaryen.i32)),
             mod.i32.store(0, 0, ctx.localGet('__tmp'), mod.i32.const(1)),

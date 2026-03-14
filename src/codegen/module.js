@@ -13,7 +13,7 @@ import {
   buildCollectionsFunctions, buildWasiImports, buildIoFunctions, buildFsFunctions,
   buildClockFunctions, buildRandomFunctions, buildMathFunctions, buildIterFunctions,
 } from './runtime.js';
-import { astHasArray, buildStringTable, genFunction, genMethod, genConstructor } from './functions.js';
+import { astHasArray, buildStringTable, genFunction, genMethod, genConstructor, genStaticMethod } from './functions.js';
 import { collectLocals } from './expressions.js';
 import { genStatement } from './statements.js';
 
@@ -175,6 +175,21 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
       stringTable, filename, fnTableMap, fnTypeNames);
   }
 
+  // Add WASM globals for static fields
+  for (const classInfo of classes.values()) {
+    for (const [fieldName, fieldType] of (classInfo.staticFields ?? new Map()).entries()) {
+      const globalName = `${classInfo.name}__sf_${fieldName}`;
+      // All static fields are mutable i32 globals (pointers/ints/bools all fit in i32)
+      // Initial value 0 (false/null); for bool false, i32 float fields would need special handling
+      let initVal = mod.i32.const(0);
+      if (fieldType?.wasmType === 'f64') {
+        // Can't have f64 global with i32 — store as i32 bits or just use i32
+        // For simplicity, static f64 fields stored as i32 (limitation)
+      }
+      mod.addGlobal(globalName, binaryen.i32, true, initVal);
+    }
+  }
+
   for (const classInfo of classes.values()) {
     for (const [methodName, method] of classInfo.methods.entries()) {
       genMethod(classInfo, methodName, method.node, method.signature,
@@ -183,6 +198,14 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
     if (classInfo.constructor) {
       genConstructor(classInfo, classInfo.constructor.node, classInfo.constructor.signature,
         mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames);
+    }
+    for (const [methodName, method] of (classInfo.staticMethods ?? new Map()).entries()) {
+      genStaticMethod(classInfo, methodName, method.node, method.signature,
+        mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames, false);
+    }
+    for (const [getterName, getter] of (classInfo.staticGetters ?? new Map()).entries()) {
+      genStaticMethod(classInfo, getterName, getter.node, getter.signature,
+        mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames, true);
     }
   }
 

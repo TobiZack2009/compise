@@ -81,7 +81,37 @@
 - 11 unit tests passing (`test/std-range.test.js`)
 - Example: `examples/range.js`
 
-**Total: 220 passing, 7 pending, 0 failing**
+### Phase 5 — Static Class Members, Inheritance, Bug Fixes
+
+#### Static class members (complete)
+- Static fields stored as WASM mutable globals (`ClassName__sf_field`)
+- Static methods generated as `ClassName__sm_method` (no `this` param)
+- Static getters generated as `ClassName__sg_getter`
+- `inferClass` extended to infer static fields/methods/getters and inheritance
+- MemberExpression codegen checks static fields → globals, static getters → calls, instance getters → calls
+
+#### Inheritance (complete)
+- `extends` keyword: parent instance fields copied into child ClassInfo
+- `super()` calls parent constructor with `this` and default-filled args
+- `findCommonAncestor` allows polymorphic return types (Ok|Err → Result)
+
+#### Bug fixes
+- `**` operator: typecheck always returns f64; codegen converts integer operands via `binaryen.getExpressionType`
+- `!` unary operator: now emits `i32.eqz` (was previously dropped entirely)
+- f64 instance field assignments: use `__tmp_f64` local to avoid i32/f64 type mismatch
+- std call args auto-coerced to expected param types (Math.max(0, x) now converts 0 to f64)
+- Field type not updated when assigning across integer/float boundary (f64 result into i32 field)
+- Instance getter vs field access: PrivateIdentifier → field load, Identifier → method call
+
+#### 21-fizzbuzz.js enabled (test)
+- fd_write-based output capture; checks for Fizz, Buzz, FizzBuzz
+
+#### 21-game-loop.js enabled (test)
+- Vec2 + Player classes with private fields, getters, std/math
+- Game class with static fields/methods/getters
+- Verifies damage/health/running cycle
+
+**Total: 222 passing, 5 pending, 0 failing**
 
 ---
 

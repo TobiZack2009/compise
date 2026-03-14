@@ -58,8 +58,13 @@ class Game {
   static get running() { return Game.#running; }
 }
 
-//@export("game_init")    function init()                  { Game.init(); }
-//@export("game_update")  function update(dt = 0.0)        { Game.update(dt); }
-//@export("game_move")    function move(dx=0.0, dy=0.0)    { Game.move(dx, dy); }
-//@export("game_damage")  function damage(amount = 0)      { Game.damage(amount); }
-//@export("game_running") function running()               { return Game.running ? 1 : 0; }
+//@export("game_init")
+function init()                { Game.init(); }
+//@export("game_update")
+function update(dt = 0.0)     { Game.update(dt); }
+//@export("game_move")
+function move(dx=0.0, dy=0.0) { Game.move(dx, dy); }
+//@export("game_damage")
+function damage(amount = 0)   { Game.damage(amount); }
+//@export("game_running")
+function running()             { return Game.running ? 1 : 0; }

@@ -197,12 +197,75 @@ describe('section 21 examples (Phase 2+)', () => {
     const exp = await instantiateFile('examples/21-hello-world.js', importObject);
     assert.ok(exp, 'expected WASM exports');
   });
-  it.skip('21-fizzbuzz.js    — requires std/io, std/string, std/range, for-of');
+  it('21-fizzbuzz.js — std/io, std/string, std/range, for-of', async () => {
+    let output = '';
+    const source = await readFile(new URL('../examples/21-fizzbuzz.js', import.meta.url), 'utf8');
+    const { wasm } = await compileSource(source, '21-fizzbuzz.js');
+    const importObject = {
+      wasi_snapshot_preview1: {
+        fd_write(_fd, iovs_ptr, iovs_len, nwritten_ptr) {
+          const mem = new Uint8Array(instance.exports.memory.buffer);
+          const view = new DataView(instance.exports.memory.buffer);
+          for (let i = 0; i < iovs_len; i++) {
+            const base = iovs_ptr + i * 8;
+            const ptr  = view.getUint32(base, true);
+            const len  = view.getUint32(base + 4, true);
+            output += new TextDecoder().decode(mem.slice(ptr, ptr + len));
+          }
+          view.setUint32(nwritten_ptr, 1, true);
+          return 0;
+        },
+        fd_read: () => 0,
+        proc_exit: () => {},
+      },
+    };
+    const { instance } = await WebAssembly.instantiate(wasm, importObject);
+    if (instance.exports.__start) instance.exports.__start();
+    assert.ok(output.includes('Fizz'),     'expected Fizz in output');
+    assert.ok(output.includes('Buzz'),     'expected Buzz in output');
+    assert.ok(output.includes('FizzBuzz'), 'expected FizzBuzz in output');
+    // Spot-check: 15 is FizzBuzz, 3 is Fizz, 5 is Buzz
+    assert.ok(!output.includes('15'),      '15 should be FizzBuzz, not a number');
+  });
   it.skip('21-fibonacci.js   — requires classes, Symbol traits, for-of');
   it.skip('21-stack.js       — requires classes, private fields, arrays');
   it.skip('21-result.js      — requires classes, inheritance, switch narrowing');
   it.skip('21-pixel-buffer.js — requires classes, manual memory');
   it.skip('21-wasm-compute.js — requires std/math, std/random, ptr');
-  it.skip('21-game-loop.js   — requires classes, static fields, std/math');
+  it('21-game-loop.js — classes, static fields/methods/getters, inheritance, std/math', async () => {
+    let output = '';
+    const source = await readFile(new URL('../examples/21-game-loop.js', import.meta.url), 'utf8');
+    const { wasm } = await compileSource(source, '21-game-loop.js');
+    const importObject = {
+      wasi_snapshot_preview1: {
+        fd_write(_fd, iovs_ptr, iovs_len, nwritten_ptr) {
+          const mem = new Uint8Array(instance.exports.memory.buffer);
+          const view = new DataView(instance.exports.memory.buffer);
+          for (let i = 0; i < iovs_len; i++) {
+            const base = iovs_ptr + i * 8;
+            const ptr  = view.getUint32(base, true);
+            const len  = view.getUint32(base + 4, true);
+            output += new TextDecoder().decode(mem.slice(ptr, ptr + len));
+          }
+          view.setUint32(nwritten_ptr, 1, true);
+          return 0;
+        },
+        fd_read: () => 0,
+        proc_exit: () => {},
+      },
+    };
+    const { instance } = await WebAssembly.instantiate(wasm, importObject);
+    if (instance.exports.__start) instance.exports.__start();
+    const exp = instance.exports;
+    exp.game_init();
+    assert.equal(exp.game_running(), 1, 'running after init');
+    exp.game_move(1.0, 0.0);
+    exp.game_update(0.5);
+    exp.game_damage(50);
+    assert.equal(exp.game_running(), 1, 'running after 50 damage (50 hp left)');
+    exp.game_damage(60);
+    assert.equal(exp.game_running(), 0, 'stopped after 60 more damage (0 hp)');
+    assert.ok(output.includes('Game over'), `expected "Game over" in output, got: ${JSON.stringify(output)}`);
+  });
 
 });

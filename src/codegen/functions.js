@@ -198,6 +198,7 @@ export function genConstructor(classInfo, fnNode, sig, mod, classes, layouts, im
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
   ctx._strings = stringTable.map;
+  ctx._currentClassInfo = classInfo;
   ctx.setLocals(params, localVars);
 
   const bodyStmts = fnNode.body.body.map(stmt => genStatement(stmt, TYPES.void, ctx, filename));
@@ -208,4 +209,30 @@ export function genConstructor(classInfo, fnNode, sig, mod, classes, layouts, im
   const paramType  = binaryen.createType(params.map(p => toBinType(p.type)));
   // Constructor returns void
   mod.addFunction(name, paramType, binaryen.none, ctx._varTypes, bodyExpr);
+}
+
+/**
+ * Generate and add a static class method to the binaryen module.
+ * Static methods have no 'this' parameter.
+ */
+export function genStaticMethod(classInfo, methodName, fnNode, sig, mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames, isGetter) {
+  const suffix = isGetter ? `__sg_${methodName}` : `__sm_${methodName}`;
+  const name = `${classInfo.name}${suffix}`;
+  const params = sig.params.map(p => ({ name: p.name, type: p.type }));
+  const localVars = collectLocals(fnNode.body, params);
+
+  const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
+  ctx._strings = stringTable.map;
+  ctx._currentClassInfo = classInfo;
+  ctx.setLocals(params, localVars);
+
+  const bodyStmts = fnNode.body.body.map(stmt => genStatement(stmt, sig.returnType, ctx, filename));
+  const bodyExpr  = bodyStmts.length === 0 ? mod.nop()
+                  : bodyStmts.length === 1 ? bodyStmts[0]
+                  : mod.block(null, bodyStmts, binaryen.none);
+
+  const paramType  = binaryen.createType(params.map(p => toBinType(p.type)));
+  const resultType = toBinType(sig.returnType);
+
+  mod.addFunction(name, paramType, resultType, ctx._varTypes, bodyExpr);
 }

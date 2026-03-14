@@ -77,6 +77,32 @@ function isIntLiteral(node) {
   return Number.isInteger(node.value);
 }
 
+/**
+ * Find the least common ancestor of two class types in the inheritance hierarchy.
+ * Returns the LCA TypeInfo, or null if no common ancestor.
+ * @param {TypeInfo} a
+ * @param {TypeInfo} b
+ * @param {Map<string, ClassInfo>} classes
+ * @returns {TypeInfo|null}
+ */
+function findCommonAncestor(a, b, classes) {
+  if (!a || !b || a.kind !== 'class' || b.kind !== 'class') return null;
+  // Build ancestor chain for a
+  const aAncestors = new Set();
+  let cur = a.name;
+  while (cur) {
+    aAncestors.add(cur);
+    cur = classes.get(cur)?.superClassName ?? null;
+  }
+  // Walk b's chain until we find a common ancestor
+  cur = b.name;
+  while (cur) {
+    if (aAncestors.has(cur)) return classes.get(cur)?.type ?? null;
+    cur = classes.get(cur)?.superClassName ?? null;
+  }
+  return null;
+}
+
 // ── Main inference engine ────────────────────────────────────────────────────
 
 /**
@@ -117,6 +143,10 @@ export function inferTypes(ast, filename = '<input>') {
         fields: new Map(),
         methods: new Map(),
         constructor: null,
+        staticFields: new Map(),
+        staticMethods: new Map(),
+        staticGetters: new Map(),
+        superClassName: stmt.superClass?.name ?? null,
       });
     }
   }
@@ -311,12 +341,19 @@ function inferFunction(node, scope, signatures, classes, filename, ctx) {
     for (let i = 1; i < returnTypes.length; i++) {
       const unified = promoteTypes(returnType, returnTypes[i]);
       if (!unified) {
-        throw new Error(
-          `Type mismatch in return types of '${node.id?.name}': ` +
-          `${returnType.name} vs ${returnTypes[i].name} (${filename}:${node.loc?.start?.line ?? '?'})`
-        );
+        // Try to find common ancestor for class types
+        const lca = findCommonAncestor(returnType, returnTypes[i], classes);
+        if (lca) {
+          returnType = lca;
+        } else {
+          throw new Error(
+            `Type mismatch in return types of '${node.id?.name}': ` +
+            `${returnType.name} vs ${returnTypes[i].name} (${filename}:${node.loc?.start?.line ?? '?'})`
+          );
+        }
+      } else {
+        returnType = unified;
       }
-      returnType = unified;
     }
   }
 
@@ -331,7 +368,7 @@ function inferFunction(node, scope, signatures, classes, filename, ctx) {
 }
 
 /**
- * Infer class fields and method signatures.
+ * Infer class fields and method signatures (including static members and inheritance).
  * @param {object} node  ClassDeclaration
  * @param {ScopeChain} scope
  * @param {Map<string, FunctionSignature>} signatures
@@ -343,29 +380,123 @@ function inferClass(node, scope, signatures, classes, filename, ctx) {
   const classInfo = classes.get(node.id.name);
   if (!classInfo) return;
 
+  // Inheritance: copy parent instance fields into child (parent must be processed first)
+  if (classInfo.superClassName) {
+    const parentInfo = classes.get(classInfo.superClassName);
+    if (parentInfo) {
+      for (const [name, type] of parentInfo.fields.entries()) {
+        if (!classInfo.fields.has(name)) classInfo.fields.set(name, type);
+      }
+    }
+  }
+
+  const elCtx = { currentClass: classInfo, imports: ctx.imports };
+
   for (const element of node.body.body) {
-    if (element.type === 'PropertyDefinition' && !element.static) {
-      const name = element.key?.name;
-      if (name && !classInfo.fields.has(name)) {
-        const fieldType = element.value
-          ? inferExpr(element.value, scope, signatures, classes, filename, { currentClass: classInfo })
-          : TYPES.unknown;
+    if (element.type === 'PropertyDefinition') {
+      const name = element.key?.name; // PrivateIdentifier.name strips the '#'
+      if (!name) continue;
+      const fieldType = element.value
+        ? inferExpr(element.value, scope, signatures, classes, filename, elCtx)
+        : TYPES.unknown;
+      if (element.static) {
+        classInfo.staticFields.set(name, fieldType);
+      } else if (!classInfo.fields.has(name)) {
         classInfo.fields.set(name, fieldType);
       }
     }
 
-    if (element.type === 'MethodDefinition' && !element.static) {
+    if (element.type === 'MethodDefinition') {
       const methodName = element.key?.name;
       const methodFn = element.value;
       if (!methodName || !methodFn) continue;
-      const sig = inferMethod(methodFn, classInfo, scope, signatures, classes, filename, ctx);
-      if (element.kind === 'constructor') {
-        classInfo.constructor = { node: methodFn, signature: sig };
+
+      if (element.static) {
+        const sig = inferStaticMethod(methodFn, classInfo, scope, signatures, classes, filename, ctx);
+        if (element.kind === 'get') {
+          classInfo.staticGetters.set(methodName, { node: methodFn, signature: sig });
+        } else {
+          classInfo.staticMethods.set(methodName, { node: methodFn, signature: sig });
+        }
       } else {
-        classInfo.methods.set(methodName, { node: methodFn, signature: sig });
+        const sig = inferMethod(methodFn, classInfo, scope, signatures, classes, filename, ctx);
+        if (element.kind === 'constructor') {
+          classInfo.constructor = { node: methodFn, signature: sig };
+        } else {
+          classInfo.methods.set(methodName, { node: methodFn, signature: sig });
+        }
       }
     }
   }
+
+  // Post-scan: infer class-typed static fields from assignments in static methods
+  // e.g. Game.#instance = new Player(...) → #instance is typed as Player
+  for (const el of node.body.body) {
+    if (el.type !== 'MethodDefinition' || !el.static || !el.value?.body) continue;
+    for (const stmt of el.value.body.body) {
+      if (stmt.type !== 'ExpressionStatement') continue;
+      const expr = stmt.expression;
+      if (expr?.type !== 'AssignmentExpression' || expr.operator !== '=') continue;
+      const { left, right } = expr;
+      if (left?.type !== 'MemberExpression') continue;
+      const objName = left.object?.name;
+      const fieldName = left.property?.name;
+      if (objName !== node.id.name || !fieldName) continue;
+      if (right?.type !== 'NewExpression') continue;
+      const ctorClassName = right.callee?.name;
+      if (!ctorClassName) continue;
+      const ctorClass = classes.get(ctorClassName);
+      if (!ctorClass) continue;
+      // Only update if field was unknown
+      const existing = classInfo.staticFields.get(fieldName);
+      if (!existing || existing.kind === 'unknown') {
+        classInfo.staticFields.set(fieldName, ctorClass.type);
+      }
+    }
+  }
+}
+
+/**
+ * Infer a static class method signature (no `this` param).
+ * @param {object} fnNode  FunctionExpression
+ * @param {ClassInfo} classInfo
+ * @param {ScopeChain} scope
+ * @param {Map<string, FunctionSignature>} signatures
+ * @param {Map<string, ClassInfo>} classes
+ * @param {string} filename
+ * @returns {FunctionSignature}
+ */
+function inferStaticMethod(fnNode, classInfo, scope, signatures, classes, filename, ctx) {
+  scope.push();
+  const childCtx = { currentClass: classInfo, imports: ctx.imports };
+
+  /** @type {Array<{ name: string, type: TypeInfo }>} */
+  const params = [];
+  for (const p of fnNode.params) {
+    if (p.type === 'AssignmentPattern' && p.left?.name) {
+      const defaultType = inferExpr(p.right, scope, signatures, classes, filename, childCtx);
+      p._type = defaultType;
+      p.left._type = defaultType;
+      scope.define(p.left.name, defaultType);
+      params.push({ name: p.left.name, type: defaultType });
+    }
+  }
+
+  /** @type {TypeInfo[]} */
+  const returnTypes = [];
+  collectReturnTypes(fnNode.body, returnTypes, scope, signatures, classes, filename, childCtx);
+
+  let returnType = TYPES.void;
+  if (returnTypes.length > 0) {
+    returnType = returnTypes[0];
+    for (let i = 1; i < returnTypes.length; i++) {
+      const unified = promoteTypes(returnType, returnTypes[i]);
+      returnType = unified ?? returnType;
+    }
+  }
+
+  scope.pop();
+  return { params, returnType };
 }
 
 /**
@@ -582,6 +713,11 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
       } else {
         // User function calls
         for (const arg of node.arguments) inferExpr(arg, scope, signatures, classes, filename, ctx);
+        if (callee.type === 'Super') {
+          for (const arg of node.arguments ?? []) inferExpr(arg, scope, signatures, classes, filename, ctx);
+          t = TYPES.void;
+          break;
+        }
         if (callee.type === 'Identifier') {
           const std = resolveStdFunction(ctx.imports, callee.name);
           if (std) {
@@ -648,7 +784,7 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           }
           if (!t || t === TYPES.void) {
             const classInfo = objType && objType.kind === 'class' ? classes.get(objType.name) : null;
-            const method = methodName && classInfo ? classInfo.methods.get(methodName) : null;
+            const method = methodName && classInfo ? (classInfo.methods.get(methodName) ?? classInfo.staticMethods?.get(methodName)) : null;
             if (method) {
               t = method.signature.returnType ?? TYPES.void;
             } else {
@@ -669,6 +805,9 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
       const cmpOps = new Set(['===', '!==', '<', '>', '<=', '>=']);
       if (cmpOps.has(node.operator)) {
         t = TYPES.bool;
+      } else if (node.operator === '**') {
+        // ** always operates in f64 (calls __jswat_math_pow); coerce both sides
+        t = TYPES.f64;
       } else {
         const promoted = promoteTypes(left, right);
         if (!promoted) {
@@ -702,8 +841,17 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           const classInfo = objType && objType.kind === 'class' ? classes.get(objType.name) : null;
           const fieldName = node.left.property?.name;
           if (classInfo && fieldName) {
-            const existing = classInfo.fields.get(fieldName) ?? TYPES.unknown;
-            classInfo.fields.set(fieldName, promoteTypes(existing, t) ?? t);
+            if (classInfo.fields.has(fieldName)) {
+              const existing = classInfo.fields.get(fieldName) ?? TYPES.unknown;
+              // Only update field type if compatible (same integer/float domain); never cross the boundary
+              const promoted = promoteTypes(existing, t);
+              if (promoted) classInfo.fields.set(fieldName, promoted);
+            } else if (classInfo.staticFields?.has(fieldName)) {
+              const existing = classInfo.staticFields.get(fieldName) ?? TYPES.unknown;
+              if (existing === TYPES.unknown || existing?.kind === 'unknown') {
+                classInfo.staticFields.set(fieldName, t);
+              }
+            }
           }
         }
         if (node.left.type === 'Identifier' && leftType.kind === 'unknown') {
@@ -735,8 +883,16 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
         if (objType && objType.kind === 'class') {
           const classInfo = classes.get(objType.name);
           const fieldName = node.property?.name;
-          if (classInfo && fieldName && classInfo.fields.has(fieldName)) {
-            t = classInfo.fields.get(fieldName);
+          if (classInfo && fieldName) {
+            if (classInfo.fields.has(fieldName)) {
+              t = classInfo.fields.get(fieldName);
+            } else if (classInfo.staticFields?.has(fieldName)) {
+              t = classInfo.staticFields.get(fieldName);
+            } else if (classInfo.staticGetters?.has(fieldName)) {
+              t = classInfo.staticGetters.get(fieldName).signature.returnType;
+            } else {
+              t = TYPES.unknown;
+            }
           } else {
             t = TYPES.unknown;
           }

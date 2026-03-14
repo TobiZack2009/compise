@@ -90,7 +90,11 @@ export function genBinOp(mod, op, typeInfo, left, right) {
   const isFloat = typeInfo.isFloat;
   const s = typeInfo.isSigned ? '_s' : '_u';
 
-  if (op === '**') return mod.call('__jswat_math_pow', [left, right], binaryen.f64);
+  if (op === '**') {
+    // Always operate in f64; convert integer operands if needed
+    const toF64 = (expr) => (binaryen.getExpressionType(expr) === binaryen.f64 ? expr : mod.f64.convert_s.i32(expr));
+    return mod.call('__jswat_math_pow', [toF64(left), toF64(right)], binaryen.f64);
+  }
 
   switch (op) {
     case '+':   return mod[wt].add(left, right);
