@@ -62,6 +62,10 @@ const TYPE_REGISTRY = {
 
   // Iterator handle (tagged pointer)
   iter: t({ kind: 'iter', name: 'iter', nullable: true, abstract: true, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
+
+  // Typed raw pointer (ptr<T>) — represented as i32 address at runtime
+  // .addr returns the address, .val loads/stores the pointed-to value (f64)
+  ptr:  t({ kind: 'ptr',  name: 'ptr',  nullable: true, abstract: true, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
 };
 
 export const TYPES = TYPE_REGISTRY;

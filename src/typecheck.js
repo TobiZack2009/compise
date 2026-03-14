@@ -191,6 +191,21 @@ export function inferTypes(ast, filename = '<input>') {
     }
   }
 
+  // Inject synthetic std/range Range class so `new Range(a, b, c)` args get typechecked
+  if (Array.from(imports.values()).some(i => i.module === 'std/range')) {
+    const rangeType = {
+      kind: 'class', name: 'Range', nullable: true, abstract: false,
+      wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32,
+    };
+    classes.set('Range', {
+      name: 'Range', type: rangeType,
+      fields: new Map([['start', TYPES.isize], ['end', TYPES.isize], ['step', TYPES.isize]]),
+      methods: new Map(), constructor: null,
+      staticFields: new Map(), staticMethods: new Map(), staticGetters: new Map(),
+      superClassName: null,
+    });
+  }
+
   for (const classInfo of classes.values()) {
     TYPES[classInfo.name] = classInfo.type;
   }
@@ -767,6 +782,19 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
 
     case 'CallExpression': {
       const callee = node.callee;
+      // ptr(x) — type annotation for raw pointer; always produces TYPES.ptr
+      if (callee.type === 'Identifier' && callee.name === 'ptr') {
+        for (const arg of node.arguments) inferExpr(arg, scope, signatures, classes, filename, ctx);
+        t = TYPES.ptr;
+        break;
+      }
+      // ptr.fromAddr(addr, elem) — creates typed raw pointer from address
+      if (callee.type === 'MemberExpression' && callee.object?.name === 'ptr' &&
+          callee.property?.name === 'fromAddr') {
+        for (const arg of node.arguments) inferExpr(arg, scope, signatures, classes, filename, ctx);
+        t = TYPES.ptr;
+        break;
+      }
       // Cast calls: u8(x), i32(x), f64(x), etc.
       if (callee.type === 'Identifier' && CAST_TYPES.has(callee.name)) {
         t = TYPES[callee.name];
@@ -959,6 +987,11 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           } else {
             t = TYPES.unknown;
           }
+        } else if (objType?.kind === 'ptr') {
+          const propName = node.property?.name;
+          if (propName === 'addr') t = TYPES.isize; // ptr.addr = the raw address (i32)
+          else if (propName === 'val') t = TYPES.f64; // ptr.val = load/store f64
+          else t = TYPES.void;
         } else if (objType?.kind === 'array' && node.property?.name === 'length') {
           t = TYPES.usize;
         } else if (objType?.kind === 'str' && !node.computed) {

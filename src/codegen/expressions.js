@@ -229,6 +229,10 @@ export function genExpr(node, filename, ctx) {
         return mod.call(`${parentName}__ctor`, [ctx.localGet('this'), ...argExprs], binaryen.none);
       }
       if (callee.type === 'Identifier') {
+        // ptr(x) — null typed raw pointer (the address 0 or the given value as i32)
+        if (callee.name === 'ptr') {
+          return mod.i32.const(0);
+        }
         const castTarget = TYPES[callee.name];
         if (castTarget && !castTarget.abstract) {
           const argExpr = genExpr(node.arguments[0], filename, ctx);
@@ -262,6 +266,10 @@ export function genExpr(node, filename, ctx) {
         const className = objType?.kind === 'class' ? objType.name : null;
 
         if (callee.object.type === 'Identifier' && methodName) {
+          // ptr.fromAddr(addr, elem) — returns addr as a raw typed pointer (identity)
+          if (callee.object.name === 'ptr' && methodName === 'fromAddr') {
+            return genExpr(node.arguments[0], filename, ctx);
+          }
           if (callee.object.name === 'memory' && (methodName === 'copy' || methodName === 'fill')) {
             const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
             if (methodName === 'copy') return mod.memory.copy(argExprs[0], argExprs[1], argExprs[2]);
@@ -410,6 +418,16 @@ export function genExpr(node, filename, ctx) {
         return ctx.localTee(name, expr);
       }
       if (left.type === 'MemberExpression') {
+        // ptr.val = x → f64.store at the address
+        if (!left.computed && left.object?._type?.kind === 'ptr' && left.property?.name === 'val') {
+          const ptrExpr = genExpr(left.object, filename, ctx);
+          const valueExpr = genExpr(node.right, filename, ctx);
+          return mod.block(null, [
+            ctx.localSet('__tmp_f64', valueExpr),
+            mod.f64.store(0, 0, ptrExpr, ctx.localGet('__tmp_f64')),
+            ctx.localGet('__tmp_f64'),
+          ], binaryen.f64);
+        }
         if (left.computed && left.object?._type?.kind === 'array') {
           if (node.operator !== '=') {
             throw new CodegenError(`Compound assignments on array elements not supported yet (${filename})`);
@@ -535,6 +553,14 @@ export function genExpr(node, filename, ctx) {
 
     case 'MemberExpression': {
       const objType = node.object?._type;
+      // ptr.addr → return the pointer value itself (i32 address)
+      if (!node.computed && objType?.kind === 'ptr' && node.property?.name === 'addr') {
+        return genExpr(node.object, filename, ctx);
+      }
+      // ptr.val → load f64 at the address
+      if (!node.computed && objType?.kind === 'ptr' && node.property?.name === 'val') {
+        return mod.f64.load(0, 0, genExpr(node.object, filename, ctx));
+      }
       if (node.computed && objType?.kind === 'array') {
         return mod.call('__jswat_array_get', [
           genExpr(node.object, filename, ctx),

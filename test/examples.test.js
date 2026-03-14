@@ -297,7 +297,42 @@ describe('section 21 examples (Phase 2+)', () => {
     assert.equal(lines[1], 'Error: division by zero', `Expected 'Error: division by zero', got: ${lines[1]}`);
   });
   it.skip('21-pixel-buffer.js — requires classes, manual memory');
-  it.skip('21-wasm-compute.js — requires std/math, std/random, ptr');
+  it('21-wasm-compute.js — ptr type, dot_product, matrix_fill_random', async () => {
+    const source = await readFile(new URL('../examples/21-wasm-compute.js', import.meta.url), 'utf8');
+    const { wasm } = await compileSource(source, '21-wasm-compute.js');
+    let instance;
+    const importObject = {
+      wasi_snapshot_preview1: {
+        random_get(bufPtr, bufLen) {
+          const mem = new Uint8Array(instance.exports.memory.buffer);
+          for (let i = 0; i < bufLen; i++) mem[bufPtr + i] = (i * 37 + 13) & 0xff;
+          return 0;
+        },
+        proc_exit: () => {},
+      },
+    };
+    ({ instance } = await WebAssembly.instantiate(wasm, importObject));
+    const view = new DataView(instance.exports.memory.buffer);
+    // Allocate 3-element f64 vectors
+    const aPtr = instance.exports.__alloc(24, 0);
+    const bPtr = instance.exports.__alloc(24, 0);
+    view.setFloat64(aPtr,      1.0, true);
+    view.setFloat64(aPtr +  8, 2.0, true);
+    view.setFloat64(aPtr + 16, 3.0, true);
+    view.setFloat64(bPtr,      4.0, true);
+    view.setFloat64(bPtr +  8, 5.0, true);
+    view.setFloat64(bPtr + 16, 6.0, true);
+    // dot([1,2,3],[4,5,6]) = 32
+    const dp = instance.exports.dot_product(aPtr, bPtr, 3);
+    assert.equal(dp, 32, `dot_product should be 32, got ${dp}`);
+    // matrix_fill_random should not crash and fill memory
+    instance.exports.seed(42);
+    const matPtr = instance.exports.__alloc(9 * 8, 0);
+    instance.exports.matrix_fill_random(matPtr, 3, 3);
+    // at least one element should be a finite number
+    const v = view.getFloat64(matPtr, true);
+    assert.ok(Number.isFinite(v), `matrix element should be finite, got ${v}`);
+  });
   it('21-game-loop.js — classes, static fields/methods/getters, inheritance, std/math', async () => {
     let output = '';
     const source = await readFile(new URL('../examples/21-game-loop.js', import.meta.url), 'utf8');
