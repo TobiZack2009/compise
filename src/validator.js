@@ -160,10 +160,7 @@ export function validate(ast, filename = '<input>') {
             err("Math.* requires importing Math from 'std/math'", node);
           }
         }
-        // Bracket (computed) access is not supported — use direct field access.
-        if (node.computed) {
-          err("Bracket notation (computed member access) is not allowed; use direct field access", node);
-        }
+        // Bracket (computed) access is supported on arrays; class fields require direct access.
       },
 
       /** @param {object} node */

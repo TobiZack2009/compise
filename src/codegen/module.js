@@ -190,12 +190,27 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
     }
   }
 
+  // ── Built-in class constructors (direct binaryen, no AST) ────────────────
+  if (classes.has('IteratorResult')) {
+    const irLayout = layouts.get('IteratorResult');
+    const valOff  = irLayout?.fields.get('value')?.offset ?? 4;
+    const doneOff = irLayout?.fields.get('done')?.offset  ?? 8;
+    mod.addFunction('IteratorResult__ctor',
+      binaryen.createType([binaryen.i32, binaryen.i32, binaryen.i32]),
+      binaryen.none, [],
+      mod.block(null, [
+        mod.i32.store(valOff,  0, mod.local.get(0, binaryen.i32), mod.local.get(1, binaryen.i32)),
+        mod.i32.store8(doneOff, 0, mod.local.get(0, binaryen.i32), mod.local.get(2, binaryen.i32)),
+      ], binaryen.none)
+    );
+  }
+
   for (const classInfo of classes.values()) {
     for (const [methodName, method] of classInfo.methods.entries()) {
       genMethod(classInfo, methodName, method.node, method.signature,
         mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames);
     }
-    if (classInfo.constructor) {
+    if (classInfo.constructor && !classInfo.constructor._builtin) {
       genConstructor(classInfo, classInfo.constructor.node, classInfo.constructor.signature,
         mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames);
     }
@@ -246,6 +261,7 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   }
 
   // ── Emit ──────────────────────────────────────────────────────────────────
+  mod.setFeatures(binaryen.Features.BulkMemory | binaryen.Features.MutableGlobals);
   const wat    = mod.emitText();
   const binary = mod.emitBinary();
   mod.dispose();

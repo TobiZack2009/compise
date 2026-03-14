@@ -217,6 +217,25 @@ export function buildArrayFunctions(mod) {
       binaryen.createType([i32, i32]), i32,
       [i32, i32, i32, i32, i32], body);
   }
+
+  // __jswat_array_pop(arr:i32) -> i32
+  // params: arr(0); locals: len(1), data(2)
+  {
+    const getArr  = () => mod.local.get(0, i32);
+    const getLen  = () => mod.local.get(1, i32);
+    const getData = () => mod.local.get(2, i32);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.i32.load(4, 0, getArr())),
+      mod.if(mod.i32.eqz(getLen()), mod.return(mod.i32.const(0))),
+      mod.local.set(1, mod.i32.sub(getLen(), mod.i32.const(1))),
+      mod.i32.store(4, 0, getArr(), getLen()),
+      mod.local.set(2, mod.i32.load(12, 0, getArr())),
+      mod.return(mod.i32.load(0, 0,
+        mod.i32.add(getData(), mod.i32.mul(getLen(), mod.i32.const(4))))),
+    ], i32);
+    mod.addFunction('__jswat_array_pop',
+      binaryen.createType([i32]), i32, [i32, i32], body);
+  }
 }
 
 // ── std/string ────────────────────────────────────────────────────────────────

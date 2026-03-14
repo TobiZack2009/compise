@@ -14,8 +14,10 @@ import { typeSize, resolveFieldType } from './types.js';
  */
 export function buildClassLayouts(classes) {
   const layouts = new Map();
+  let nextClassId = 1;
   for (const classInfo of classes.values()) {
-    let offset = 4; // 4-byte refcount header
+    const classId = nextClassId++;
+    let offset = 4; // 4-byte type-tag header (stores classId)
     const fields = new Map();
     for (const [name, typeInfo] of classInfo.fields.entries()) {
       const resolved = resolveFieldType(typeInfo);
@@ -23,7 +25,7 @@ export function buildClassLayouts(classes) {
       fields.set(name, { offset, type: resolved });
       offset += size;
     }
-    layouts.set(classInfo.name, { size: offset, fields });
+    layouts.set(classInfo.name, { classId, size: offset, fields });
   }
   return layouts;
 }

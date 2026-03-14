@@ -309,6 +309,31 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
       return mod.br(loop.continueLabel);
     }
 
+    case 'SwitchStatement': {
+      const discType = stmt.discriminant?._type;
+      if (discType?.kind === 'class') {
+        // Type-narrowing switch: compare type tag (ptr[0]) to each case class ID
+        let chain = mod.nop();
+        for (let i = stmt.cases.length - 1; i >= 0; i--) {
+          const c = stmt.cases[i];
+          if (!c.test) continue; // default case — skip for now
+          const caseLayout = ctx._layouts.get(c.test.name);
+          if (!caseLayout) continue;
+          const bodyStmts = c.consequent.map(s => genStatement(s, fnReturnType, ctx, filename));
+          const body = bodyStmts.length === 0 ? mod.nop()
+                     : bodyStmts.length === 1 ? bodyStmts[0]
+                     : mod.block(null, bodyStmts, binaryen.none);
+          const tagCheck = mod.i32.eq(
+            mod.i32.load(0, 0, genExpr(stmt.discriminant, filename, ctx)),
+            mod.i32.const(caseLayout.classId)
+          );
+          chain = mod.if(tagCheck, body, chain);
+        }
+        return chain;
+      }
+      return mod.nop();
+    }
+
     default:
       return mod.nop();
   }

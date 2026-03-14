@@ -155,6 +155,7 @@ export function genExpr(node, filename, ctx) {
 
   switch (node.type) {
     case 'Literal': {
+      if (node.value === null) return mod.i32.const(0); // null pointer
       const type = node._type;
       if (type?.name === 'str' && typeof node.value === 'string') {
         const addr = ctx._strings?.get(node.value);
@@ -217,6 +218,8 @@ export function genExpr(node, filename, ctx) {
         const parentName = ctx._currentClassInfo?.superClassName;
         if (!parentName) throw new CodegenError(`super() used without parent class (${filename})`);
         const parentCtorInfo = ctx._classes?.get(parentName)?.constructor;
+        // If parent has no constructor, super() is a no-op
+        if (!parentCtorInfo || parentCtorInfo._builtin) return mod.nop();
         const provided = node.arguments ?? [];
         const ctorParams = parentCtorInfo?.node.params ?? [];
         const argExprs = ctorParams.map((p, i) => {
@@ -325,6 +328,15 @@ export function genExpr(node, filename, ctx) {
             default: throw new CodegenError(`Unknown str method '${methodName}' (${filename})`);
           }
         }
+        if (objType?.kind === 'array' && methodName) {
+          const objExpr = genExpr(callee.object, filename, ctx);
+          const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
+          switch (methodName) {
+            case 'push': return mod.call('__jswat_array_push', [objExpr, ...argExprs], binaryen.none);
+            case 'pop':  return mod.call('__jswat_array_pop',  [objExpr], binaryen.i32);
+            default: throw new CodegenError(`Unknown array method '${methodName}' (${filename})`);
+          }
+        }
         if (callee.object.type === 'Identifier' && methodName) {
           const ns = resolveStdNamespace(ctx._imports, callee.object.name, methodName);
           const def = resolveStdDefault(ctx._imports, callee.object.name, methodName);
@@ -355,7 +367,16 @@ export function genExpr(node, filename, ctx) {
           throw new CodegenError(`Unsupported method call (${filename})`);
         }
         const fnName = `${className}_${methodName}`;
-        const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
+        const methodSig = ctx._classes?.get(className)?.methods?.get(methodName)?.signature;
+        const argExprs = node.arguments.map((arg, i) => {
+          const expr = genExpr(arg, filename, ctx);
+          const expectedType = methodSig?.params?.[i]?.type;
+          if (!expectedType) return expr;
+          const actualWt = binaryen.getExpressionType(expr);
+          const expectedWt = toBinType(expectedType);
+          if (actualWt !== expectedWt) return genCast(mod, expr, arg._type, expectedType);
+          return expr;
+        });
         const retType = node._type ? toBinType(node._type) : binaryen.none;
         return mod.call(fnName, [objExpr, ...argExprs], retType);
       }
@@ -453,6 +474,33 @@ export function genExpr(node, filename, ctx) {
 
     case 'UpdateExpression': {
       const arg = node.argument;
+      const addOp = node.operator === '++' ? 'add' : 'sub';
+
+      if (arg.type === 'MemberExpression') {
+        // UpdateExpression on an instance field: load, inc/dec, store
+        const field = resolveFieldAccess(arg, ctx, filename);
+        const t = field.type;
+        const wt = t.wasmType ?? 'i32';
+        const one = wt === 'i64' ? mod.i64.const(1, 0) : wt === 'f64' ? mod.f64.const(1) : mod.i32.const(1);
+        const tmpName = wt === 'f64' ? '__tmp_f64' : '__tmp';
+        const oldVal  = genLoad(mod, genExpr(arg.object, filename, ctx), t, field.offset);
+        const newVal  = maybeNarrow(mod, mod[wt][addOp](oldVal, one), t);
+        if (node.prefix) {
+          return mod.block(null, [
+            ctx.localSet(tmpName, newVal),
+            genStore(mod, genExpr(arg.object, filename, ctx), ctx.localGet(tmpName), t, field.offset),
+            ctx.localGet(tmpName),
+          ], toBinType(t));
+        }
+        // postfix: return old, then store new
+        const oldValSaved = genLoad(mod, genExpr(arg.object, filename, ctx), t, field.offset);
+        return mod.block(null, [
+          ctx.localSet(tmpName, oldValSaved),
+          genStore(mod, genExpr(arg.object, filename, ctx), mod[wt][addOp](ctx.localGet(tmpName), one), t, field.offset),
+          ctx.localGet(tmpName),
+        ], toBinType(t));
+      }
+
       if (arg.type !== 'Identifier') {
         throw new CodegenError(`Only simple update expressions on locals are supported (${filename})`);
       }
@@ -463,7 +511,6 @@ export function genExpr(node, filename, ctx) {
                 : wt === 'f32' ? mod.f32.const(1)
                 : wt === 'f64' ? mod.f64.const(1)
                 : mod.i32.const(1);
-      const addOp = node.operator === '++' ? 'add' : 'sub';
       const newVal = maybeNarrow(mod, mod[wt][addOp](ctx.localGet(name), one), t);
       if (node.prefix) {
         return ctx.localTee(name, newVal);
@@ -532,11 +579,14 @@ export function genExpr(node, filename, ctx) {
     case 'NewExpression': {
       if (node.callee?.type === 'Identifier') {
         const className = node.callee.name;
-        const ctor = resolveStdCollectionCtor(className);
-        if (ctor) {
-          return mod.call(ctor, [], binaryen.i32);
-        }
+        // User-defined classes take priority over stdlib collections
         const layout = ctx._layouts.get(className);
+        if (!layout) {
+          const ctor = resolveStdCollectionCtor(className);
+          if (ctor) {
+            return mod.call(ctor, [], binaryen.i32);
+          }
+        }
         if (!layout) throw new CodegenError(`Unknown class '${className}' (${filename})`);
         const ctorInfo = ctx._classes?.get(className)?.constructor ?? null;
         if (ctorInfo) {
@@ -547,16 +597,18 @@ export function genExpr(node, filename, ctx) {
             if (i < provided.length) return genExpr(provided[i], filename, ctx);
             return p.type === 'AssignmentPattern' ? genExpr(p.right, filename, ctx) : mod.i32.const(0);
           });
+          const classId = layout.classId ?? 1;
           return mod.block(null, [
             ctx.localSet('__tmp', mod.call('__alloc', [mod.i32.const(layout.size)], binaryen.i32)),
-            mod.i32.store(0, 0, ctx.localGet('__tmp'), mod.i32.const(1)),
+            mod.i32.store(0, 0, ctx.localGet('__tmp'), mod.i32.const(classId)),
             mod.call(ctorName, [ctx.localGet('__tmp'), ...argExprs], binaryen.none),
             ctx.localGet('__tmp'),
           ], binaryen.i32);
         }
+        const classId = layout.classId ?? 1;
         return mod.block(null, [
           ctx.localSet('__tmp', mod.call('__alloc', [mod.i32.const(layout.size)], binaryen.i32)),
-          mod.i32.store(0, 0, ctx.localGet('__tmp'), mod.i32.const(1)),
+          mod.i32.store(0, 0, ctx.localGet('__tmp'), mod.i32.const(classId)),
           ctx.localGet('__tmp'),
         ], binaryen.i32);
       }
@@ -572,15 +624,58 @@ export function genExpr(node, filename, ctx) {
       ];
       for (let i = 0; i < count; i++) {
         const el = elements[i];
+        let valExpr = el ? genExpr(el, filename, ctx) : mod.i32.const(0);
+        // Arrays store i32; coerce float elements to i32 bits via reinterpret
+        if (el && binaryen.getExpressionType(valExpr) === binaryen.f64) {
+          valExpr = mod.i32.reinterpret(mod.f32.demote(valExpr));
+        } else if (el && binaryen.getExpressionType(valExpr) === binaryen.f32) {
+          valExpr = mod.i32.reinterpret(valExpr);
+        }
         stmts.push(mod.call('__jswat_array_set', [
           ctx.localGet('__tmp'),
           mod.i32.const(i),
-          el ? genExpr(el, filename, ctx) : mod.i32.const(0),
+          valExpr,
         ], binaryen.none));
       }
       stmts.push(mod.i32.store(4, 0, ctx.localGet('__tmp'), mod.i32.const(count)));
       stmts.push(ctx.localGet('__tmp'));
       return mod.block(null, stmts, binaryen.i32);
+    }
+
+    case 'TemplateLiteral': {
+      // Build a string by concatenating quasis and expressions
+      // quasis[0] expr[0] quasis[1] expr[1] ... quasis[n]
+      const quasis = node.quasis ?? [];
+      const exprs  = node.expressions ?? [];
+      // Start with the first quasi (static string)
+      const firstCooked = quasis[0]?.value?.cooked ?? '';
+      const firstAddr = ctx._strings?.get(firstCooked);
+      let result = firstAddr !== undefined
+        ? mod.i32.const(firstAddr)
+        : mod.i32.const(ctx._strings?.get('') ?? 8); // empty string fallback
+
+      for (let i = 0; i < exprs.length; i++) {
+        const exprRef = genExpr(exprs[i], filename, ctx);
+        const exprType = exprs[i]._type;
+        // Coerce non-string expression to str
+        let strExpr;
+        if (exprType?.kind === 'str' || exprType?.name === 'str') {
+          strExpr = exprRef;
+        } else {
+          // Integer → string conversion
+          strExpr = mod.call('__jswat_string_from_i32', [exprRef], binaryen.i32);
+        }
+        result = mod.call('__jswat_str_concat', [result, strExpr], binaryen.i32);
+        // Append the next quasi
+        const nextCooked = quasis[i + 1]?.value?.cooked ?? '';
+        if (nextCooked.length > 0) {
+          const nextAddr = ctx._strings?.get(nextCooked);
+          if (nextAddr !== undefined) {
+            result = mod.call('__jswat_str_concat', [result, mod.i32.const(nextAddr)], binaryen.i32);
+          }
+        }
+      }
+      return result;
     }
 
     default:

@@ -58,6 +58,17 @@ export function buildStringTable(ast) {
         offset += total;
       }
     }
+    // Also collect template literal quasi (static) strings
+    if (node.type === 'TemplateElement') {
+      const cooked = node.value?.cooked ?? '';
+      if (!strings.has(cooked)) {
+        const bytes = encoder.encode(cooked);
+        const len = bytes.length;
+        const total = 8 + len;
+        strings.set(cooked, { offset, bytes, len });
+        offset += total;
+      }
+    }
     for (const key of Object.keys(node)) {
       const child = node[key];
       if (Array.isArray(child)) {

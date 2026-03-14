@@ -148,9 +148,7 @@ describe('validator — banned constructs', () => {
     rejects(`function f(a = 0, b) { return a + b; }`, 'default');
   });
 
-  it('rejects bracket notation (computed MemberExpression)', () => {
-    rejects(`function f(obj = 0, key = 0) { return obj[key]; }`, 'bracket');
-  });
+  // Bracket notation is now allowed (for array access); codegen/typecheck enforce valid use.
 
   // ── Allowed constructs ─────────────────────────────────────────────────────
 

@@ -227,9 +227,75 @@ describe('section 21 examples (Phase 2+)', () => {
     // Spot-check: 15 is FizzBuzz, 3 is Fizz, 5 is Buzz
     assert.ok(!output.includes('15'),      '15 should be FizzBuzz, not a number');
   });
-  it.skip('21-fibonacci.js   — requires classes, Symbol traits, for-of');
-  it.skip('21-stack.js       — requires classes, private fields, arrays');
-  it.skip('21-result.js      — requires classes, inheritance, switch narrowing');
+  it('21-fibonacci.js — FibIterator class, IteratorResult built-in, for-of', async () => {
+    let output = '';
+    const source = await readFile(new URL('../examples/21-fibonacci.js', import.meta.url), 'utf8');
+    const { wasm } = await compileSource(source, '21-fibonacci.js');
+    const importObject = {
+      wasi_snapshot_preview1: {
+        fd_write(_fd, iovs_ptr, iovs_len, nwritten_ptr) {
+          const mem = new Uint8Array(instance.exports.memory.buffer);
+          const view = new DataView(instance.exports.memory.buffer);
+          for (let i = 0; i < iovs_len; i++) {
+            const base = iovs_ptr + i * 8;
+            const ptr  = view.getUint32(base, true);
+            const len  = view.getUint32(base + 4, true);
+            output += new TextDecoder().decode(mem.slice(ptr, ptr + len));
+          }
+          view.setUint32(nwritten_ptr, 1, true);
+          return 0;
+        },
+        fd_read: () => 0,
+        proc_exit: () => {},
+      },
+    };
+    const { instance } = await WebAssembly.instantiate(wasm, importObject);
+    if (instance.exports.__start) instance.exports.__start();
+    const nums = output.trim().split('\n').map(Number);
+    assert.deepEqual(nums, [0, 1, 1, 2, 3, 5, 8, 13, 21, 34], `Fibonacci sequence: ${output}`);
+  });
+  it('21-stack.js — Stack class, private fields, arrays (push/pop/bracket access)', async () => {
+    const source = await readFile(new URL('../examples/21-stack.js', import.meta.url), 'utf8');
+    const { wasm } = await compileSource(source, '21-stack.js');
+    const importObject = {
+      wasi_snapshot_preview1: {
+        fd_write: () => 0, fd_read: () => 0, proc_exit: () => {},
+      },
+    };
+    const { instance } = await WebAssembly.instantiate(wasm, importObject);
+    // Just verify it runs without throwing
+    instance.exports.__start();
+  });
+  it('21-result.js — Result/Ok/Err classes, inheritance, switch type narrowing, template literals', async () => {
+    let output = '';
+    const source = await readFile(new URL('../examples/21-result.js', import.meta.url), 'utf8');
+    const { wasm } = await compileSource(source, '21-result.js');
+    let instance;
+    const importObject = {
+      wasi_snapshot_preview1: {
+        fd_write(fd, iovs_ptr, iovs_len, nwritten_ptr) {
+          const mem = new Uint8Array(instance.exports.memory.buffer);
+          const view = new DataView(instance.exports.memory.buffer);
+          for (let i = 0; i < iovs_len; i++) {
+            const base = iovs_ptr + i * 8;
+            const ptr = view.getUint32(base, true);
+            const len = view.getUint32(base + 4, true);
+            output += new TextDecoder().decode(mem.slice(ptr, ptr + len));
+          }
+          view.setUint32(nwritten_ptr, 1, true);
+          return 0;
+        },
+        fd_read: () => 0,
+        proc_exit: () => {},
+      },
+    };
+    const result = await WebAssembly.instantiate(wasm, importObject);
+    instance = result.instance;
+    instance.exports.__start();
+    const lines = output.trim().split('\n');
+    assert.equal(lines[0], 'Result: 5',           `Expected 'Result: 5', got: ${lines[0]}`);
+    assert.equal(lines[1], 'Error: division by zero', `Expected 'Error: division by zero', got: ${lines[1]}`);
+  });
   it.skip('21-pixel-buffer.js — requires classes, manual memory');
   it.skip('21-wasm-compute.js — requires std/math, std/random, ptr');
   it('21-game-loop.js — classes, static fields/methods/getters, inheritance, std/math', async () => {

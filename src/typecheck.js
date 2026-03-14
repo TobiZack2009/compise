@@ -123,6 +123,33 @@ export function inferTypes(ast, filename = '<input>') {
   const scope = new ScopeChain();
   scope.push(); // global scope
 
+  // Inject built-in classes (always available, never user-defined).
+  {
+    const irType = {
+      kind: 'class', name: 'IteratorResult', nullable: true, abstract: false,
+      wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32,
+    };
+    const irCtorSig = {
+      params: [{ name: 'value', type: TYPES.isize }, { name: 'done', type: TYPES.bool }],
+      returnType: TYPES.void,
+    };
+    // Synthetic param nodes so NewExpression default-arg filling works
+    const irCtorNode = {
+      params: [
+        { type: 'AssignmentPattern', left: { name: 'value' }, right: { type: 'Literal', value: 0, raw: '0' } },
+        { type: 'AssignmentPattern', left: { name: 'done'  }, right: { type: 'Literal', value: false, raw: 'false' } },
+      ],
+    };
+    classes.set('IteratorResult', {
+      name: 'IteratorResult', type: irType,
+      fields: new Map([['value', TYPES.isize], ['done', TYPES.bool]]),
+      methods: new Map(), constructor: { node: irCtorNode, signature: irCtorSig, _builtin: true },
+      staticFields: new Map(), staticMethods: new Map(), staticGetters: new Map(),
+      superClassName: null,
+    });
+    TYPES.IteratorResult = irType;
+  }
+
   // Register class names early.
   for (const stmt of ast.body) {
     if (stmt.type === 'ClassDeclaration' && stmt.id?.name) {
@@ -299,6 +326,23 @@ function inferStatement(stmt, scope, signatures, classes, filename, ctx) {
       for (const s of stmt.body) inferStatement(s, scope, signatures, classes, filename, ctx);
       scope.pop();
       break;
+
+    case 'SwitchStatement': {
+      const discType = inferExpr(stmt.discriminant, scope, signatures, classes, filename, ctx);
+      const discName = stmt.discriminant?.name;
+      for (const c of stmt.cases) {
+        // Class type-narrowing: temporarily narrow discriminant type for case body
+        const caseTestName = c.test?.name;
+        const narrowedType = (discType?.kind === 'class' && caseTestName && classes.has(caseTestName))
+          ? classes.get(caseTestName).type : null;
+        if (narrowedType && discName) scope.define(discName, narrowedType);
+        scope.push();
+        for (const s of c.consequent) inferStatement(s, scope, signatures, classes, filename, ctx);
+        scope.pop();
+        if (discName && discType) scope.define(discName, discType); // restore
+      }
+      break;
+    }
 
     default:
       break;
@@ -651,6 +695,22 @@ function collectReturnTypes(node, out, scope, signatures, classes, filename, ctx
       break;
     }
 
+    case 'SwitchStatement': {
+      const discType = inferExpr(node.discriminant, scope, signatures, classes, filename, ctx);
+      const discName = node.discriminant?.name;
+      for (const c of node.cases) {
+        const caseTestName = c.test?.name;
+        const narrowedType = (discType?.kind === 'class' && caseTestName && classes.has(caseTestName))
+          ? classes.get(caseTestName).type : null;
+        if (narrowedType && discName) scope.define(discName, narrowedType);
+        scope.push();
+        for (const s of c.consequent) collectReturnTypes(s, out, scope, signatures, classes, filename, ctx);
+        scope.pop();
+        if (discName && discType) scope.define(discName, discType);
+      }
+      break;
+    }
+
     default:
       break;
   }
@@ -681,6 +741,8 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
         t = TYPES.str;
       } else if (typeof node.value === 'number') {
         t = isFloatLiteral(node) ? defaultFloatType() : defaultIntegerType();
+      } else if (node.value === null) {
+        t = TYPES.isize; // null is a nullable pointer (0)
       } else {
         t = TYPES.void;
       }
@@ -756,6 +818,7 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           }
           if ((!t || t === TYPES.void) && objType?.kind === 'array' && methodName) {
             if (methodName === 'push') t = TYPES.usize;
+            else if (methodName === 'pop') t = TYPES.isize;
           }
           if ((!t || t === TYPES.void) && objType?.kind === 'iter' && methodName) {
             if (['map', 'filter', 'take', 'skip'].includes(methodName)) t = TYPES.iter;
@@ -906,6 +969,13 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           t = TYPES.void;
         }
       }
+      break;
+
+    case 'TemplateLiteral':
+      for (const expr of node.expressions ?? []) {
+        inferExpr(expr, scope, signatures, classes, filename, ctx);
+      }
+      t = TYPES.str;
       break;
 
     case 'ArrayExpression':
