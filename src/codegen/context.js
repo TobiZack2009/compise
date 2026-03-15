@@ -55,6 +55,8 @@ export class GenContext {
     this._localMap = new Map();
     /** @type {number[]} local var types (not counting params) */
     this._varTypes = [];
+    /** @type {Map<string, TypeInfo>} heap-allocated locals (class/array) for RC cleanup */
+    this._heapLocals = new Map();
   }
 
   /**

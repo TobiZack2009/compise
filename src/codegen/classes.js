@@ -17,7 +17,7 @@ export function buildClassLayouts(classes) {
   let nextClassId = 1;
   for (const classInfo of classes.values()) {
     const classId = nextClassId++;
-    let offset = 4; // 4-byte type-tag header (stores classId)
+    let offset = 12; // 12-byte header: rc_class(4) + vtable_ptr(4) + class_id(4)
     const fields = new Map();
     for (const [name, typeInfo] of classInfo.fields.entries()) {
       const resolved = resolveFieldType(typeInfo);

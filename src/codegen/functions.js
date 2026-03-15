@@ -7,7 +7,7 @@ import binaryen from 'binaryen';
 import { TYPES } from '../types.js';
 import { CodegenError, GenContext, toBinType } from './context.js';
 import { collectLocals } from './expressions.js';
-import { genStatement } from './statements.js';
+import { genStatement, genHeapCleanup } from './statements.js';
 
 /**
  * Detect array usage in the AST.
@@ -132,13 +132,18 @@ export function genFunction(node, mod, signatures, classes, layouts, imports, st
   if (!sig) throw new CodegenError(`No signature for function '${name}' (${filename})`);
 
   const params    = sig.params.map(p => ({ name: p.name, type: p.type }));
-  const localVars = collectLocals(node.body, sig.params);
+  const { locals: localVars, heapLocals } = collectLocals(node.body, sig.params);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
   ctx._strings = stringTable.map;
+  ctx._heapLocals = heapLocals;
   ctx.setLocals(params, localVars);
 
   const bodyStmts = node.body.body.map(stmt => genStatement(stmt, sig.returnType, ctx, filename));
+  // End-of-body cleanup for void functions (non-void always have explicit returns)
+  if (heapLocals.size > 0 && (!sig.returnType || sig.returnType.wasmType === '')) {
+    bodyStmts.push(...genHeapCleanup(ctx, null));
+  }
   const bodyExpr  = bodyStmts.length === 0 ? mod.nop()
                   : bodyStmts.length === 1 ? bodyStmts[0]
                   : mod.block(null, bodyStmts, binaryen.none);
@@ -170,13 +175,18 @@ export function genFunction(node, mod, signatures, classes, layouts, imports, st
 export function genMethod(classInfo, methodName, fnNode, sig, mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames) {
   const name   = `${classInfo.name}_${methodName}`;
   const params = [{ name: 'this', type: classInfo.type }, ...sig.params.map(p => ({ name: p.name, type: p.type }))];
-  const localVars = collectLocals(fnNode.body, params);
+  const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
   ctx._strings = stringTable.map;
+  ctx._heapLocals = heapLocals;
   ctx.setLocals(params, localVars);
 
   const bodyStmts = fnNode.body.body.map(stmt => genStatement(stmt, sig.returnType, ctx, filename));
+  // End-of-body cleanup for void methods (non-void always have explicit returns)
+  if (heapLocals.size > 0 && (!sig.returnType || sig.returnType.wasmType === '')) {
+    bodyStmts.push(...genHeapCleanup(ctx, null));
+  }
   const bodyExpr  = bodyStmts.length === 0 ? mod.nop()
                   : bodyStmts.length === 1 ? bodyStmts[0]
                   : mod.block(null, bodyStmts, binaryen.none);
@@ -205,14 +215,17 @@ export function genMethod(classInfo, methodName, fnNode, sig, mod, classes, layo
 export function genConstructor(classInfo, fnNode, sig, mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames) {
   const name   = `${classInfo.name}__ctor`;
   const params = [{ name: 'this', type: classInfo.type }, ...sig.params.map(p => ({ name: p.name, type: p.type }))];
-  const localVars = collectLocals(fnNode.body, params);
+  const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
   ctx._strings = stringTable.map;
   ctx._currentClassInfo = classInfo;
+  ctx._heapLocals = heapLocals;
   ctx.setLocals(params, localVars);
 
   const bodyStmts = fnNode.body.body.map(stmt => genStatement(stmt, TYPES.void, ctx, filename));
+  // Constructors are always void — add end-of-body heap cleanup
+  if (heapLocals.size > 0) bodyStmts.push(...genHeapCleanup(ctx, null));
   const bodyExpr  = bodyStmts.length === 0 ? mod.nop()
                   : bodyStmts.length === 1 ? bodyStmts[0]
                   : mod.block(null, bodyStmts, binaryen.none);
@@ -230,14 +243,18 @@ export function genStaticMethod(classInfo, methodName, fnNode, sig, mod, classes
   const suffix = isGetter ? `__sg_${methodName}` : `__sm_${methodName}`;
   const name = `${classInfo.name}${suffix}`;
   const params = sig.params.map(p => ({ name: p.name, type: p.type }));
-  const localVars = collectLocals(fnNode.body, params);
+  const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
   ctx._strings = stringTable.map;
   ctx._currentClassInfo = classInfo;
+  ctx._heapLocals = heapLocals;
   ctx.setLocals(params, localVars);
 
   const bodyStmts = fnNode.body.body.map(stmt => genStatement(stmt, sig.returnType, ctx, filename));
+  if (heapLocals.size > 0 && (!sig.returnType || sig.returnType.wasmType === '')) {
+    bodyStmts.push(...genHeapCleanup(ctx, null));
+  }
   const bodyExpr  = bodyStmts.length === 0 ? mod.nop()
                   : bodyStmts.length === 1 ? bodyStmts[0]
                   : mod.block(null, bodyStmts, binaryen.none);

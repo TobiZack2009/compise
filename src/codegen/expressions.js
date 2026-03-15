@@ -80,8 +80,37 @@ export function collectLocals(body, params) {
     locals.push({ name: '__tmp',     type: TYPES.isize });
     locals.push({ name: '__tmp_f64', type: TYPES.f64 });
   }
-  return locals;
+
+  // Collect heap-typed locals (class/array) for RC management.
+  // Only non-param locals can be owned by the function.
+  const heapLocals = new Map();
+  for (const { name, type } of locals) {
+    if (type?.kind === 'class' || type?.kind === 'array') {
+      heapLocals.set(name, type);
+    }
+  }
+
+  // Add __result local for the result-save pattern used at ReturnStatement cleanup.
+  if (heapLocals.size > 0 && !seen.has('__result')) {
+    seen.add('__result');
+    locals.push({ name: '__result', type: TYPES.isize });
+  }
+
+  return { locals, heapLocals };
 }
+
+// ── RC header helpers ─────────────────────────────────────────────────────────
+
+const RC_SIZE_CLASSES = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
+
+/** Returns size-class index (0-9) for the given allocation size, or 10 for large. */
+function sizeClassIdx(size) {
+  for (let i = 0; i < RC_SIZE_CLASSES.length; i++) if (size <= RC_SIZE_CLASSES[i]) return i;
+  return 10;
+}
+
+/** Compute initial rc_class word: bits[31:28]=sizeClassIdx, bits[27:0]=1 (initial rc). */
+function computeRcClassInit(size) { return (sizeClassIdx(size) << 28) | 1; }
 
 // ── Expression code generation ───────────────────────────────────────────────
 
@@ -643,17 +672,23 @@ export function genExpr(node, filename, ctx) {
             return p.type === 'AssignmentPattern' ? genExpr(p.right, filename, ctx) : mod.i32.const(0);
           });
           const classId = layout.classId ?? 1;
+          const rcInit = computeRcClassInit(layout.size);
           return mod.block(null, [
             ctx.localSet('__tmp', mod.call('__alloc', [mod.i32.const(layout.size)], binaryen.i32)),
-            mod.i32.store(0, 0, ctx.localGet('__tmp'), mod.i32.const(classId)),
+            mod.i32.store(0, 0, ctx.localGet('__tmp'), mod.i32.const(rcInit)),   // rc_class: size-class + rc=1
+            mod.i32.store(4, 0, ctx.localGet('__tmp'), mod.i32.const(0)),         // vtable_ptr = 0
+            mod.i32.store(8, 0, ctx.localGet('__tmp'), mod.i32.const(classId)),   // class_id
             mod.call(ctorName, [ctx.localGet('__tmp'), ...argExprs], binaryen.none),
             ctx.localGet('__tmp'),
           ], binaryen.i32);
         }
         const classId = layout.classId ?? 1;
+        const rcInit = computeRcClassInit(layout.size);
         return mod.block(null, [
           ctx.localSet('__tmp', mod.call('__alloc', [mod.i32.const(layout.size)], binaryen.i32)),
-          mod.i32.store(0, 0, ctx.localGet('__tmp'), mod.i32.const(classId)),
+          mod.i32.store(0, 0, ctx.localGet('__tmp'), mod.i32.const(rcInit)),   // rc_class: size-class + rc=1
+          mod.i32.store(4, 0, ctx.localGet('__tmp'), mod.i32.const(0)),         // vtable_ptr = 0
+          mod.i32.store(8, 0, ctx.localGet('__tmp'), mod.i32.const(classId)),   // class_id
           ctx.localGet('__tmp'),
         ], binaryen.i32);
       }

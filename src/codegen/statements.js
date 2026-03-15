@@ -5,8 +5,29 @@
 import binaryen from 'binaryen';
 import { TYPES } from '../types.js';
 import { CodegenError } from './context.js';
-import { genLoad } from './types.js';
+import { genLoad, isHeapType } from './types.js';
 import { genExpr, genExprStatement } from './expressions.js';
+
+// ── RC heap cleanup helper ─────────────────────────────────────────────────────
+
+/**
+ * Generate rc_dec + nullify for all heap locals except the optional skipLocal.
+ * Nullification prevents double-free when early returns also clean up heap locals.
+ *
+ * @param {import('./context.js').GenContext} ctx
+ * @param {string|null} skipLocal  local name to skip (the one being returned, if any)
+ * @returns {number[]} array of ExpressionRef (void statements)
+ */
+export function genHeapCleanup(ctx, skipLocal) {
+  const mod = ctx.mod;
+  const stmts = [];
+  for (const [name] of ctx._heapLocals) {
+    if (name === skipLocal) continue;
+    stmts.push(mod.call('__jswat_rc_dec', [ctx.localGet(name)], binaryen.none));
+    stmts.push(ctx.localSet(name, mod.i32.const(0)));
+  }
+  return stmts;
+}
 
 // ── Statement code generation ─────────────────────────────────────────────────
 
@@ -52,16 +73,46 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
   const mod = ctx.mod;
 
   switch (stmt.type) {
-    case 'ReturnStatement':
-      return stmt.argument
-        ? mod.return(genExpr(stmt.argument, filename, ctx))
-        : mod.return();
+    case 'ReturnStatement': {
+      const heapLocals = ctx._heapLocals;
+      if (!heapLocals || heapLocals.size === 0) {
+        return stmt.argument
+          ? mod.return(genExpr(stmt.argument, filename, ctx))
+          : mod.return();
+      }
+      // Determine if we're returning a heap local (to skip its rc_dec).
+      const skipLocal = (stmt.argument?.type === 'Identifier' && heapLocals.has(stmt.argument.name))
+        ? stmt.argument.name
+        : null;
+      const cleanups = genHeapCleanup(ctx, skipLocal);
+      if (cleanups.length === 0) {
+        return stmt.argument
+          ? mod.return(genExpr(stmt.argument, filename, ctx))
+          : mod.return();
+      }
+      // Pattern: save return value → cleanup → return saved value
+      const retStmts = [];
+      if (stmt.argument) {
+        retStmts.push(ctx.localSet('__result', genExpr(stmt.argument, filename, ctx)));
+      }
+      retStmts.push(...cleanups);
+      retStmts.push(stmt.argument ? mod.return(ctx.localGet('__result')) : mod.return());
+      return mod.block(null, retStmts, binaryen.none);
+    }
 
     case 'VariableDeclaration': {
       const stmts = [];
       for (const decl of stmt.declarations) {
-        if (decl.init)
+        if (decl.init) {
           stmts.push(ctx.localSet(decl.id.name, genExpr(decl.init, filename, ctx)));
+          // If copying an existing heap reference (not a NewExpression or CallExpression),
+          // rc_inc the new owner.
+          if (isHeapType(decl.init._type) &&
+              decl.init.type !== 'NewExpression' &&
+              decl.init.type !== 'CallExpression') {
+            stmts.push(mod.call('__jswat_rc_inc', [ctx.localGet(decl.id.name)], binaryen.none));
+          }
+        }
       }
       if (stmts.length === 0) return mod.nop();
       if (stmts.length === 1) return stmts[0];
@@ -324,7 +375,7 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
                      : bodyStmts.length === 1 ? bodyStmts[0]
                      : mod.block(null, bodyStmts, binaryen.none);
           const tagCheck = mod.i32.eq(
-            mod.i32.load(0, 0, genExpr(stmt.discriminant, filename, ctx)),
+            mod.i32.load(8, 0, genExpr(stmt.discriminant, filename, ctx)),
             mod.i32.const(caseLayout.classId)
           );
           chain = mod.if(tagCheck, body, chain);

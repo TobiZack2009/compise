@@ -12,7 +12,7 @@ import {
   buildStdStub, buildMemFunctions, buildArrayFunctions, buildStringFunctions,
   buildCollectionsFunctions, buildWasiImports, buildIoFunctions, buildFsFunctions,
   buildClockFunctions, buildRandomFunctions, buildMathFunctions, buildIterFunctions,
-  buildPoolFunctions, buildArenaFunctions,
+  buildPoolFunctions, buildArenaFunctions, buildRcFunctions, buildParseFunctions,
 } from './runtime.js';
 import { astHasArray, buildStringTable, genFunction, genMethod, genConstructor, genStaticMethod } from './functions.js';
 import { collectLocals } from './expressions.js';
@@ -164,6 +164,10 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   // ── Allocator ─────────────────────────────────────────────────────────────
   buildAllocator(mod);
 
+  // ── RC runtime (always present — any class instantiation uses it) ─────────
+  buildRcFunctions(mod);
+  buildParseFunctions(mod);
+
   // ── Runtime functions ─────────────────────────────────────────────────────
   if (hasIo)          buildIoFunctions(mod, ioBase);
   if (hasFs)          buildFsFunctions(mod, ioBase + 64);
@@ -272,8 +276,8 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   // ── Built-in class constructors (direct binaryen, no AST) ────────────────
   if (classes.has('IteratorResult')) {
     const irLayout = layouts.get('IteratorResult');
-    const valOff  = irLayout?.fields.get('value')?.offset ?? 4;
-    const doneOff = irLayout?.fields.get('done')?.offset  ?? 8;
+    const valOff  = irLayout?.fields.get('value')?.offset ?? 12;
+    const doneOff = irLayout?.fields.get('done')?.offset  ?? 16;
     mod.addFunction('IteratorResult__ctor',
       binaryen.createType([binaryen.i32, binaryen.i32, binaryen.i32]),
       binaryen.none, [],
@@ -317,10 +321,11 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
 
   if (topLevelStmts.length > 0) {
     const fakeBlock = { type: 'BlockStatement', body: topLevelStmts };
-    const locals    = collectLocals(fakeBlock, []);
+    const { locals, heapLocals: startHeapLocals } = collectLocals(fakeBlock, []);
 
     const startCtx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
     startCtx._strings = stringMap;
+    startCtx._heapLocals = startHeapLocals;
     startCtx.setLocals([], locals);
 
     const bodyStmts = topLevelStmts.map(stmt => genStatement(stmt, TYPES.void, startCtx, filename));

@@ -125,6 +125,14 @@ export function genBinOp(mod, op, typeInfo, left, right) {
  */
 export function genCast(mod, value, src, dst) {
   if (!src || src === dst) return value;
+  // str → integer/float: parse string content (must come before same-wasmType short-circuit)
+  if (src.name === 'str' && dst.isInteger) {
+    const parsed = mod.call('__jswat_parse_i32', [value], binaryen.i32);
+    return dst.wasmType === 'i64' ? mod.i64.extend_s(parsed) : parsed;
+  }
+  if (src.name === 'str' && dst.isFloat) {
+    return mod.call('__jswat_parse_f64', [value], binaryen.f64);
+  }
   // Same WASM type — may still need narrow-type masking
   if (src.wasmType === dst.wasmType) {
     if (dst.isInteger && dst.bits > 0 && dst.bits < 32) {
@@ -161,6 +169,15 @@ export function genCast(mod, value, src, dst) {
   if (src.wasmType === 'i32' && dst.wasmType === 'i64')
     return src.isSigned ? mod.i64.extend_s(value) : mod.i64.extend_u(value);
   return value;
+}
+
+/**
+ * Returns true if the type lives on the heap and needs RC management.
+ * @param {TypeInfo | undefined} type
+ * @returns {boolean}
+ */
+export function isHeapType(type) {
+  return type?.kind === 'class' || type?.kind === 'array';
 }
 
 /**
