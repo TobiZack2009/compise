@@ -8,6 +8,7 @@ import { parseSource } from './parser.js';
 import { validate }    from './validator.js';
 import { inferTypes }  from './typecheck.js';
 import { generateWat } from './codegen/index.js';
+import { ModuleResolver } from './resolver.js';
 
 /**
  * @typedef {{ wat: string, wasm: Uint8Array|null, warnings: string[] }} CompileResult
@@ -62,11 +63,11 @@ export async function wasmToWat(wasmBuffer) {
  * Compile js.wat source text directly (without reading from disk).
  * @param {string} source  js.wat source
  * @param {string} [filename='<input>']
- * @param {{ checkOnly?: boolean }} [opts]
+ * @param {{ checkOnly?: boolean, readFile?: ((path: string) => string) | null, stdRoot?: string | null }} [opts]
  * @returns {Promise<CompileResult>}
  */
 export async function compileSource(source, filename = '<input>', opts = {}) {
-  const { checkOnly = false } = opts;
+  const { checkOnly = false, readFile = null, stdRoot = null } = opts;
 
   // 1. Parse
   const ast = parseSource(source, filename);
@@ -74,15 +75,29 @@ export async function compileSource(source, filename = '<input>', opts = {}) {
   // 2. Validate
   const { warnings } = validate(ast, filename);
 
-  // 3. Type-check
-  const { ast: typedAst, signatures, classes, imports } = inferTypes(ast, filename);
+  // 3. Resolve transitive stdlib/user imports (when readFile+stdRoot are provided)
+  /** @type {Array<{ ast: object, filename: string }>} */
+  let stdModules = [];
+  if (readFile && stdRoot) {
+    const resolver = new ModuleResolver(stdRoot, readFile, parseSource);
+    const deps = resolver.collectDeps(ast, filename);
+    stdModules = deps.map(({ source: s, filename: f }) => ({
+      ast: parseSource(s, f),
+      filename: f,
+    }));
+  }
+
+  // 4. Type-check
+  const { ast: typedAst, signatures, classes, imports } =
+    inferTypes(ast, filename, { stdModules });
 
   if (checkOnly) {
     return { wat: '', wasm: null, warnings };
   }
 
-  // 4. Code generation + assemble (binaryen emits binary directly)
-  const { wat, binary: wasm } = generateWat(typedAst, signatures, classes, imports, filename);
+  // 5. Code generation + assemble (binaryen emits binary directly)
+  const { wat, binary: wasm } =
+    generateWat(typedAst, signatures, classes, imports, filename, { stdModules });
 
   return { wat, wasm, warnings };
 }

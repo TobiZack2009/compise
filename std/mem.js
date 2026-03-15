@@ -1,4 +1,6 @@
 import { memory_copy, memory_fill } from "std/wasm";
+import { Pool } from "std/alloc/pool";
+import { Arena } from "std/alloc/arena";
 
 //@external("__jswat_runtime", "__jswat_alloc")
 function __alloc(size = usize(0)) { return usize(0); }
@@ -28,6 +30,14 @@ export class alloc {
 
   static fill(dst = u8(0), value = u8(0), n = usize(0)) {
     memory_fill(usize(dst), i32(value), n);
+  }
+
+  static pool(stride = usize(0), cap = usize(0)) {
+    return new Pool(stride, cap);
+  }
+
+  static arena(size = usize(0)) {
+    return new Arena(size);
   }
 }
 

@@ -361,6 +361,19 @@ export function genExpr(node, filename, ctx) {
             return mod.call(std.stub, argExprs, retType);
           }
         }
+        // alloc.pool(Type, cap) — type-as-value: first arg is a class name → use stride
+        if (className === 'alloc' && methodName === 'pool' &&
+            node.arguments[0]?.type === 'Identifier') {
+          const typeName = node.arguments[0].name;
+          const layout = ctx._layouts?.get(typeName);
+          if (layout) {
+            const capExpr = node.arguments[1]
+              ? genExpr(node.arguments[1], filename, ctx)
+              : mod.i32.const(0);
+            return mod.call('__jswat_pool_new',
+              [mod.i32.const(layout.size), capExpr], binaryen.i32);
+          }
+        }
         // Static method call: ClassName.method(args) — no 'this'
         if (className) {
           const ci = ctx._classes?.get(className);
@@ -552,6 +565,12 @@ export function genExpr(node, filename, ctx) {
       return ctx.localGet('this');
 
     case 'MemberExpression': {
+      // ClassName.stride — compile-time size constant
+      if (!node.computed && node.object?.type === 'Identifier' &&
+          node.property?.name === 'stride') {
+        const layout = ctx._layouts?.get(node.object.name);
+        if (layout) return mod.i32.const(layout.size);
+      }
       const objType = node.object?._type;
       // ptr.addr → return the pointer value itself (i32 address)
       if (!node.computed && objType?.kind === 'ptr' && node.property?.name === 'addr') {

@@ -44,6 +44,10 @@ export function parseSource(source, filename = '<input>') {
   let ast;
   /** @type {Array<{ line: number, exportName: string }>} */
   const exportAnnotations = [];
+  /** @type {Array<{ line: number, module: string, name: string }>} */
+  const externalAnnotations = [];
+  /** @type {Array<{ line: number, symbol: string }>} */
+  const symbolAnnotations = [];
   try {
     ast = parse(source, {
       ecmaVersion: 2022,
@@ -51,35 +55,90 @@ export function parseSource(source, filename = '<input>') {
       locations: true,
       onComment(isBlock, text, _start, _end, startLoc) {
         if (isBlock) return;
-        const m = text.match(/^@export(?:\("([^"]+)"\))?/);
-        if (!m) return;
-        // m[1] is the custom name (or undefined for bare @export)
-        exportAnnotations.push({ line: startLoc?.line ?? 0, exportName: m[1] ?? null });
+        const line = startLoc?.line ?? 0;
+        const mExport = text.match(/^@export(?:\("([^"]+)"\))?/);
+        if (mExport) {
+          exportAnnotations.push({ line, exportName: mExport[1] ?? null });
+          return;
+        }
+        const mExternal = text.match(/^@external\("([^"]+)",\s*"([^"]+)"\)/);
+        if (mExternal) {
+          externalAnnotations.push({ line, module: mExternal[1], name: mExternal[2] });
+          return;
+        }
+        const mSymbol = text.match(/^@symbol\((.+)\)/);
+        if (mSymbol) {
+          symbolAnnotations.push({ line, symbol: mSymbol[1].trim() });
+        }
       },
     });
   } catch (/** @type {any} */ e) {
     throw new Error(`Parse error in ${filename}: ${e.message}`);
   }
 
-  // Attach export annotations to function declarations
-  if (exportAnnotations.length > 0) {
-    // Build a map from line number to export name
-    /** @type {Map<number, string|null>} */
-    const exportByLine = new Map();
-    for (const ann of exportAnnotations) exportByLine.set(ann.line, ann.exportName);
-
+  // Helper: attach annotation to nearest function declaration within 2 lines
+  /**
+   * @param {Map<number, any>} byLine
+   * @param {(node: object, value: any) => void} attach
+   */
+  function attachToFunctions(byLine, attach) {
     for (const node of ast.body) {
       if (node.type !== 'FunctionDeclaration') continue;
       const fnLine = node.loc?.start?.line ?? 0;
-      for (const [annLine, exportName] of exportByLine) {
-        // Allow @export on the same line or the line immediately before the function
+      for (const [annLine, value] of byLine) {
         if (annLine === fnLine || annLine === fnLine - 1) {
-          node._exportName = exportName ?? node.id?.name ?? null;
-          exportByLine.delete(annLine);
+          attach(node, value);
+          byLine.delete(annLine);
           break;
         }
       }
     }
+    // Also scan class method declarations
+    for (const node of ast.body) {
+      if (node.type !== 'ClassDeclaration') continue;
+      for (const el of node.body?.body ?? []) {
+        if (el.type !== 'MethodDefinition') continue;
+        const fnLine = el.loc?.start?.line ?? 0;
+        for (const [annLine, value] of byLine) {
+          if (annLine === fnLine || annLine === fnLine - 1) {
+            attach(el, value);
+            byLine.delete(annLine);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Attach export annotations to function declarations
+  if (exportAnnotations.length > 0) {
+    /** @type {Map<number, string|null>} */
+    const exportByLine = new Map();
+    for (const ann of exportAnnotations) exportByLine.set(ann.line, ann.exportName);
+    attachToFunctions(exportByLine, (node, exportName) => {
+      node._exportName = exportName ?? node.id?.name ?? null;
+    });
+  }
+
+  // Attach @external annotations to function declarations
+  if (externalAnnotations.length > 0) {
+    /** @type {Map<number, { module: string, name: string }>} */
+    const extByLine = new Map();
+    for (const ann of externalAnnotations) extByLine.set(ann.line, { module: ann.module, name: ann.name });
+    attachToFunctions(extByLine, (node, ext) => {
+      node._externalModule = ext.module;
+      node._externalName   = ext.name;
+    });
+  }
+
+  // Attach @symbol annotations to function/method declarations
+  if (symbolAnnotations.length > 0) {
+    /** @type {Map<number, string>} */
+    const symByLine = new Map();
+    for (const ann of symbolAnnotations) symByLine.set(ann.line, ann.symbol);
+    attachToFunctions(symByLine, (node, symbol) => {
+      node._symbolName = symbol;
+    });
   }
 
   const errors = [];

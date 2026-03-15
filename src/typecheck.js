@@ -111,9 +111,11 @@ function findCommonAncestor(a, b, classes) {
  *
  * @param {object} ast  acorn Program AST
  * @param {string} [filename='<input>']
- * @returns {{ ast: object, signatures: Map<string, FunctionSignature> }}
+ * @param {{ stdModules?: Array<{ ast: object, filename: string }> }} [opts]
+ * @returns {{ ast: object, signatures: Map<string, FunctionSignature>, classes: Map<string, ClassInfo>, imports: Map }}
  */
-export function inferTypes(ast, filename = '<input>') {
+export function inferTypes(ast, filename = '<input>', opts = {}) {
+  const { stdModules = [] } = opts;
   /** @type {Map<string, FunctionSignature>} */
   const signatures = new Map();
   /** @type {Map<string, ClassInfo>} */
@@ -150,33 +152,67 @@ export function inferTypes(ast, filename = '<input>') {
     TYPES.IteratorResult = irType;
   }
 
-  // Register class names early.
-  for (const stmt of ast.body) {
-    if (stmt.type === 'ClassDeclaration' && stmt.id?.name) {
-      const typeInfo = {
-        kind: 'class',
-        name: stmt.id.name,
-        nullable: true,
-        abstract: false,
-        wasmType: 'i32',
-        isInteger: false,
-        isFloat: false,
-        isSigned: false,
-        bits: 32,
-      };
-      classes.set(stmt.id.name, {
-        name: stmt.id.name,
-        type: typeInfo,
-        fields: new Map(),
-        methods: new Map(),
-        constructor: null,
-        staticFields: new Map(),
-        staticMethods: new Map(),
-        staticGetters: new Map(),
-        superClassName: stmt.superClass?.name ?? null,
-      });
+  // ── Process std modules (dep-first order, before user code) ─────────────────
+
+  // Helper: register a class name into the classes map if not already present.
+  function registerClassStub(stmt) {
+    if (stmt.type !== 'ClassDeclaration' || !stmt.id?.name) return;
+    if (classes.has(stmt.id.name)) return;
+    const typeInfo = {
+      kind: 'class', name: stmt.id.name, nullable: true, abstract: false,
+      wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32,
+    };
+    classes.set(stmt.id.name, {
+      name: stmt.id.name, type: typeInfo,
+      fields: new Map(), methods: new Map(), constructor: null,
+      staticFields: new Map(), staticMethods: new Map(), staticGetters: new Map(),
+      superClassName: stmt.superClass?.name ?? null,
+    });
+    TYPES[stmt.id.name] = typeInfo;
+  }
+
+  // Pass 1: register all std class names so cross-module references resolve
+  for (const { ast: stdAst } of stdModules) {
+    for (const stmt of stdAst.body) registerClassStub(stmt);
+  }
+
+  // Pass 2: collect std module imports + register std function stubs
+  const stdCtx = { currentClass: null, imports };
+  for (const { ast: stdAst } of stdModules) {
+    for (const stmt of stdAst.body) {
+      if (stmt.type === 'ImportDeclaration') {
+        const mod = stmt.source?.value;
+        for (const spec of stmt.specifiers || []) {
+          if (spec.type === 'ImportSpecifier') {
+            imports.set(spec.local.name, { kind: 'namespace', module: mod, name: spec.imported.name });
+          } else if (spec.type === 'ImportDefaultSpecifier') {
+            imports.set(spec.local.name, { kind: 'default', module: mod, name: spec.local.name });
+          }
+        }
+      }
+      if (stmt.type === 'FunctionDeclaration' && stmt.id?.name) {
+        signatures.set(stmt.id.name, { params: [], returnType: TYPES.unknown });
+      }
     }
   }
+
+  // Pass 3: run full inference on std module bodies
+  for (const { ast: stdAst, filename: stdFile } of stdModules) {
+    for (const stmt of stdAst.body) {
+      inferStatement(stmt, scope, signatures, classes, stdFile, stdCtx);
+    }
+    // Mark @external function signatures with external metadata
+    for (const stmt of stdAst.body) {
+      if (stmt.type === 'FunctionDeclaration' && stmt.id?.name && stmt._externalModule) {
+        const sig = signatures.get(stmt.id.name);
+        if (sig) sig.external = { module: stmt._externalModule, name: stmt._externalName };
+      }
+    }
+  }
+
+  // ── Register class names early (user code) ────────────────────────────────
+
+  for (const stmt of ast.body) registerClassStub(stmt);
 
   for (const stmt of ast.body) {
     if (stmt.type === 'ImportDeclaration') {
@@ -191,8 +227,8 @@ export function inferTypes(ast, filename = '<input>') {
     }
   }
 
-  // Inject synthetic std/range Range class so `new Range(a, b, c)` args get typechecked
-  if (Array.from(imports.values()).some(i => i.module === 'std/range')) {
+  // Inject synthetic std/range Range class (fallback when std/range.js not provided as stdModule)
+  if (!classes.has('Range') && Array.from(imports.values()).some(i => i.module === 'std/range')) {
     const rangeType = {
       kind: 'class', name: 'Range', nullable: true, abstract: false,
       wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32,
@@ -204,10 +240,11 @@ export function inferTypes(ast, filename = '<input>') {
       staticFields: new Map(), staticMethods: new Map(), staticGetters: new Map(),
       superClassName: null,
     });
+    TYPES['Range'] = rangeType;
   }
 
   for (const classInfo of classes.values()) {
-    TYPES[classInfo.name] = classInfo.type;
+    if (!TYPES[classInfo.name]) TYPES[classInfo.name] = classInfo.type;
   }
 
   // Register function names early with unknown return types for recursion.
@@ -965,6 +1002,12 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
 
     case 'MemberExpression':
       {
+        // ClassName.stride — compile-time size constant (usize)
+        if (!node.computed && node.object?.type === 'Identifier' &&
+            node.property?.name === 'stride' && classes.has(node.object.name)) {
+          t = TYPES.usize;
+          break;
+        }
         const objType = inferExpr(node.object, scope, signatures, classes, filename, ctx);
         if (node.computed && objType?.kind === 'array') {
           inferExpr(node.property, scope, signatures, classes, filename, ctx);

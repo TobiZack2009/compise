@@ -1,21 +1,19 @@
 # js.wat Language Specification
-### Version 1.2
+### Version 1.3
 
 > A statically-typed, JIT-friendly language with JavaScript syntax that compiles to WebAssembly.
 > No eval. No hidden classes. No surprises.
 
-**What's new in v1.2:**
-- `std/wasm` intrinsics replace all inline WASM — no `wasm { }` blocks, ever
-- `//@lowlevel` pragma removed — `std/wasm` Tier 2 freely importable by any code
-- Sentinel header model (`0xFFFFFFFF`) fully specified — GC/manual interop without `@unmanaged`
-- `alloc.*` returns `T?` directly for class instances (not `Ptr<T>`)
-- `alloc.bytes`, `alloc.realloc`, `alloc.copy`, `alloc.fill` added
-- Named block `{ key: val }` for all allocator construction forms
-- `std/mem` as dedicated module for `ptr`, `alloc`, `Arena`, `Pool`
-- `Math.reinterpret*` family documented
-- `Array.filled(n, elem)` builtin for null-initialised arrays
-- Full `runtime.wat` included (§22)
-- Full standard library source included (§23)
+**What's new in v1.3:**
+- §25 Errors — full CE/RT/RX taxonomy, WASM exception instructions, updated object header
+- §26 String ↔ Number conversions — backtick interpolation as the only number-to-string path, `.parse()` with radix, `Symbol.toStr` for class interpolation
+- §27 Modules — full resolution algorithm, `.wasm` direct imports, all import/export forms
+- §28 Implicit Prelude — Rust-style always-in-scope names, no import needed
+- §29 Tree-shaking — five levels, full pipeline, `--wasi` branch folding
+- Object header updated: 3-slot prefix (rc+class_bits, vtable_ptr, class_id)
+- Null dereference via `.` is UB — debug traps, release assumes never happens
+- `String.from` removed — use `` `${n}` `` instead
+- `.parse(s, radix?)` added to all integer types; `.parse(s)` for floats
 
 ## 1. Philosophy
 
@@ -257,11 +255,10 @@ s.at(0)           // str — single char
 
 Memory layout (data segment): `[ length:4 | hash:4 | bytes... ]`
 
-**`String` — heap-allocated mutable string (default export of std/string):**
+**`String` — heap-allocated mutable string (implicit prelude):**
 
 ```js
-import String from "std/string";
-
+// String is in the implicit prelude — no import needed
 let s = new String("hello");
 s.append(" world");  s.set(0, "H");
 s.asStr();           // str — zero-copy view
@@ -269,9 +266,9 @@ s.dataPtr();         // usize — address of raw byte buffer (past header)
 s.length;            // usize
 ```
 
-Memory layout: `[ refcount:4 | length:4 | capacity:4 | hash:4 | *buffer ]`
+Memory layout: `[ rc_class:4 | vtable_ptr:4 | class_id:4 | length:4 | capacity:4 | hash:4 | *buf:4 ]` — 28-byte header.
 
-**Template literals produce `String` — requires import. Only integers, floats, bool, and str can be interpolated.**
+**Template literals produce `String`. Interpolatable types: all integers, all floats, `bool`, `str`, `String`, and any class implementing `Symbol.toStr`.**
 
 ### 3.7 Nullability
 
@@ -353,9 +350,22 @@ Entity.stride      // usize — byte increment between elements in a flat array
 
 ### 3.9 Memory Layout
 
-**Compact layout (default):**
+**Object header — every heap object has a 12-byte prefix before its fields:**
 
-Fields sorted by descending size to minimise padding. Sort is stable within same size class:
+```
+Offset 0   [ rc_and_class : 4 ]   bits [31:28] = size-class index (0–10)
+                                   bits [27:0]  = refcount (0xFFFFFFF max)
+                                   0xFFFFFFFF   = manual sentinel (never GC-freed)
+Offset 4   [ vtable_ptr   : 4 ]   pointer to vtable, or 0 if no symbol methods
+Offset 8   [ class_id     : 4 ]   unique u32 per class, assigned by compiler
+Offset 12  [ fields...        ]   user-defined fields start here
+```
+
+`class_id` is used by `instanceof`, `switch` type narrowing, and `catch` dispatch. `vtable_ptr` points to the compiler-generated vtable for any class implementing symbol methods. Every heap object carries these 12 bytes — including arrays, `String`, and `Ptr` boxes.
+
+**Compact field layout (default):**
+
+User fields are sorted by descending size to minimise padding. Sort is stable within the same size class:
 
 ```
 Sort order: f64/i64/u64 (8) → f32/i32/u32/isize/usize/ptr (4) → i16/u16 (2) → i8/u8/bool (1)
@@ -374,21 +384,23 @@ class Entity {
 }
 ```
 
-Compact layout:
+Compact layout (header + fields):
 ```
-Offset  Field    Type    Size
-0       refcount —       4
-4       x        f64     8    ← 8-byte fields first
-12      y        f64     8
-20      id       isize   4    ← 4-byte fields
-24      health   i32     4
-28      flags    u16     2    ← 2-byte fields
-30      active   bool    1    ← 1-byte fields
-31      tag      u8      1
-32      (pad)    —       4    ← pad to multiple of largest alignment (8)
+Offset  Field       Type    Size
+0       rc_class    —       4    ← header
+4       vtable_ptr  —       4    ← header
+8       class_id    —       4    ← header
+12      x           f64     8    ← 8-byte fields first
+20      y           f64     8
+28      id          isize   4    ← 4-byte fields
+32      health      i32     4
+36      flags       u16     2    ← 2-byte fields
+38      active      bool    1    ← 1-byte fields
+39      tag         u8      1
+40      (pad)       —       4    ← pad to multiple of largest alignment (8)
 ```
 
-Total: 36 bytes.
+Total: 44 bytes. `Entity.byteSize = usize(44)`.
 
 **`//@ordered` — fields in constructor assignment order:**
 
@@ -403,28 +415,28 @@ class WireFormat {
 }
 ```
 
-Use for network protocols, binary formats, and FFI where host expects a specific field order. Makes pointer arithmetic on fields predictable.
+Use for network protocols, binary formats, and FFI where host expects a specific field order. `//@ordered` affects field layout only — the 12-byte header is always present and always at offset 0.
 
 **Inheritance layout:**
 
-Parent fields always form a prefix of child layout — enables safe pointer narrowing:
+Parent fields always form a prefix of child layout — enables safe pointer narrowing. The header is shared:
 
 ```
-Shape:   [ refcount:4 | color:4 ]
-Circle:  [ refcount:4 | color:4 | radius:8 ]
-         ↑ identical Shape prefix
+Shape:   [ header:12 | color:4 ]
+Circle:  [ header:12 | color:4 | radius:8 ]
+         ↑ identical prefix — a Circle* can be read as Shape*
 ```
 
 **Static fields:**
 
-Live in a separate region of linear memory — one allocation per class:
+Live in a separate region of linear memory — one allocation per class, no header:
 ```
 Static data region: [ IdGen.#next:4 | Config.MAX:4 | ... ]
 ```
 
 **Reference fields:**
 
-Class instances, arrays, `String`, and `Ptr` are stored as pointers (4 bytes on WASM32) in the struct layout.
+Class instances, arrays, `String`, and `Ptr` are stored as 4-byte pointers (WASM32) in struct field layout.
 
 ### 3.10 Tagged Unions
 
@@ -475,7 +487,7 @@ bytes.length;            // usize
 
 Array layout:
 ```
-Header: [ refcount:4 | length:4 | capacity:4 | *data ]
+Header: [ rc_class:4 | vtable_ptr:4 | class_id:4 | length:4 | capacity:4 | *data:4 ]
 Buffer: [ elem_0 | elem_1 | ... | (unused) ]
 ```
 
@@ -493,7 +505,7 @@ x.val += 1;          // ✅
 x.val++;             // ✅
 ```
 
-`Ptr` layout: `[ refcount:4 | value:N ]`
+`Ptr` layout: `[ rc_class:4 | vtable_ptr:4 | class_id:4 | value:N ]`
 
 **Pointer arithmetic:**
 
@@ -511,7 +523,7 @@ next.val.r = u8(128);
 const dist = ptr.diff(next, base);          // isize — one Pixel.stride
 ```
 
-GC objects must not directly store manually allocated objects — store the `Ptr` instead.
+Manually allocated objects carry the `0xFFFFFFFF` sentinel in their `rc_class` field. The GC's `rc_inc`/`rc_dec` skip them automatically — they can be stored directly in GC class fields and arrays with no special annotation.
 
 ### 3.14 Functions
 
@@ -611,7 +623,7 @@ function area(s = Shape) {
 }
 ```
 
-No fallthrough. No `break`. Exhaustiveness enforced.
+No fallthrough. No `break`. Exhaustiveness enforced at compile time for tagged unions. At runtime, narrowing is a single `i32.load offset=8` (read `class_id`) followed by `i32.eq` against the compiler-assigned id for each variant — zero overhead.
 
 ### 5.2 If
 
@@ -619,7 +631,15 @@ No fallthrough. No `break`. Exhaustiveness enforced.
 if (s instanceof Circle) { s.radius; s.color; }
 ```
 
-Combinable with `&&`. Elimination narrowing in `else` for two-variant unions. No exhaustiveness check.
+`instanceof` compiles to the same `class_id` check. Combinable with `&&`. Elimination narrowing in `else` for two-variant unions. No exhaustiveness check.
+
+### 5.3 Null checks
+
+```js
+if (p != null) { p.x; }    // p narrowed to non-null inside block
+p?.x;                       // safe — null propagates, no trap
+p.x;                        // fast — UB if p is null (see §25.2)
+```
 
 ---
 
@@ -634,13 +654,15 @@ Symbols define trait contracts via `//@symbol(SymbolName)` pragma.
 | `Symbol.iterator` | `for...of` support | class implementing `Symbol.next` |
 | `Symbol.next` | iterator step | `IteratorResult<T>` |
 | `Symbol.toPrimitive` | numeric conversion | numeric type |
-| `Symbol.toStr` | string conversion | `str` |
+| `Symbol.toStr` | string conversion for template literals | `str` |
 | `Symbol.compare` | ordering for sort | `isize` |
 | `Symbol.hash` | hash for Map/Set | `isize` |
 | `Symbol.equals` | equality for Map/Set | `bool` |
 | `Symbol.dispose` | cleanup on free | `void` |
 
 `Symbol.dispose` called automatically when refcount hits zero.
+
+`Symbol.toStr` is required for a class to be used inside template literal interpolation `${}`. If a class is interpolated without implementing `Symbol.toStr`, the compiler rejects it with `CE-T09`.
 
 **User-defined symbols:**
 
@@ -728,7 +750,42 @@ Standard JS: `if/else`, `for`, `while`, `do...while`, `switch`, `break/continue`
 
 **Ternary:** both branches must return same type. Null branch makes result nullable.
 
-**`throw`/`catch`:** class instances only. Multiple throws unify to common superclass.
+**`throw`/`catch`:** class instances only. Uses WASM exception instructions. Multiple `catch` clauses narrow by `class_id`. Multiple throws from the same function unify to their common superclass. `finally` always runs.
+
+```js
+try {
+  const n = i32.parse(input);
+  riskyOp(n);
+} catch (e = ParseError) {
+  console.log(`parse failed: ${e.message}`);
+} catch (e = IOError) {
+  console.log(`io failed: ${e.message}`);
+} finally {
+  cleanup();
+}
+```
+
+**Template literals:** `` `${}` `` accepts the following types directly:
+
+| Type | Output |
+|---|---|
+| All integer subtypes | Decimal, no leading zeros, `-` for negatives |
+| All float subtypes | Shortest round-trip decimal (Ryu) |
+| `bool` | `"true"` or `"false"` |
+| `str` | Direct — zero copy |
+| `String` | Copies content |
+| Any class with `Symbol.toStr` | Calls `toStr()`, result is `str` |
+
+Class instances without `Symbol.toStr` in `${}` are a compile error (`CE-T09`). There is no silent fallback to `[object Object]`.
+
+```js
+`value: ${n}`        // ✅ integer
+`pi: ${3.14}`        // ✅ float
+`flag: ${active}`    // ✅ bool → "true"/"false"
+`name: ${p.name}`    // ✅ str field
+`obj: ${p}`          // ✅ if Player implements Symbol.toStr
+`obj: ${p}`          // ❌ CE-T09: Player does not implement Symbol.toStr
+```
 
 ---
 
@@ -812,15 +869,16 @@ jswat compile src/main.js --emit-layout dist/layout.json
 ```json
 {
   "Entity": {
-    "byteSize": 36,
+    "byteSize": 44,
+    "headerSize": 12,
     "fields": {
-      "x":      { "offset": 4,  "type": "f64",  "wasmType": "f64"  },
-      "y":      { "offset": 12, "type": "f64",  "wasmType": "f64"  },
-      "id":     { "offset": 20, "type": "isize","wasmType": "i32"  },
-      "health": { "offset": 24, "type": "i32",  "wasmType": "i32"  },
-      "flags":  { "offset": 28, "type": "u16",  "wasmType": "i32"  },
-      "active": { "offset": 30, "type": "bool", "wasmType": "i32"  },
-      "tag":    { "offset": 31, "type": "u8",   "wasmType": "i32"  }
+      "x":      { "offset": 12, "type": "f64",   "wasmType": "f64"  },
+      "y":      { "offset": 20, "type": "f64",   "wasmType": "f64"  },
+      "id":     { "offset": 28, "type": "isize", "wasmType": "i32"  },
+      "health": { "offset": 32, "type": "i32",   "wasmType": "i32"  },
+      "flags":  { "offset": 36, "type": "u16",   "wasmType": "i32"  },
+      "active": { "offset": 38, "type": "bool",  "wasmType": "i32"  },
+      "tag":    { "offset": 39, "type": "u8",    "wasmType": "i32"  }
     }
   }
 }
@@ -884,36 +942,50 @@ Or via `jswat.json`:
 
 js.wat integrates `wasm-merge` from wabt to link pre-compiled WASM modules at compile time. Linked modules are merged into a single output binary — cross-module calls become internal calls, enabling inlining and dead code elimination across boundaries.
 
+**Two ways to link a WASM module:**
+
+| Method | When to use |
+|---|---|
+| `import { fn } from "./lib.wasm"` | Preferred — automatic, no manual flags |
+| `--link name=path.wasm` CLI flag | Explicit control, or when linking without importing |
+
 ### 13.1 Declaring linked module functions
 
-Functions from a linked WASM module are declared with `//@external` using the module name as the first argument. The declaration can live in any `.js` file, or in a dedicated `.extern.js` file:
+**Preferred — direct `.wasm` import (see §27.2):**
 
 ```js
-// Inline — anywhere in the codebase
+// Compiler reads export section, infers types, adds to link list automatically
+import { vec3Dot, vec3Cross } from "./mathlib.wasm";
+```
+
+**With sidecar for precise types:**
+
+```js
+// mathlib.extern.js sidecar provides refined js.wat types, validated against binary
+import { vec3Dot, vec3Cross } from "./mathlib.extern.js";
+// The .wasm binary is located automatically alongside the .extern.js file
+```
+
+**Legacy explicit declarations** — still valid for inline one-off calls:
+
+```js
 //@external("mathlib", "vec3_dot")
 function vec3Dot(a = ptr(0.0), b = ptr(0.0)) { return 0.0; }
-
-// Or in mathlib.extern.js — full library interface in one place
-//@external("mathlib", "vec3_dot")
-export function vec3Dot(a = ptr(0.0), b = ptr(0.0)) { return 0.0; }
-
-//@external("mathlib", "vec3_cross")
-export function vec3Cross(a = ptr(0.0), b = ptr(0.0), out = ptr(0.0)) { }
-
-//@external("mathlib", "mat4_multiply")
-export function mat4Multiply(a = ptr(0.0), b = ptr(0.0), out = ptr(0.0)) { }
 ```
 
 ### 13.2 Linking at compile time
 
+Direct `.wasm` imports are automatically added to the link list — no `--link` flag needed. For explicit control or for linking modules that are not imported by name:
+
 ```bash
-# Via CLI flags
+# Explicit link flags — still supported
 jswat compile src/main.js \
   --link mathlib=dist/mathlib.wasm \
   --link physics=dist/physics.wasm \
   -o dist/app.wasm
+```
 
-# Via jswat.json
+```json
 {
   "entry": "src/main.js",
   "output": "dist/app.wasm",
@@ -926,8 +998,9 @@ jswat compile src/main.js \
 
 The compiler:
 1. Compiles `src/main.js` to a temporary `.wasm`
-2. Invokes `wasm-merge --merge-memory` with all linked libraries
-3. Outputs the merged binary
+2. Collects all `.wasm` imports from the module graph and adds them to the link set
+3. Invokes `wasm-merge --merge-memory` with all linked libraries
+4. Outputs the merged binary
 
 `--merge-memory` is the default when linking — all modules share one linear memory space, making pointer passing across module boundaries safe and zero-cost.
 
@@ -1059,14 +1132,23 @@ const POINTER_SIZE = usize(4);   // WASM32 — always compile-time const
 
 ### 16.2 Reference Counting and Sentinel
 
-Every heap object begins with a 4-byte refcount header:
+Every heap object begins with a 12-byte header (see §3.9 and §25.2):
 
 ```
-GC object:     [ rc: N  | ... ]    N ≥ 1 while alive, 0 triggers dispose+free
-Manual object: [ rc: -1 | ... ]    sentinel 0xFFFFFFFF — never touched by GC
+Offset 0  rc_class    [ bits[31:28]=size-class | bits[27:0]=refcount ]
+Offset 4  vtable_ptr  [ pointer to vtable, or 0 ]
+Offset 8  class_id    [ unique u32 per class ]
 ```
 
-The compiler emits `__jswat_rc_inc` and `__jswat_rc_dec` at every reference assignment. Both functions check the sentinel and skip if set — no annotation or pragma needed. Manually allocated objects (via `alloc.*`) can be stored directly in GC class fields and arrays.
+The `rc_class` word drives GC behaviour:
+
+```
+rc_class = 0xFFFFFFFF   → manual sentinel — rc_inc/rc_dec skip entirely
+rc_class bits[27:0] = 0 → refcount hit zero → call dispose, then free
+rc_class bits[27:0] > 0 → object alive
+```
+
+The compiler emits `__jswat_rc_inc` and `__jswat_rc_dec` at every reference assignment. Both check the sentinel and skip if set — no annotation or pragma needed. Manually allocated objects can be stored directly in GC class fields and arrays.
 
 `Symbol.dispose` is called when an object's refcount hits zero, then the block is returned to the allocator.
 
@@ -1298,7 +1380,7 @@ Math.random()    // f64 — alias to global Random instance
 import String from "std/string";
 ```
 
-**Layout:** `[ rc:4 | vtable:4 | length:4 | capacity:4 | hash:4 | *buf:4 ]` — 24-byte header.
+**Layout:** `[ rc_class:4 | vtable_ptr:4 | class_id:4 | length:4 | capacity:4 | hash:4 | *buf:4 ]` — 28-byte header.
 
 **Methods:**
 `append` `set` `at` `slice` `indexOf` `includes` `startsWith` `endsWith`
@@ -1306,13 +1388,20 @@ import String from "std/string";
 `replace` `padStart` `padEnd` `repeat` `split`
 `asStr` (zero-copy str view) `dataPtr` (raw buffer address for host interop)
 
-**Symbols:** `Symbol.hash` (FNV-1a, cached), `Symbol.equals`, `Symbol.toStr`, `Symbol.dispose` (frees buffer)
+**Symbols:** `Symbol.hash` (FNV-1a, cached), `Symbol.equals`, `Symbol.toStr` (returns `asStr()`), `Symbol.dispose` (frees buffer)
+
+`String` implements `Symbol.toStr` — it is always interpolatable in template literals.
 
 **Static:**
 ```js
-String.from(n = Number)        // monomorphizes for all numeric types
-String.fromBool(b = false)
-String.fromCodePoint(cp = u32(0))
+String.fromCodePoint(cp = u32(0))   // single codepoint → String
+```
+
+`String.from` and `String.fromBool` are removed. Use template literals instead:
+```js
+`${n}`       // any Number → String
+`${b}`       // bool → "true" / "false"
+`${p}`       // class with Symbol.toStr → String
 ```
 
 ### 18.8 `std/random` — Random (default export)
@@ -1463,28 +1552,21 @@ UTF8.validate(s);        // bool
 UTF8.charCount(s);       // usize — Unicode codepoints
 ```
 
-### 18.18 `std/prelude` — Bundle
+### 18.18 `std/prelude` — Implicit (see §28)
 
-```js
-import "std/prelude";
-// Brings in: Math, String, Random, Range, StepRange, iter,
-//            Map, Set, Stack, Queue, Deque,
-//            AppError, ValueError, RangeError, IOError, ParseError, NotFoundError,
-//            console, stdout, stderr, stdin,
-//            FS, Clock, Process, Base64, UTF8
-```
+The prelude is not imported — its members are always in scope. See §28 for the full list. Explicitly importing anything from the prelude produces a compiler warning.
 
 ---
 
-## 19. `Array.filled` — Initialised Arrays
+### 18.15 `Array.filled` — Initialised Arrays
 
-The builtin `Array.filled` creates a null-initialised typed array of a given size. Required for `Map` and `Set` internals:
+The builtin `Array.filled` creates a typed array of a given size with all elements set to a provided value. Required for `Map` and `Set` internals:
 
 ```js
 Array.filled(n = usize(0), elem = 0)   // returns T[] of length n, all set to elem
 ```
 
-The `elem` argument anchors the element type — the same way array literals do. All slots are initialised to the value of `elem`:
+The `elem` argument anchors the element type — the same way array literals do:
 
 ```js
 const zeros = Array.filled(usize(100), i32(0));   // i32[100] all zeros
@@ -1496,7 +1578,7 @@ This is a compiler builtin — it lowers to `__jswat_alloc` + `memory.fill` for 
 
 ---
 
-## 20. Compiler Intrinsics Reference
+## 19. Compiler Intrinsics Reference
 
 The compiler provides the following `__`-prefixed intrinsics used by stdlib implementations. These are not user-visible — they are injected by the compiler at call sites in stdlib source:
 
@@ -1509,7 +1591,7 @@ The compiler provides the following `__`-prefixed intrinsics used by stdlib impl
 | `__is_whitespace` | `(buf: u8?, i: usize) → bool` | ASCII whitespace check |
 | `__str_case` | `(s: String, upper: bool) → String` | Case conversion |
 | `__u8_offset` | `(buf: u8?, offset: usize) → u8?` | Pointer arithmetic on u8? |
-| `__fmt_number` | `(n: Number) → str` | Number to str (monomorphized) |
+| `__fmt_number` | `(n: Number) → str` | Number to str (monomorphized) — used by template literals |
 | `__reinterpret_f64` | `(bits: i64) → f64` | f64.reinterpret_i64 |
 | `__wasi_available` | `i32` global | 1 if WASI probe succeeded |
 | `__stack_alloc` | `(n: usize) → usize` | Short-lived stack-frame allocation |
@@ -1520,10 +1602,9 @@ The compiler provides the following `__`-prefixed intrinsics used by stdlib impl
 | `__u32_load` | `(addr: usize) → u32` | Bare u32 load (for WASI arg parsing) |
 | `unreachable` | statement | Emits WASM `unreachable` instruction |
 
-
 ---
 
-## 19. What Is Banned
+## 20. What Is Banned
 
 | Feature | Reason |
 |---|---|
@@ -1535,11 +1616,13 @@ The compiler provides the following `__`-prefixed intrinsics used by stdlib impl
 | `delete obj.prop` | Breaks class sealing |
 | Object literals `{}` outside `new` | Use named construction blocks |
 | `Object.assign`, `Object.defineProperty` | Shape mutation |
-| Dynamic `import()` | Static imports only |
+| Dynamic `import()` | Static imports only — full graph resolved at compile time |
+| Side-effect imports `import "x"` | Prelude is implicit; no other side-effect imports |
+| Bare import specifiers `import x from "pkg"` | No package registry — use `"./path"` or `"std/*"` |
 | `Proxy`, `Reflect` | Runtime interception |
 | `Symbol` as dynamic key outside trait system | Dynamic property keys |
 | `typeof` as branch condition | Use `instanceof` |
-| Type annotations | No annotation syntax |
+| Type annotations | No annotation syntax — types inferred from defaults |
 | `JSON.parse` | Returns untyped object |
 | `this` outside class methods | No global this |
 | Nullable numeric types, `bool`, `str` | These are never nullable |
@@ -1553,15 +1636,14 @@ The compiler provides the following `__`-prefixed intrinsics used by stdlib impl
 | Comma operator, labeled `break`/`continue` | Banned |
 | `||=`/`&&=` on non-nullable types | Reference types only |
 | Switch fallthrough | Cases are sealed |
-| `Math.*` without import | Must import from std/math |
-| Manual allocation stored directly in GC object | Store Ptr instead |
 | Implicit numeric coercion | Explicit casts required |
 | `bool` in numeric expressions | Use ternary |
 | Instantiating `Number`, `Integer`, `Float` | Abstract — constraints only |
+| Class interpolation without `Symbol.toStr` | Implement `Symbol.toStr` returning `str` |
 
 ---
 
-## 20. Why js.wat Is Easy to JIT
+## 21. Why js.wat Is Easy to JIT
 
 | Property | Mechanism |
 |---|---|
@@ -1579,52 +1661,46 @@ The compiler provides the following `__`-prefixed intrinsics used by stdlib impl
 | Always-bound `this` | No runtime binding confusion |
 | Full numeric hierarchy | Every operation has a statically known width |
 | Fully anchored signatures | Every parameter has a default |
-| UB null fast path | `.` emits zero null checks |
+| UB null fast path | `.` emits zero null checks in release |
 | Manual memory escape hatch | `alloc` bypasses GC entirely |
 | Compile-time constants | `const` inlined — zero runtime cost |
 | Symbol traits at compile time | No runtime dispatch overhead |
 | Type propagation | Eliminates redundant casts in hot paths |
 | Whole-program linking | `wasm-merge` enables cross-module inlining |
+| O(1) type dispatch | `class_id` at fixed offset 8 — one load + compare |
+| Aggressive tree-shaking | Five-level DCE — zero bytes for unused stdlib |
+| WASM exception instructions | Zero-cost exceptions when no throw occurs |
 
 ---
 
-## 21. Sample Programs
+## 22. Sample Programs
 
-### 21.1 Hello World
+### 22.1 Hello World
 
 ```js
-import { console } from "std/io";
-
 console.log("Hello from js.wat!");
 ```
 
 ---
 
-### 21.2 FizzBuzz
+### 22.2 FizzBuzz
 
 ```js
-import { console } from "std/io";
-import String from "std/string";
-import { Range } from "std/range";
-
 for (const i of new Range(1, 101)) {
   const fizz = i % 3 === 0;
   const buzz = i % 5 === 0;
   if (fizz && buzz) console.log("FizzBuzz");
   else if (fizz)    console.log("Fizz");
   else if (buzz)    console.log("Buzz");
-  else              console.log(String.from(i));
+  else              console.log(`${i}`);
 }
 ```
 
 ---
 
-### 21.3 Fibonacci (iterator)
+### 22.3 Fibonacci (iterator)
 
 ```js
-import { console } from "std/io";
-import String from "std/string";
-
 class FibIterator {
   a; b;
   constructor(a = 0, b = 1) { this.a = a; this.b = b; }
@@ -1644,7 +1720,7 @@ class FibIterator {
 
 let count = 0;
 for (const n of new FibIterator) {
-  console.log(String.from(n));
+  console.log(`${n}`);
   if (++count >= 10) break;
 }
 // 0 1 1 2 3 5 8 13 21 34
@@ -1652,7 +1728,7 @@ for (const n of new FibIterator) {
 
 ---
 
-### 21.4 Generic Stack
+### 22.4 Generic Stack
 
 ```js
 class Stack {
@@ -1691,12 +1767,9 @@ floats.push(3.14); floats.push(2.71);
 
 ---
 
-### 21.5 Result Pattern
+### 22.5 Result Pattern
 
 ```js
-import { console } from "std/io";
-import String from "std/string";
-
 class Result { }
 class Ok extends Result {
   value;
@@ -1714,7 +1787,7 @@ function divide(a = 0, b = 0) {
 
 function printResult(r = Result) {
   switch (r) {
-    case Ok:  console.log(`Result: ${String.from(r.value)}`);
+    case Ok:  console.log(`Result: ${r.value}`);
     case Err: console.log(`Error: ${r.message}`);
   }
 }
@@ -1725,10 +1798,10 @@ printResult(divide(10, 0));   // Error: division by zero
 
 ---
 
-### 21.6 Pixel Buffer (manual memory)
+### 22.6 Pixel Buffer (manual memory)
 
 ```js
-import { Range } from "std/range";
+import { ptr, alloc } from "std/mem";
 
 class Pixel {
   r; g; b; a;
@@ -1771,12 +1844,10 @@ canvas.set(usize(100), usize(100), u8(255), u8(0), u8(0));
 
 ---
 
-### 21.7 WASM Computation Module (WASI-free)
+### 22.7 WASM Computation Module (WASI-free)
 
 ```js
-import Math from "std/math";
-import Random from "std/random";
-import { Range } from "std/range";
+import { ptr, alloc } from "std/mem";
 
 //@export("seed")
 function seed(s = 0) { Random.seed(s); }
@@ -1802,10 +1873,10 @@ function matrixFillRandom(mat = ptr(0.0), rows = usize(0), cols = usize(0)) {
 
 ---
 
-### 21.8 Linking a WASM Math Library
+### 22.8 Linking a WASM Math Library
 
 ```js
-// mathlib.extern.js — optional, documents full mathlib interface
+// mathlib.extern.js — optional sidecar with precise js.wat types
 //@external("mathlib", "vec3_dot")
 export function vec3Dot(a = ptr(0.0), b = ptr(0.0)) { return 0.0; }
 
@@ -1814,8 +1885,16 @@ export function vec3Cross(a = ptr(0.0), b = ptr(0.0), out = ptr(0.0)) { }
 ```
 
 ```js
-// main.js — import from the .extern.js or declare inline
+// main.js — Option A: import directly from .wasm (conservative type inference)
+import { vec3Dot, vec3Cross } from "./mathlib.wasm";
+
+// main.js — Option B: import from sidecar (precise js.wat types, validated against binary)
 import { vec3Dot, vec3Cross } from "./mathlib.extern.js";
+```
+
+```js
+// Either way, usage is identical — no --link flag needed, compiler handles it
+import { ptr, alloc } from "std/mem";
 
 class Vec3 {
   x; y; z;
@@ -1827,18 +1906,11 @@ const b = alloc.create(Vec3, 0.0, 1.0, 0.0);
 const dot = vec3Dot(a, b);   // f64 — calls into linked mathlib.wasm
 ```
 
-```bash
-jswat compile src/main.js --link mathlib=dist/mathlib.wasm -o dist/app.wasm
-```
-
 ---
 
-### 21.9 Game Loop
+### 22.9 Game Loop
 
 ```js
-import Math from "std/math";
-import { console } from "std/io";
-
 class Vec2 {
   x; y;
   constructor(x = 0.0, y = 0.0) { this.x = x; this.y = y; }
@@ -1904,18 +1976,149 @@ class Game {
 
 ---
 
-*End of js.wat Spec v1.1*
+### 22.10 Parsing and Error Handling
+
+```js
+import { FS } from "std/fs";
+
+// Symbol.toStr on a custom error type
+class ConfigError extends AppError {
+  field;
+  constructor(message = "", field = "") {
+    super(message);
+    this.field = field;
+  }
+
+  //@symbol(Symbol.toStr)
+  toStr() { return `ConfigError(${this.field}): ${this.message}`; }
+}
+
+// Parse a key=value config line — throws on malformed input
+function parseLine(line = "") {
+  const eq = line.indexOf("=");
+  if (eq < 0) throw new ConfigError("missing '='", line);
+
+  const key   = line.slice(usize(0), usize(eq)).trim();
+  const value = line.slice(usize(eq) + usize(1), line.length).trim();
+
+  if (key.length == usize(0)) throw new ConfigError("empty key", line);
+  return new KeyValue(key.asStr(), value.asStr());
+}
+
+class KeyValue {
+  key; value;
+  constructor(key = "", value = "") { this.key = key; this.value = value; }
+}
+
+// Read and parse a config file
+function loadConfig(path = "") {
+  const content = FS.read(path);
+  if (content == null) throw new IOError(`cannot read: ${path}`);
+
+  const lines = content.split("\n");
+  const result = new Map(Symbol.hash, new String(""));
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.length == usize(0)) continue;          // skip blank lines
+    if (trimmed.startsWith("#"))    continue;          // skip comments
+
+    try {
+      const kv = parseLine(trimmed);
+      result.set(kv.key, kv.value);
+    } catch (e = ConfigError) {
+      console.log(`warning: skipping line — ${e}`);   // ${e} calls Symbol.toStr
+    }
+  }
+
+  return result;
+}
+
+// Read a numeric value from config — throws ParseError if not a valid integer
+function getInt(config = Map, key = "", default_ = 0) {
+  const val = config.get(new String(key));
+  if (val == null) return default_;
+  return i32.parse(val.asStr());
+}
+
+try {
+  const config  = loadConfig("app.config");
+  const port    = getInt(config, "port", 8080);
+  const workers = getInt(config, "workers", 4);
+  console.log(`Starting on port ${port} with ${workers} workers`);
+} catch (e = IOError) {
+  console.log(`fatal: ${e}`);
+} catch (e = ParseError) {
+  console.log(`bad config value: ${e}`);
+}
+```
 
 ---
 
-## 22. `runtime.wat` — Full Runtime Source
+### 22.11 WASM Direct Import
+
+```js
+// Import directly from a pre-compiled .wasm binary — no extern.js needed
+import { encrypt, decrypt, keyExpand } from "./crypto.wasm";
+
+// Types inferred conservatively from binary (i32→isize, f64→f64)
+// For precise types, place a crypto.extern.js sidecar alongside crypto.wasm
+
+class Message {
+  #data;   // u8?
+  #len;    // usize
+
+  constructor(text = "") {
+    this.#len  = text.length;
+    this.#data = alloc.bytes(this.#len);
+    alloc.copy(this.#data, text, this.#len);
+  }
+
+  //@symbol(Symbol.dispose)
+  dispose() { alloc.free(this.#data); }
+
+  //@symbol(Symbol.toStr)
+  toStr() { return __str_from_ptr(this.#data, this.#len); }
+
+  get ptr()    { return usize(this.#data); }
+  get length() { return this.#len; }
+}
+
+function roundTrip(plaintext = "", key = "") {
+  import { ptr, alloc } from "std/mem";
+
+  const msg     = new Message(plaintext);
+  const keyMsg  = new Message(key);
+  const keyCtx  = alloc.bytes(usize(240));   // AES-256 key schedule
+
+  keyExpand(keyMsg.ptr, usize(key.length), usize(keyCtx));
+
+  const cipherBuf = alloc.bytes(msg.length);
+  encrypt(msg.ptr, msg.length, usize(keyCtx), usize(cipherBuf));
+
+  const plainBuf = alloc.bytes(msg.length);
+  decrypt(usize(cipherBuf), msg.length, usize(keyCtx), usize(plainBuf));
+
+  const result = new String(__str_from_ptr(plainBuf, msg.length));
+
+  alloc.free(keyCtx);
+  alloc.free(cipherBuf);
+  alloc.free(plainBuf);
+
+  return result;
+}
+```
+
+---
+
+## 23. `runtime.wat` — Full Runtime Source
 
 The runtime is compiled separately from a fixed WAT file and merged with user code at link time. It implements Layers 1 and 2 (allocator + GC). Layer 0 is WASM primitives used directly.
 
 ```wat
 ;; ============================================================
 ;; js.wat runtime — runtime.wat
-;; Version 1.2
+;; Version 1.3
 ;;
 ;; Compiled separately into runtime.wasm and merged with user
 ;; code via wasm-merge. Binaryen inlines hot paths after merge.
@@ -2398,8 +2601,8 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
   ;; Arena allocator
   ;;
   ;; Arena header (GC-allocated, rc managed):
-  ;;   [ rc:4 | vtable:4 | buf_ptr:4 | used:4 | capacity:4 | growable:1 | pad:3 ]
-  ;; Total: 20 bytes header.
+  ;;   [ rc_class:4 | vtable_ptr:4 | class_id:4 | buf_ptr:4 | used:4 | capacity:4 | growable:4 ]
+  ;; Total: 28 bytes header.
   ;;
   ;; buf_ptr points to a raw byte buffer.
   ;; Growable arenas double their buffer on overflow.
@@ -2409,26 +2612,31 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
     (local $arena i32)
     (local $buf   i32)
 
-    ;; Allocate arena header — 20 bytes, class 2 (32-byte slot)
-    (local.set $arena (call $jswat_alloc (i32.const 20)))
-    ;; rc = 1 (GC-managed)
+    ;; Allocate arena header — 28 bytes, class 2 (32-byte slot)
+    (local.set $arena (call $jswat_alloc (i32.const 28)))
+    ;; rc = 1 (GC-managed), class_id written by compiler at link time
     (i32.store (local.get $arena) (i32.const 1))
 
     ;; If size = 0, start with 4096
     (if (i32.eqz (local.get $size))
       (then
         (local.set $size (i32.const 4096))
-        ;; Mark growable: write 1 at offset 16
-        (i32.store8 (i32.add (local.get $arena) (i32.const 16)) (i32.const 1))
+        ;; Mark growable: write 1 at offset 24 (growable field)
+        (i32.store (i32.add (local.get $arena) (i32.const 24)) (i32.const 1))
       )
     )
 
     ;; Allocate buffer
     (local.set $buf (call $jswat_alloc (local.get $size)))
     (i32.store8 (local.get $buf) (i32.const -1))  ;; sentinel for buf block
-    (i32.store (i32.add (local.get $arena) (i32.const 8))  (local.get $buf))
-    (i32.store (i32.add (local.get $arena) (i32.const 12)) (i32.const 0))     ;; used=0
-    (i32.store (i32.add (local.get $arena) (i32.const 16)) (local.get $size)) ;; capacity
+    ;; Header layout (past 12-byte object header):
+    ;;   offset 12 = buf_ptr
+    ;;   offset 16 = used
+    ;;   offset 20 = capacity
+    ;;   offset 24 = growable (i32, 0 or 1)
+    (i32.store (i32.add (local.get $arena) (i32.const 12)) (local.get $buf))
+    (i32.store (i32.add (local.get $arena) (i32.const 16)) (i32.const 0))     ;; used=0
+    (i32.store (i32.add (local.get $arena) (i32.const 20)) (local.get $size)) ;; capacity
 
     (local.get $arena)
   )
@@ -2448,15 +2656,15 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
         (i32.add (local.get $size) (i32.const 7))
         (i32.const -8)))
 
-    (local.set $used (i32.load (i32.add (local.get $arena) (i32.const 12))))
-    (local.set $cap  (i32.load (i32.add (local.get $arena) (i32.const 16))))
-    (local.set $buf  (i32.load (i32.add (local.get $arena) (i32.const 8))))
+    (local.set $used (i32.load (i32.add (local.get $arena) (i32.const 16))))
+    (local.set $cap  (i32.load (i32.add (local.get $arena) (i32.const 20))))
+    (local.set $buf  (i32.load (i32.add (local.get $arena) (i32.const 12))))
 
     (if (i32.gt_u (i32.add (local.get $used) (local.get $size)) (local.get $cap))
       (then
         ;; Check if growable
         (if (i32.eqz
-              (i32.load8_u (i32.add (local.get $arena) (i32.const 20))))
+              (i32.load (i32.add (local.get $arena) (i32.const 24))))
           (then unreachable)  ;; fixed arena overflow — trap
         )
 
@@ -2474,8 +2682,8 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
         )
 
         (local.set $new_buf (call $jswat_realloc (local.get $buf) (local.get $new_cap)))
-        (i32.store (i32.add (local.get $arena) (i32.const 8))  (local.get $new_buf))
-        (i32.store (i32.add (local.get $arena) (i32.const 16)) (local.get $new_cap))
+        (i32.store (i32.add (local.get $arena) (i32.const 12)) (local.get $new_buf))
+        (i32.store (i32.add (local.get $arena) (i32.const 20)) (local.get $new_cap))
         (local.set $buf (local.get $new_buf))
         (local.set $cap (local.get $new_cap))
       )
@@ -2488,7 +2696,7 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
     (i32.store (local.get $result) (i32.const -1))
 
     (i32.store
-      (i32.add (local.get $arena) (i32.const 12))
+      (i32.add (local.get $arena) (i32.const 16))
       (i32.add (local.get $used) (local.get $size)))
 
     (local.get $result)
@@ -2496,12 +2704,12 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
 
   (func $jswat_arena_reset (export "__jswat_arena_reset") (param $arena i32)
     ;; Reset used counter — no individual frees
-    (i32.store (i32.add (local.get $arena) (i32.const 12)) (i32.const 0))
+    (i32.store (i32.add (local.get $arena) (i32.const 16)) (i32.const 0))
   )
 
   (func $jswat_arena_free (export "__jswat_arena_free") (param $arena i32)
     (local $buf i32)
-    (local.set $buf (i32.load (i32.add (local.get $arena) (i32.const 8))))
+    (local.set $buf (i32.load (i32.add (local.get $arena) (i32.const 12))))
     (call $jswat_free (local.get $buf))
     (call $jswat_free (local.get $arena))
   )
@@ -2510,8 +2718,8 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
   ;; Pool allocator
   ;;
   ;; Pool<T> header (GC-allocated):
-  ;;   [ rc:4 | vtable:4 | buf_ptr:4 | stride:4 | capacity:4 | free_head:4 ]
-  ;; Total: 24 bytes.
+  ;;   [ rc_class:4 | vtable_ptr:4 | class_id:4 | buf_ptr:4 | stride:4 | capacity:4 | free_head:4 ]
+  ;; Total: 28 bytes.
   ;;
   ;; buf_ptr points to capacity * stride raw bytes.
   ;; Free slots: their first 4 bytes are a next-free-index (1-based).
@@ -2527,7 +2735,7 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
     (local $i    i32)
     (local $slot i32)
 
-    (local.set $pool (call $jswat_alloc (i32.const 24)))
+    (local.set $pool (call $jswat_alloc (i32.const 28)))
     (i32.store (local.get $pool) (i32.const 1))  ;; rc = 1
 
     ;; If capacity = 0, use 16
@@ -2536,10 +2744,15 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
 
     (local.set $buf (call $jswat_alloc (i32.mul (local.get $stride) (local.get $cap))))
 
-    (i32.store (i32.add (local.get $pool) (i32.const 8))  (local.get $buf))
-    (i32.store (i32.add (local.get $pool) (i32.const 12)) (local.get $stride))
-    (i32.store (i32.add (local.get $pool) (i32.const 16)) (local.get $cap))
-    (i32.store (i32.add (local.get $pool) (i32.const 20)) (i32.const 1)) ;; free_head = slot 1
+    ;; Pool header layout (past 12-byte object header):
+    ;;   offset 12 = buf_ptr
+    ;;   offset 16 = stride
+    ;;   offset 20 = capacity
+    ;;   offset 24 = free_head (1-based index, 0 = full)
+    (i32.store (i32.add (local.get $pool) (i32.const 12)) (local.get $buf))
+    (i32.store (i32.add (local.get $pool) (i32.const 16)) (local.get $stride))
+    (i32.store (i32.add (local.get $pool) (i32.const 20)) (local.get $cap))
+    (i32.store (i32.add (local.get $pool) (i32.const 24)) (i32.const 1)) ;; free_head = slot 1
 
     ;; Chain free list: slot[i].next = i+2 for i in 1..cap-1; last.next = 0
     (local.set $i (i32.const 0))
@@ -2577,14 +2790,14 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
     (local $slot      i32)
     (local $next      i32)
 
-    (local.set $free_head (i32.load (i32.add (local.get $pool) (i32.const 20))))
+    (local.set $free_head (i32.load (i32.add (local.get $pool) (i32.const 24))))
 
     (if (i32.eqz (local.get $free_head))
       (then unreachable)  ;; pool exhausted — trap
     )
 
-    (local.set $buf    (i32.load (i32.add (local.get $pool) (i32.const 8))))
-    (local.set $stride (i32.load (i32.add (local.get $pool) (i32.const 12))))
+    (local.set $buf    (i32.load (i32.add (local.get $pool) (i32.const 12))))
+    (local.set $stride (i32.load (i32.add (local.get $pool) (i32.const 16))))
 
     ;; Convert 1-based index to offset
     (local.set $slot
@@ -2597,7 +2810,7 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
     (local.set $next (i32.load (i32.add (local.get $slot) (i32.const 4))))
 
     ;; Update free head
-    (i32.store (i32.add (local.get $pool) (i32.const 20)) (local.get $next))
+    (i32.store (i32.add (local.get $pool) (i32.const 24)) (local.get $next))
 
     ;; Zero the slot and write sentinel
     (memory.fill (local.get $slot) (i32.const 0) (local.get $stride))
@@ -2614,9 +2827,9 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
     (local $idx       i32)
     (local $free_head i32)
 
-    (local.set $buf    (i32.load (i32.add (local.get $pool) (i32.const 8))))
-    (local.set $stride (i32.load (i32.add (local.get $pool) (i32.const 12))))
-    (local.set $cap    (i32.load (i32.add (local.get $pool) (i32.const 16))))
+    (local.set $buf    (i32.load (i32.add (local.get $pool) (i32.const 12))))
+    (local.set $stride (i32.load (i32.add (local.get $pool) (i32.const 16))))
+    (local.set $cap    (i32.load (i32.add (local.get $pool) (i32.const 20))))
 
     ;; Convert pointer to 1-based index
     (local.set $idx
@@ -2626,12 +2839,12 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
           (local.get $stride))
         (i32.const 1)))
 
-    (local.set $free_head (i32.load (i32.add (local.get $pool) (i32.const 20))))
+    (local.set $free_head (i32.load (i32.add (local.get $pool) (i32.const 24))))
 
     ;; Push onto free list
     (i32.store (i32.add (local.get $slot) (i32.const 4)) (local.get $free_head))
     (i32.store (local.get $slot) (i32.const -1))  ;; keep sentinel
-    (i32.store (i32.add (local.get $pool) (i32.const 20)) (local.get $idx))
+    (i32.store (i32.add (local.get $pool) (i32.const 24)) (local.get $idx))
   )
 
   ;; -------------------------------------------------------
@@ -2657,14 +2870,14 @@ The runtime is compiled separately from a fixed WAT file and merged with user co
 
 ---
 
-## 23. Standard Library Source
+## 24. Standard Library Source
 
 All stdlib modules are written in js.wat itself. The compiler is bootstrapped — it can compile its own stdlib. Each module is listed below with full source.
 
-### 23.1 `std/wasm`
+### 24.1 `std/wasm`
 ```js
 // std/wasm — WASM instruction intrinsics
-// Version 1.2
+// Version 1.3
 //
 // Every export compiles to exactly ONE WASM instruction.
 // Zero runtime overhead — the compiler inlines the instruction
@@ -2757,10 +2970,10 @@ export function memory_copy(dst = usize(0), src = usize(0), n = usize(0)) { }
 export function memory_fill(dst = usize(0), val = u8(0), n = usize(0))    { }
 ```
 
-### 23.2 `std/math`
+### 24.2 `std/math`
 ```js
 // std/math — Math default export
-// Version 1.2
+// Version 1.3
 //
 // All transcendentals implemented in pure js.wat using
 // minimax polynomial approximations and bit manipulation
@@ -3102,14 +3315,14 @@ class Math {
 export default Math;
 ```
 
-### 23.3 `std/string`
+### 24.3 `std/string`
 ```js
 // std/string — heap-allocated mutable string
-// Version 1.2
+// Version 1.3
 //
 // Memory layout:
-//   [ refcount:4 | vtable:4 | length:4 | capacity:4 | hash:4 | *buffer:4 ]
-//   Total header: 24 bytes. Buffer is a raw alloc.bytes block.
+//   [ rc_class:4 | vtable_ptr:4 | class_id:4 | length:4 | capacity:4 | hash:4 | *buffer:4 ]
+//   Total header: 28 bytes. Buffer is a raw alloc.bytes block.
 //
 // hash is lazily computed on first access and cached.
 // hash == 0 means "not computed" — the empty string uses hash=1 as sentinel.
@@ -3318,25 +3531,21 @@ class String {
   // ============================================================
   // Static constructors
   // ============================================================
-  static from(n = Number) {
-    // Compiler monomorphizes for each numeric type.
-    // The __fmt_* intrinsics write into a stack buffer and return str.
-    return new String(__fmt_number(n));
-  }
 
-  static fromBool(b = false) {
-    return new String(b ? "true" : "false");
-  }
-
+  // fromCodePoint — single Unicode codepoint to String
   static fromCodePoint(cp = u32(0)) {
     return new String(__char_from_codepoint(cp));  // compiler intrinsic
   }
+
+  // Note: String.from and String.fromBool are removed.
+  // Use template literals for all number/bool → String conversions:
+  //   `${n}`   `${b}`   `${obj}`  (obj must implement Symbol.toStr)
 }
 
 export default String;
 ```
 
-### 23.4 `std/mem`
+### 24.4 `std/mem`
 ```js
 // std/mem — Manual memory management.
 // Import what you need:
@@ -3503,10 +3712,10 @@ export const alloc = {
 };
 ```
 
-### 23.5 `std/range`
+### 24.5 `std/range`
 ```js
 // std/range — Range and StepRange
-// Version 1.2
+// Version 1.3
 
 // Range — half-open integer interval [start, end)
 // Implements Symbol.iterator and Symbol.next.
@@ -3594,10 +3803,10 @@ export class StepRange {
 }
 ```
 
-### 23.6 `std/iter`
+### 24.6 `std/iter`
 ```js
 // std/iter — iterator combinators
-// Version 1.2
+// Version 1.3
 //
 // iter(iterable) returns an Iter<T> wrapper with chainable methods.
 // All combinators are lazy — no allocation until collect/forEach.
@@ -3798,10 +4007,10 @@ export function iter(src = Symbol.iterator) {
 }
 ```
 
-### 23.7 `std/collections`
+### 24.7 `std/collections`
 ```js
 // std/collections — Map, Set, Queue, Stack, Deque
-// Version 1.2
+// Version 1.3
 //
 // Map and Set use open-addressing hash tables with
 // Robin Hood probing. Keys must implement Symbol.hash
@@ -4207,10 +4416,10 @@ export class Deque {
 export { Map, Set };
 ```
 
-### 23.8 `std/random`
+### 24.8 `std/random`
 ```js
 // std/random — xoshiro256** PRNG
-// Version 1.2
+// Version 1.3
 //
 // WASI path: wasi_snapshot_preview1.random_get for seeding.
 // WASI-free: falls back to seed(0) — deterministic.
@@ -4306,10 +4515,10 @@ class Random {
 export default Random;
 ```
 
-### 23.9 `std/error`
+### 24.9 `std/error`
 ```js
 // std/error — Error hierarchy
-// Version 1.2
+// Version 1.3
 
 export class AppError {
   message;
@@ -4341,10 +4550,10 @@ export class NotFoundError extends AppError {
 }
 ```
 
-### 23.10 `std/io`
+### 24.10 `std/io`
 ```js
 // std/io — console, stdout, stderr, stdin
-// Version 1.2
+// Version 1.3
 //
 // All functions degrade gracefully in WASI-free environments
 // (silent no-op for writes, null for reads).
@@ -4437,10 +4646,10 @@ export const stdin  = new Stdin;
 export const console = new ConsoleClass;
 ```
 
-### 23.11 `std/fs`
+### 24.11 `std/fs`
 ```js
 // std/fs — filesystem access via WASI
-// Version 1.2
+// Version 1.3
 //
 // Degrades gracefully: all functions return null/false in WASI-free.
 
@@ -4561,10 +4770,10 @@ class FS {
 export { FS };
 ```
 
-### 23.12 `std/clock`
+### 24.12 `std/clock`
 ```js
 // std/clock — wall clock and monotonic clock via WASI
-// Version 1.2
+// Version 1.3
 
 //@external("wasi_snapshot_preview1", "clock_time_get")
 function wasi_clock_time_get(id=i32(0), precision=i64(0), time=usize(0)) { return i32(0); }
@@ -4607,10 +4816,10 @@ class Clock {
 export { Clock };
 ```
 
-### 23.13 `std/process`
+### 24.13 `std/process`
 ```js
 // std/process — process exit, args, env
-// Version 1.2
+// Version 1.3
 
 import String from "std/string";
 
@@ -4702,10 +4911,10 @@ class Process {
 export { Process };
 ```
 
-### 23.14 `std/encoding`
+### 24.14 `std/encoding`
 ```js
 // std/encoding — Base64 and UTF-8 utilities
-// Version 1.2
+// Version 1.3
 
 import String from "std/string";
 import { i32_load8_u, i32_store8 } from "std/wasm";
@@ -4846,10 +5055,10 @@ class UTF8 {
 export { Base64, UTF8 };
 ```
 
-### 23.15 `std/prelude`
+### 24.15 `std/prelude`
 ```js
 // std/prelude — convenient bundle import
-// Version 1.2
+// Version 1.3
 //
 // import "std/prelude"; brings in all commonly used stdlib items.
 // Avoid in library code — prefer explicit imports.
@@ -4881,4 +5090,664 @@ export {
 
 ---
 
-*End of js.wat Spec v1.2*
+## 25. Errors
+
+### 25.1 Philosophy
+
+js.wat errors fall into three populations with distinct costs and recovery semantics:
+
+```
+Compile errors (CE)     — programmer mistakes caught statically. Zero runtime cost.
+Runtime traps (RT)      — unrecoverable. Emit WASM unreachable. Module survives in
+                          browser contexts (JS catches WebAssembly.RuntimeError).
+Runtime exceptions (RX) — recoverable. WASM exception instructions. throw/catch/finally.
+```
+
+**Null dereference is UB.** The safe path is `?.` and `??`. If you use `.` on a nullable type you are asserting non-null — the compiler trusts you. In debug builds the compiler inserts a null check and traps with a message. In release builds the optimizer assumes `.` is never null, enabling zero-overhead field access. This is an intentional design decision — the cost of safety is always explicit in js.wat.
+
+### 25.2 Updated Object Header
+
+Every heap object carries a 12-byte header before its user fields:
+
+```
+Offset 0   rc_class    i32   bits[31:28]=size-class index, bits[27:0]=refcount
+                              0xFFFFFFFF = manual sentinel (never GC-freed)
+Offset 4   vtable_ptr  i32   pointer to vtable, 0 if no symbol methods
+Offset 8   class_id    i32   unique u32 per class, compiler-assigned at build time
+```
+
+`class_id` is used by `instanceof`, `switch` type narrowing, and `catch` dispatch — all reduce to a single `i32.load offset=8` + `i32.eq`.
+
+### 25.3 Compile-Time Errors (CE)
+
+Error format: `file:line:col  CE-XXX  message\n  hint`
+
+**Type errors:**
+
+| Code | Condition | Example |
+|---|---|---|
+| CE-T01 | Type mismatch on assignment | `let x = u8(0); x = 300;` |
+| CE-T02 | Implicit coercion — mixed types without explicit cast | `u8(0) + i32(0)` |
+| CE-T03 | Out-of-range literal for target type | `u8(256)`, `u8(-1)` |
+| CE-T04 | Nullable used where non-null required | `let x: Player = maybePlayer` |
+| CE-T05 | `bool` used in numeric expression | `i32(true)` |
+| CE-T06 | Abstract type instantiated | `new Integer`, `new Number` |
+| CE-T07 | Wrong return type | `function f() { return 1; }` when return is `str` |
+| CE-T08 | Missing return on reachable path | non-void function with exit path that falls off |
+| CE-T09 | Class interpolated without `Symbol.toStr` | `` `${p}` `` where Player has no `Symbol.toStr` |
+
+**Variable/binding errors:**
+
+| Code | Condition | Example |
+|---|---|---|
+| CE-V01 | `const` reassignment | `const x = 1; x = 2;` |
+| CE-V02 | Undeclared variable | `x + 1` with no `let x` |
+| CE-V03 | Use before declaration | `x; let x = 0;` |
+| CE-V04 | Duplicate declaration in same scope | `let x = 0; let x = 1;` |
+
+**Class errors:**
+
+| Code | Condition | Example |
+|---|---|---|
+| CE-C01 | Unknown key in named construction block | `new Vec2({ z: 1.0 })` |
+| CE-C02 | Named block key type mismatch | `new Vec2({ x: i32(0) })` when x is f64 |
+| CE-C03 | Private field accessed outside class | `p.#score` from outside Player |
+| CE-C04 | Static-only class instantiated | `new IdGen` when all members are static |
+| CE-C05 | `this` outside class method | `this.x` at top level |
+| CE-C06 | `this` accessed before `super()` in child | `this.x = 1; super();` |
+| CE-C07 | Setter without getter | `set x(v) { }` with no `get x()` |
+| CE-C08 | Duplicate field or method name | two `score` fields |
+| CE-C09 | Child class defines no-arg constructor that doesn't call `super()` | |
+
+**Function errors:**
+
+| Code | Condition | Example |
+|---|---|---|
+| CE-F01 | Parameter without default | `function f(x) { }` |
+| CE-F02 | Wrong argument count | `add(1, 2, 3)` when `add` takes 2 |
+| CE-F03 | Argument type mismatch | `add(1.0, 2)` when both params are `isize` |
+| CE-F04 | `arguments` object used | `arguments[0]` |
+| CE-F05 | Arrow function used as constructor | `new (() => {})()` |
+
+**Control flow errors:**
+
+| Code | Condition | Example |
+|---|---|---|
+| CE-CF01 | `for...in` used | `for (const k in obj)` |
+| CE-CF02 | Switch fallthrough | implicit fall between cases |
+| CE-CF03 | Non-exhaustive switch on tagged union | missing variant in `switch` |
+| CE-CF04 | `break`/`continue` outside loop | `break;` at top level |
+| CE-CF05 | Unreachable code after `return`/`throw`/`unreachable` | code after `return` |
+| CE-CF06 | Ternary branches return different types | `true ? 1 : "a"` |
+
+**Access errors:**
+
+| Code | Condition | Example |
+|---|---|---|
+| CE-A01 | Bracket notation on non-array | `obj["key"]` |
+| CE-A02 | `eval` / `Function()` / `new Function` | `eval("1+1")` |
+| CE-A03 | Prototype access | `Player.prototype`, `obj.__proto__` |
+| CE-A04 | Nested destructuring | `const { a: { b } } = obj` |
+| CE-A05 | Destructuring of nullable without null check | `const { x } = maybePoint` |
+| CE-A06 | `delete` on object property | `delete obj.x` |
+| CE-A07 | `?.` on non-nullable type | `n?.toString()` where n is `i32` |
+
+**Module errors:**
+
+| Code | Condition | Example |
+|---|---|---|
+| CE-M01 | Import of non-existent export | `import { Foo } from "./bar"` — no Foo |
+| CE-M02 | Circular import | `a → b → a` |
+| CE-M03 | Bare specifier | `import x from "lodash"` |
+| CE-M04 | `.wasm` import arity mismatch | declared 2 params, binary has 3 |
+| CE-M05 | `.wasm` import type mismatch | declared `f64` return, binary returns `i32` |
+| CE-M06 | Explicit import of prelude member | `import String from "std/string"` — warning |
+
+**Pragma errors:**
+
+| Code | Condition | Example |
+|---|---|---|
+| CE-P01 | Unknown pragma | `//@unknown` |
+| CE-P02 | `//@symbol` on non-method | `//@symbol(Symbol.hash)` on a class |
+| CE-P03 | `//@export` on non-function non-static | `//@export` on a field |
+| CE-P04 | `//@ordered` on non-class | `//@ordered` on a function |
+| CE-P05 | `//@external` missing module or name | `//@external("env")` — missing name |
+
+### 25.4 Runtime Traps (RT)
+
+Hard traps — emit `unreachable`. The current call terminates. In browser contexts the WASM module instance survives; in WASI contexts the process exits. No recovery, no cleanup, no `Symbol.dispose` calls for in-flight stack frames.
+
+| Code | Condition | Debug behaviour | Release behaviour |
+|---|---|---|---|
+| RT-01 | OOM — `memory.grow` returns -1 | trap with message | trap |
+| RT-02 | Pool exhausted — `pool.alloc()` on full pool | trap with message | trap |
+| RT-03 | Fixed arena overflow | trap with message | trap |
+| RT-04 | Call stack overflow | host-defined | host-defined |
+| RT-05 | Programmer `unreachable` statement | trap with message | trap |
+| RT-06 | Null dereference via `.` | trap with location | **UB — no check** |
+| RT-07 | Array out-of-bounds (release) | trap with index | **UB — no check** |
+
+RT-06 and RT-07 are the two UB cases — debug builds insert the check and trap with a useful message; release builds elide the check entirely and assume the condition never occurs.
+
+### 25.5 Runtime Exceptions (RX)
+
+Exceptions use WASM exception instructions (WASM 2.0). One shared exception tag carries the thrown object as an `i32` heap pointer:
+
+```wat
+(tag $jswat_exn (param i32))
+```
+
+**What can be thrown:** any class instance. The class must be accessible at the `throw` site.
+
+**Stdlib exceptions thrown automatically:**
+
+| Exception | Thrown by |
+|---|---|
+| `BoundsError extends AppError` | Array out-of-bounds in debug builds |
+| `MathError extends AppError` | Integer divide by zero |
+| `ParseError extends AppError` | `i32.parse`, `f64.parse` etc. on invalid input |
+| `IOError extends AppError` | `FS.*`, `stdin.read` on WASI errors |
+| `ValueError extends AppError` | Invalid radix in `.parse`, invalid argument |
+
+**`throw` compilation:**
+
+```js
+throw new IOError("disk full");
+```
+Compiles to:
+```wat
+;; allocate + construct IOError on heap → ptr on stack
+call $__jswat_rc_inc   ;; exception owns the reference
+throw $jswat_exn       ;; takes i32 ptr from stack
+```
+
+**`catch` compilation:**
+
+```js
+try { riskyOp(); }
+catch (e = IOError) { handle(e); }
+catch (e = ParseError) { handle(e); }
+```
+Compiles to:
+```wat
+try
+  call $riskyOp
+catch $jswat_exn          ;; all js.wat exceptions land here, ptr on stack
+  local.set $exn_ptr
+  ;; try IOError
+  local.get $exn_ptr
+  i32.load offset=8       ;; read class_id
+  i32.const CLASS_ID_IOError
+  i32.eq
+  if
+    ...handle e as IOError...
+  else
+    ;; try ParseError
+    local.get $exn_ptr
+    i32.load offset=8
+    i32.const CLASS_ID_ParseError
+    i32.eq
+    if
+      ...handle e as ParseError...
+    else
+      local.get $exn_ptr
+      throw $jswat_exn    ;; rethrow — not our type
+    end
+  end
+end
+```
+
+**`finally` compilation** uses `catch_all` + `rethrow`:
+
+```wat
+try
+  ...body...
+catch_all
+  ...finally body...
+  rethrow 0
+end
+...finally body...   ;; also emitted on normal exit path
+```
+
+**Unwind cleanup:** every scope that owns heap references is wrapped in an implicit `catch_all` that emits `rc_dec` for all owned references before rethrowing. This ensures refcounts stay correct across exception unwind — `Symbol.dispose` is called normally when rc hits zero.
+
+**Catch by superclass:** catching a base class catches all subclasses. The `class_id` check uses a compiler-generated table of subclass relationships resolved at compile time.
+
+```js
+catch (e = AppError) { }   // catches all AppError subclasses
+```
+
+---
+
+## 26. String ↔ Number Conversions
+
+### 26.1 Numbers to Strings — Template Literals
+
+Template literal interpolation `` `${}` `` is the only way to convert a number to a string. `String.from` does not exist.
+
+```js
+let n = i32(42);
+let s = `${n}`;              // "42" — String
+let msg = `value is ${n}`;   // "value is 42" — String
+
+let x = 3.14159;
+let t = `${x}`;              // "3.14159" — shortest round-trip f64
+
+let active = true;
+let b = `${active}`;         // "true"
+```
+
+**Format per type:**
+
+| Type | Format | Examples |
+|---|---|---|
+| `i8`–`isize` | Decimal, `-` for negatives | `"0"`, `"-42"`, `"127"` |
+| `u8`–`usize` | Decimal, unsigned | `"0"`, `"255"`, `"4294967295"` |
+| `f64` | Shortest round-trip decimal (Ryu) | `"3.14"`, `"1e100"`, `"0.1"` |
+| `f32` | Shortest round-trip at f32 precision | `"3.14"` not `"3.1400001"` |
+| `bool` | `"true"` or `"false"` | |
+| `str` | Direct — zero copy, no allocation | |
+| `String` | Copies content into output | |
+| class with `Symbol.toStr` | Calls `toStr()`, returns `str` | |
+
+**`Symbol.toStr` for classes:**
+
+```js
+class Point {
+  x; y;
+  constructor(x = 0.0, y = 0.0) { this.x = x; this.y = y; }
+
+  //@symbol(Symbol.toStr)
+  toStr() { return `(${this.x}, ${this.y})`; }
+  // Note: x and y are f64 — interpolatable directly
+  // toStr must return str, not String
+}
+
+const p = new Point(1.0, 2.0);
+console.log(`point: ${p}`);   // "point: (1.0, 2.0)"
+```
+
+`Symbol.toStr` must return `str` (not `String`). The compiler enforces this. If you need heap string construction inside `toStr`, build it and call `.asStr()` at the end.
+
+**No implicit coercion:** class instances without `Symbol.toStr` in `${}` are a compile error `CE-T09`. There is no `[object Object]` fallback.
+
+### 26.2 Strings to Numbers — `.parse()`
+
+Every numeric type has a static `.parse()` method. Parsing always throws `ParseError` on failure — no nullable return.
+
+**Integers — with optional radix:**
+
+```js
+i8.parse(s = "")                  // i8  — throws ParseError on failure
+u8.parse(s = "")                  // u8
+i16.parse(s = "")                 // i16
+u16.parse(s = "")                 // u16
+i32.parse(s = "", radix = i32(10))  // i32
+u32.parse(s = "", radix = i32(10))  // u32
+i64.parse(s = "", radix = i32(10))  // i64
+u64.parse(s = "", radix = i32(10))  // u64
+isize.parse(s = "", radix = i32(10)) // isize
+usize.parse(s = "", radix = i32(10)) // usize
+```
+
+**Floats — no radix:**
+
+```js
+f32.parse(s = "")    // f32 — throws ParseError on failure
+f64.parse(s = "")    // f64
+```
+
+**Behaviour:**
+
+```js
+i32.parse("42")          // 42
+i32.parse("-17")         // -17
+i32.parse("ff", 16)      // 255
+i32.parse("0xff", 16)    // 255 — 0x prefix stripped automatically
+i32.parse("0b1010", 2)   // 10  — 0b prefix stripped
+i32.parse("0o17", 8)     // 15  — 0o prefix stripped
+i32.parse("abc")         // throws ParseError("invalid integer: \"abc\"")
+i32.parse("999", 2)      // throws ParseError("invalid digit '9' for radix 2")
+i32.parse("42", 1)       // throws ValueError("radix must be between 2 and 36")
+f64.parse("3.14")        // 3.14
+f64.parse("1e100")       // 1e100
+f64.parse("inf")         // +Infinity
+f64.parse("-inf")        // -Infinity
+f64.parse("nan")         // NaN
+f64.parse("abc")         // throws ParseError("invalid float: \"abc\"")
+```
+
+Leading and trailing whitespace is rejected — use `.trim()` on the input string first if needed.
+
+All `.parse()` methods are compiler builtins — the implementation is in the compiler, not js.wat source.
+
+**Common pattern with try/catch:**
+
+```js
+try {
+  const n = i32.parse(userInput);
+  processNumber(n);
+} catch (e = ParseError) {
+  console.log(`bad input: ${e.message}`);
+}
+```
+
+**Common pattern with known-valid input** — if you know the string is always valid (e.g. from your own serialization), let the exception propagate naturally:
+
+```js
+// No try/catch needed — ParseError bubbles up to caller
+const n = i32.parse(record.get("count"));
+```
+
+---
+
+## 27. Modules
+
+### 27.1 Resolution Algorithm
+
+The compiler resolves import specifiers according to three rules, checked in order:
+
+```
+1. Stdlib path   "std/*"         → compiler built-in module
+2. WASM import   "./foo.wasm"    → pre-compiled WASM binary
+                 "../foo.wasm"
+3. Relative path "./foo"         → resolves to ./foo.js
+                 "./foo.js"      → literal file path
+                 "../foo"        → parent directory
+                 "./dir"         → resolves to ./dir/index.js
+```
+
+**No bare specifiers.** `import x from "lodash"` is `CE-M03`. There is no package registry.
+
+**Directory imports** resolve to `index.js` in that directory. This is the only convention — no `package.json`, no `main` field.
+
+### 27.2 Pre-compiled WASM Imports
+
+Any `.wasm` file can be imported directly. The compiler reads the export section and synthesizes declarations automatically:
+
+```js
+import { vec3Dot, mat4Multiply, vec3Cross } from "./mathlib.wasm";
+
+// Now call them like normal functions — type-checked against inferred types
+const d = vec3Dot(a, b);
+```
+
+**Type inference from WASM binary** (conservative defaults):
+
+| WASM type | Inferred js.wat type |
+|---|---|
+| `i32` | `isize` |
+| `i64` | `i64` |
+| `f32` | `f32` |
+| `f64` | `f64` |
+
+**`.extern.js` sidecar** — if a file `./mathlib.extern.js` exists alongside `./mathlib.wasm`, its type annotations take priority:
+
+```js
+// mathlib.extern.js — precise types override binary inference
+//@external("mathlib", "vec3_dot")
+export function vec3Dot(a = ptr(0.0), b = ptr(0.0)) { return 0.0; }
+```
+
+The compiler validates the sidecar types against the binary signatures. Mismatch = `CE-M04`/`CE-M05`. The `.wasm` import automatically adds the binary to the `--link` list — no manual flag needed.
+
+### 27.3 Compilation Unit
+
+All source files in a project compile to **one WASM module**. Import/export is a source-level visibility mechanism — it does not create WASM module boundaries. The linker sees a single flat namespace.
+
+Consequences:
+- No dynamic import — the whole graph is resolved at compile time
+- No lazy loading
+- Dead code elimination works across all files
+- All cross-file calls are intra-module calls — zero overhead at the WASM level
+
+### 27.4 Export Forms
+
+```js
+// Named exports
+export function foo() { }
+export class Foo { }
+export const X = 42;
+export { foo, Foo, X }
+export { foo as bar }             // renamed export
+
+// Default export — one per file
+export default Math;
+
+// Re-exports — no intermediate binding
+export { Range } from "./range";
+export { Range as R } from "./range";
+export * from "./range";          // all named exports of ./range
+```
+
+### 27.5 Import Forms
+
+```js
+// Default import
+import Math from "std/math";
+
+// Named imports
+import { Range, StepRange } from "std/range";
+import { Range as R } from "std/range";     // renamed
+
+// Namespace import — all exports as properties of ns
+import * as col from "std/collections";
+col.Map; col.Set; col.Stack;
+
+// WASM binary import
+import { vec3Dot } from "./mathlib.wasm";
+```
+
+Side-effect imports (`import "std/prelude"`) are removed — the prelude is now implicit (§28). No other side-effect import form is supported.
+
+### 27.6 `//@export` vs `export`
+
+These are orthogonal and independent:
+
+| Mechanism | Controls |
+|---|---|
+| `export` | js.wat source-level visibility — which names other `.js` files can import |
+| `//@export` | WASM host visibility — which functions appear in the WASM export section |
+
+A function can have both, either, or neither:
+
+```js
+// Visible to other js.wat files AND to the WASM host
+//@export("game_update")
+export function update(dt = 0.0) { }
+
+// Visible to other js.wat files only
+export function helperFn() { }
+
+// Visible to WASM host only (internal function exported for host tooling)
+//@export("debug_state")
+function dumpState() { }
+
+// Visible to neither — file-private
+function internalHelper() { }
+```
+
+### 27.7 Initialisation Order
+
+Top-level code (static field initialisers, module-level `const`/`let` with non-trivial values) runs in the `_start` sequence before user `main`. Order:
+
+1. **Topological sort** of the import graph — leaf modules first
+2. **Within each file** — top to bottom
+3. Cycles detected at compile time → `CE-M02` with full cycle path
+
+```
+error: CE-M02  circular import detected
+  src/a.js → src/b.js → src/c.js → src/a.js
+```
+
+### 27.8 `.extern.js` Files
+
+`.extern.js` files participate in the module graph as normal source files. The compiler identifies them by the presence of `//@external` pragmas on their exports — not by filename convention. The `.extern.js` suffix is a recommended convention for documentation, not a compiler requirement.
+
+```js
+// mathlib.extern.js — can be imported by any file
+import { vec3Dot } from "./mathlib.extern.js";
+// OR via the .wasm directly (sidecar applied automatically):
+import { vec3Dot } from "./mathlib.wasm";
+```
+
+---
+
+## 28. Implicit Prelude
+
+The prelude is never imported — its members are always in scope in every js.wat file. This is identical to Rust's prelude model. The prelude contains only names that would be genuinely tedious to import in nearly every file.
+
+Explicitly importing a prelude member is a `CE-M06` warning (not an error).
+
+**Always in scope — no import needed:**
+
+```
+From std/string:
+  String
+
+From std/io:
+  console
+
+From std/math:
+  Math
+
+From std/random:
+  Random
+
+From std/range:
+  Range
+
+From std/collections:
+  Map, Set, Stack, Queue, Deque
+
+From std/error:
+  AppError, ValueError, RangeError, IOError, ParseError, NotFoundError
+```
+
+**Requires explicit import:**
+
+```js
+import { iter }              from "std/iter";       // iterator combinators
+import { StepRange }         from "std/range";      // less common
+import { Clock }             from "std/clock";      // system concern
+import { FS }                from "std/fs";         // system concern
+import { Process }           from "std/process";    // system concern
+import { Base64, UTF8 }      from "std/encoding";   // specific use
+import { ptr, alloc }        from "std/mem";        // explicit intent matters
+import { ... }               from "std/wasm";       // explicitly low-level
+```
+
+**Tree-shaking applies to prelude members.** Being in scope does not root anything in the call graph. `Math` being in the prelude contributes zero bytes to the binary unless a `Math.*` method is actually called. `Map` contributes zero bytes unless instantiated.
+
+---
+
+## 29. Tree-Shaking
+
+Tree-shaking in js.wat is automatic and operates at five levels. No annotations or configuration required beyond the `--wasi` flag.
+
+### 29.1 Level 1 — User Module Dead Code Elimination
+
+The compiler builds a call graph rooted at:
+- All `//@export` functions
+- The `_start` entry point
+- All static field initialisers reachable from the above
+
+Any function, class, or static field not reachable from these roots is not emitted. A whole class that is never instantiated — including all its methods — produces zero bytes. This works across files because the entire module graph is one compilation unit.
+
+### 29.2 Level 2 — Stdlib Dead Code Elimination
+
+The stdlib is compiled as js.wat source alongside user code. The compiler sees the full unified call graph. Unused stdlib functions are never emitted:
+
+- Use `Range` but not `StepRange` → `StepRange` not emitted
+- Use `Math.sqrt` but not `Math.sin` → `Math.sin` polynomial not emitted
+- Use `Map` but not `Set` → `Set` not emitted
+- Use `String.slice` but not `String.split` → `split` not emitted
+
+### 29.3 Level 3 — Runtime Internals DCE
+
+After `wasm-merge`, `wasm-opt --dce` eliminates unreachable runtime functions. The runtime functions are only called from compiler-emitted call sites — never from user code directly — so DCE is precise.
+
+Runtime functions and their conditions for inclusion:
+
+| Function | Included when |
+|---|---|
+| `__jswat_alloc` | Any heap allocation (`new`, `String`, `Array`) |
+| `__jswat_free` | `__jswat_alloc` included |
+| `__jswat_realloc` | `alloc.realloc()` used |
+| `__jswat_rc_inc` | Any heap value crosses a scope boundary |
+| `__jswat_rc_dec` | Any heap value goes out of scope |
+| `__jswat_dispose` | Any class implements `Symbol.dispose` |
+| `__jswat_arena_new` | `alloc.arena()` used |
+| `__jswat_arena_alloc` | `arena.alloc()` or `arena.bytes()` used |
+| `__jswat_arena_reset` | `arena.reset()` used |
+| `__jswat_arena_free` | `arena.free()` used |
+| `__jswat_pool_new` | `alloc.pool()` used |
+| `__jswat_pool_alloc` | `pool.alloc()` used |
+| `__jswat_pool_free` | `pool.free()` used |
+
+A pure computation module — numeric processing, no heap allocation — emits zero allocator or GC code.
+
+### 29.4 Level 4 — Refcount Elimination
+
+The compiler marks a class as **cycle-free** when none of its fields (transitively) hold a reference to the same class or any of its ancestors. For cycle-free classes, binaryen's escape analysis can prove short-lived instances never escape their allocation scope and eliminate their refcount — stack-allocating them with zero GC overhead.
+
+The compiler emits a `!cycle_free` hint in the merged WASM for binaryen to exploit. No user annotation needed.
+
+### 29.5 Level 5 — WASI Branch Folding
+
+The `--wasi` compiler flag folds the `__wasi_available` global at compile time, enabling the dead-code elimination passes to remove entire branches:
+
+```bash
+jswat compile src/main.js                # runtime probe (default) — both paths kept
+jswat compile src/main.js --wasi=yes     # fold to 1 — WASI-free paths removed
+jswat compile src/main.js --wasi=no      # fold to 0 — all WASI call paths removed
+```
+
+With `--wasi=no`:
+- All `wasi_snapshot_preview1` imports disappear from the binary
+- `std/fs`, `std/clock`, `std/process`, `std/io` degrade to their no-op paths, which DCE then removes entirely if the functions are called but trivially return
+- `std/random` loses WASI seeding but keeps the PRNG
+
+`jswat.json`:
+```json
+{ "wasi": "no" }
+```
+
+### 29.6 Full Pipeline
+
+```
+1. Parse + type-check full module graph (user code + stdlib source)
+2. --wasi= flag folds __wasi_available (if specified)
+3. Build call graph rooted at //@export + _start
+4. Mark reachable: functions, classes, static fields, vtable entries
+5. Emit only reachable symbols → user.wasm
+6. wasm-merge user.wasm runtime.wasm → merged.wasm
+7. wasm-opt --dce merged.wasm          (runtime internals DCE)
+8. wasm-opt -O3 merged.wasm            (inline rc hot paths, constant fold,
+                                        escape analysis, refcount elimination)
+9. → final.wasm
+```
+
+binaryen's `-O3` pass handles levels 4 and the inlining of `rc_inc`/`rc_dec` hot paths. The typical hot path after inlining:
+
+```wat
+;; rc_inc for a non-null, non-sentinel GC object — inlined to ~5 instructions
+local.get $ptr
+i32.load                          ;; read rc_class word
+i32.const -1
+i32.ne                            ;; sentinel check
+if
+  local.get $ptr
+  local.get $ptr
+  i32.load
+  i32.const 1
+  i32.add
+  i32.store                       ;; rc++
+end
+```
+
+The sentinel check (`rc != -1`) is the only branch. For GC objects it is always predicted-taken by branch predictors after warmup.
+
+---
+
+*End of js.wat Spec v1.3*

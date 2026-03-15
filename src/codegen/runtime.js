@@ -2061,3 +2061,165 @@ export function buildRandomFunctions(mod, randomBase) {
       binaryen.createType([]), f64, [i32], body);
   }
 }
+
+// ── std/alloc/pool ────────────────────────────────────────────────────────────
+// Pool layout: [stride:i32][cap:i32][next:i32][freelist:i32][data: stride*cap bytes]
+// Offsets:       0           4        8          12            16
+
+/**
+ * Build pool allocator runtime functions.
+ * @param {any} mod
+ */
+export function buildPoolFunctions(mod) {
+  // __jswat_pool_new(stride:i32, cap:i32) -> i32 (pool ptr)
+  // params: stride(0), cap(1); locals: pool(2), dataSize(3)
+  {
+    const getStride  = () => mod.local.get(0, i32);
+    const getCap     = () => mod.local.get(1, i32);
+    const getPool    = () => mod.local.get(2, i32);
+    const getDataSz  = () => mod.local.get(3, i32);
+    const body = mod.block(null, [
+      // dataSize = stride * cap
+      mod.local.set(3, mod.i32.mul(getStride(), getCap())),
+      // pool = __jswat_alloc(16 + dataSize)
+      mod.local.set(2, mod.call('__jswat_alloc',
+        [mod.i32.add(mod.i32.const(16), getDataSz())], i32)),
+      // pool[0] = stride
+      mod.i32.store(0, 0, getPool(), getStride()),
+      // pool[4] = cap
+      mod.i32.store(4, 0, getPool(), getCap()),
+      // pool[8] = 0  (next free slot index)
+      mod.i32.store(8, 0, getPool(), mod.i32.const(0)),
+      // pool[12] = 0 (freelist head, 0 = empty)
+      mod.i32.store(12, 0, getPool(), mod.i32.const(0)),
+      mod.return(getPool()),
+    ], i32);
+    mod.addFunction('__jswat_pool_new',
+      binaryen.createType([i32, i32]), i32, [i32, i32], body);
+  }
+
+  // __jswat_pool_alloc(pool:i32) -> i32 (ptr to slot)
+  // params: pool(0); locals: freelist(1), stride(2), next(3), ptr(4)
+  {
+    const getPool     = () => mod.local.get(0, i32);
+    const getFreelist = () => mod.local.get(1, i32);
+    const getStride   = () => mod.local.get(2, i32);
+    const getNext     = () => mod.local.get(3, i32);
+    const getPtr      = () => mod.local.get(4, i32);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.i32.load(12, 0, getPool())),  // freelist
+      mod.local.set(2, mod.i32.load(0,  0, getPool())),  // stride
+      mod.if(
+        mod.i32.ne(getFreelist(), mod.i32.const(0)),
+        // freelist not empty: pop head
+        mod.block(null, [
+          // ptr = freelist head (stores abs pointer to slot)
+          mod.local.set(4, getFreelist()),
+          // freelist = *ptr (next pointer stored at slot start)
+          mod.i32.store(12, 0, getPool(), mod.i32.load(0, 0, getPtr())),
+          mod.return(getPtr()),
+        ], none),
+        // freelist empty: bump next
+        mod.block(null, [
+          mod.local.set(3, mod.i32.load(8, 0, getPool())), // next index
+          // ptr = pool + 16 + next * stride
+          mod.local.set(4, mod.i32.add(
+            mod.i32.add(getPool(), mod.i32.const(16)),
+            mod.i32.mul(getNext(), getStride())
+          )),
+          // pool[8] = next + 1
+          mod.i32.store(8, 0, getPool(), mod.i32.add(getNext(), mod.i32.const(1))),
+          mod.return(getPtr()),
+        ], none)
+      ),
+      mod.return(mod.i32.const(0)), // unreachable
+    ], i32);
+    mod.addFunction('__jswat_pool_alloc',
+      binaryen.createType([i32]), i32, [i32, i32, i32, i32], body);
+  }
+
+  // __jswat_pool_free(pool:i32, ptr:i32) -> void
+  // Push ptr onto the freelist; store old freelist head at ptr[0]
+  {
+    const getPool = () => mod.local.get(0, i32);
+    const getPtr  = () => mod.local.get(1, i32);
+    const body = mod.block(null, [
+      // *ptr = current freelist head
+      mod.i32.store(0, 0, getPtr(), mod.i32.load(12, 0, getPool())),
+      // pool[12] = ptr
+      mod.i32.store(12, 0, getPool(), getPtr()),
+    ], none);
+    mod.addFunction('__jswat_pool_free',
+      binaryen.createType([i32, i32]), none, [], body);
+  }
+}
+
+// ── std/alloc/arena ───────────────────────────────────────────────────────────
+// Arena layout: [base:i32 4B][ptr:i32 4B][cap:i32 4B][data: cap bytes]
+// Offsets:        0            4            8            12
+
+/**
+ * Build arena allocator runtime functions.
+ * @param {any} mod
+ */
+export function buildArenaFunctions(mod) {
+  // __jswat_arena_new(size:i32) -> i32 (arena ptr)
+  // params: size(0); locals: arena(1)
+  {
+    const getSize  = () => mod.local.get(0, i32);
+    const getArena = () => mod.local.get(1, i32);
+    const body = mod.block(null, [
+      // arena = __jswat_alloc(12 + size)
+      mod.local.set(1, mod.call('__jswat_alloc',
+        [mod.i32.add(mod.i32.const(12), getSize())], i32)),
+      // base = arena + 12
+      mod.i32.store(0, 0, getArena(),
+        mod.i32.add(getArena(), mod.i32.const(12))),
+      // ptr = base
+      mod.i32.store(4, 0, getArena(),
+        mod.i32.add(getArena(), mod.i32.const(12))),
+      // cap = size
+      mod.i32.store(8, 0, getArena(), getSize()),
+      mod.return(getArena()),
+    ], i32);
+    mod.addFunction('__jswat_arena_new',
+      binaryen.createType([i32]), i32, [i32], body);
+  }
+
+  // __jswat_arena_alloc(arena:i32, n:i32) -> i32 (allocated ptr)
+  // params: arena(0), n(1); locals: ptr(2), base(3), cap(4)
+  {
+    const getArena = () => mod.local.get(0, i32);
+    const getN     = () => mod.local.get(1, i32);
+    const getPtr   = () => mod.local.get(2, i32);
+    const getBase  = () => mod.local.get(3, i32);
+    const getCap   = () => mod.local.get(4, i32);
+    const body = mod.block(null, [
+      mod.local.set(2, mod.i32.load(4, 0, getArena())),  // ptr
+      mod.local.set(3, mod.i32.load(0, 0, getArena())),  // base
+      mod.local.set(4, mod.i32.load(8, 0, getArena())),  // cap
+      // if (ptr - base + n > cap) return 0 (OOM)
+      mod.if(
+        mod.i32.gt_u(
+          mod.i32.add(mod.i32.sub(getPtr(), getBase()), getN()),
+          getCap()
+        ),
+        mod.return(mod.i32.const(0))
+      ),
+      // arena[4] = ptr + n
+      mod.i32.store(4, 0, getArena(), mod.i32.add(getPtr(), getN())),
+      mod.return(getPtr()),
+    ], i32);
+    mod.addFunction('__jswat_arena_alloc',
+      binaryen.createType([i32, i32]), i32, [i32, i32, i32], body);
+  }
+
+  // __jswat_arena_reset(arena:i32) -> void
+  {
+    const getArena = () => mod.local.get(0, i32);
+    mod.addFunction('__jswat_arena_reset',
+      binaryen.createType([i32]), none, [],
+      // arena[4] = arena[0]  (reset ptr to base)
+      mod.i32.store(4, 0, getArena(), mod.i32.load(0, 0, getArena())));
+  }
+}

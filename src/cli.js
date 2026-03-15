@@ -6,7 +6,10 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { readFile } from 'fs/promises';
 import { dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { compileSource, wasmToWat } from './compiler.js';
+
+const STD_ROOT = fileURLToPath(new URL('../std', import.meta.url));
 
 /**
  * Read a file from disk and compile it.
@@ -16,7 +19,11 @@ import { compileSource, wasmToWat } from './compiler.js';
 async function compile(opts) {
   const { input, checkOnly = false } = opts;
   const source = await readFile(input, 'utf8');
-  return compileSource(source, input, { checkOnly });
+  return compileSource(source, input, {
+    checkOnly,
+    readFile: (p) => readFileSync(p, 'utf8'),
+    stdRoot: STD_ROOT,
+  });
 }
 
 

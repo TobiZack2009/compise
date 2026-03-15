@@ -6,12 +6,13 @@ import binaryen from 'binaryen';
 import { TYPES } from '../types.js';
 import { buildAllocator } from '../allocator.js';
 import { collectStdStubs } from '../std.js';
-import { GenContext } from './context.js';
+import { GenContext, toBinType } from './context.js';
 import { buildClassLayouts } from './classes.js';
 import {
   buildStdStub, buildMemFunctions, buildArrayFunctions, buildStringFunctions,
   buildCollectionsFunctions, buildWasiImports, buildIoFunctions, buildFsFunctions,
   buildClockFunctions, buildRandomFunctions, buildMathFunctions, buildIterFunctions,
+  buildPoolFunctions, buildArenaFunctions,
 } from './runtime.js';
 import { astHasArray, buildStringTable, genFunction, genMethod, genConstructor, genStaticMethod } from './functions.js';
 import { collectLocals } from './expressions.js';
@@ -25,9 +26,11 @@ import { genStatement } from './statements.js';
  * @param {Map<string, object>} classes
  * @param {Map} imports
  * @param {string} [filename='<input>']
+ * @param {{ stdModules?: Array<{ ast: object, filename: string }> }} [opts]
  * @returns {{ wat: string, binary: Uint8Array }}
  */
-export function generateWat(ast, signatures, classes, imports, filename = '<input>') {
+export function generateWat(ast, signatures, classes, imports, filename = '<input>', opts = {}) {
+  const { stdModules = [] } = opts;
   const mod = new binaryen.Module();
 
   // ── Class layouts ─────────────────────────────────────────────────────────
@@ -127,8 +130,36 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   const hasMath = Array.from(stdStubs).some(n => n.startsWith('__jswat_math_')) ||
     astHasPow(ast);
 
+  // Pool / arena: detect from std module @external declarations in signatures
+  const hasPool = Array.from(signatures.values()).some(sig => sig.external?.name?.startsWith('__jswat_pool_'));
+  const hasArena = Array.from(signatures.values()).some(sig => sig.external?.name?.startsWith('__jswat_arena_'));
+
   // ── WASI imports ──────────────────────────────────────────────────────────
   buildWasiImports(mod, hasIo, hasFs, hasClock, hasRandom);
+
+  // ── @external imports from std modules ────────────────────────────────────
+  // Track already-imported names to avoid duplicates (binaryen throws on dupes)
+  /** @type {Set<string>} */
+  const importedFunctions = new Set();
+  for (const { ast: stdAst } of stdModules) {
+    for (const node of stdAst.body) {
+      if (node.type !== 'FunctionDeclaration' || !node._externalModule) continue;
+      // Skip __jswat_runtime — those are built by runtime.js, not host imports
+      if (node._externalModule === '__jswat_runtime') continue;
+      const internalName = node.id?.name;
+      if (!internalName || importedFunctions.has(internalName)) continue;
+      const sig = signatures.get(internalName);
+      if (!sig) continue;
+      importedFunctions.add(internalName);
+      mod.addFunctionImport(
+        internalName,
+        node._externalModule,
+        node._externalName ?? internalName,
+        binaryen.createType(sig.params.map(p => toBinType(p.type))),
+        toBinType(sig.returnType)
+      );
+    }
+  }
 
   // ── Allocator ─────────────────────────────────────────────────────────────
   buildAllocator(mod);
@@ -144,6 +175,8 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   if (hasCollections) buildCollectionsFunctions(mod);
   if (hasMath)        buildMathFunctions(mod);
   if (hasIter)        { if (!hasArray) buildArrayFunctions(mod); buildIterFunctions(mod); }
+  if (hasPool)        buildPoolFunctions(mod);
+  if (hasArena)       buildArenaFunctions(mod);
 
   // ── Std stubs (no-ops for unused imports) ─────────────────────────────────
   for (const stub of stdStubs) {
@@ -166,8 +199,54 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
     buildStdStub(mod, stub);
   }
 
-  // ── User functions ────────────────────────────────────────────────────────
+  // ── Runtime wrappers for @external("__jswat_runtime", ...) std functions ──
+  // Std class methods call the internal name (e.g. `__console_log`), but the
+  // runtime provides the external name (e.g. `__jswat_console_log`).  Add a
+  // thin wrapper so that calls from compiled std class methods resolve.
+  // Skip wrapper if the runtime already added a function with the same internal name
+  // (e.g., allocator adds `__alloc` directly, so no wrapper needed for std/mem.js's
+  // function __alloc @external("__jswat_runtime","__jswat_alloc")).
+  /** @type {Set<string>} */
+  const runtimeWrappers = new Set();
+  for (const { ast: stdAst } of stdModules) {
+    for (const node of stdAst.body) {
+      if (node.type !== 'FunctionDeclaration' || !node._externalModule) continue;
+      if (node._externalModule !== '__jswat_runtime') continue;
+      const internalName = node.id?.name;
+      const externalName = node._externalName;
+      if (!internalName || !externalName || runtimeWrappers.has(internalName)) continue;
+      const sig = signatures.get(internalName);
+      if (!sig) continue;
+      runtimeWrappers.add(internalName);
+      // Skip if a function with this internal name was already added by a build* function
+      // (binaryen.getFunction returns a non-zero handle if it exists)
+      try {
+        const exists = mod.getFunction(internalName);
+        if (exists) continue; // already provided by runtime
+      } catch (_) { /* getFunction not available or other error — proceed */ }
+      const paramTypes = sig.params.map(p => toBinType(p.type));
+      const retType    = toBinType(sig.returnType);
+      const paramRefs  = sig.params.map((_, i) => mod.local.get(i, paramTypes[i]));
+      const callExpr   = mod.call(externalName, paramRefs, retType);
+      const body       = retType === binaryen.none ? callExpr : mod.return(callExpr);
+      mod.addFunction(internalName,
+        binaryen.createType(paramTypes), retType, [], body);
+    }
+  }
+
+  // ── Std functions (non-@external, compiled from std module ASTs) ─────────
   const stringTable = { map: stringMap };
+
+  for (const { ast: stdAst, filename: stdFile } of stdModules) {
+    for (const node of stdAst.body) {
+      if (node.type !== 'FunctionDeclaration') continue;
+      if (node._externalModule) continue; // @external — already handled above
+      genFunction(node, mod, signatures, classes, layouts, imports,
+        stringTable, stdFile, fnTableMap, fnTypeNames);
+    }
+  }
+
+  // ── User functions ────────────────────────────────────────────────────────
 
   for (const node of ast.body) {
     if (node.type !== 'FunctionDeclaration') continue;
