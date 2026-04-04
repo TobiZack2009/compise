@@ -48,6 +48,8 @@ export function parseSource(source, filename = '<input>') {
   const externalAnnotations = [];
   /** @type {Array<{ line: number, symbol: string }>} */
   const symbolAnnotations = [];
+  /** @type {Array<{ line: number }>} */
+  const orderedAnnotations = [];
   try {
     ast = parse(source, {
       ecmaVersion: 2022,
@@ -69,6 +71,10 @@ export function parseSource(source, filename = '<input>') {
         const mSymbol = text.match(/^@symbol\((.+)\)/);
         if (mSymbol) {
           symbolAnnotations.push({ line, symbol: mSymbol[1].trim() });
+          return;
+        }
+        if (text.trim() === '@ordered') {
+          orderedAnnotations.push({ line });
         }
       },
     });
@@ -139,6 +145,18 @@ export function parseSource(source, filename = '<input>') {
     attachToFunctions(symByLine, (node, symbol) => {
       node._symbolName = symbol;
     });
+  }
+
+  // Attach @ordered annotation to class declarations
+  if (orderedAnnotations.length > 0) {
+    const orderedByLine = new Set(orderedAnnotations.map(a => a.line));
+    for (const node of ast.body) {
+      if (node.type !== 'ClassDeclaration') continue;
+      const classLine = node.loc?.start?.line ?? 0;
+      if (orderedByLine.has(classLine - 1) || orderedByLine.has(classLine)) {
+        node._ordered = true;
+      }
+    }
   }
 
   const errors = [];

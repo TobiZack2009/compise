@@ -156,6 +156,10 @@ export function inferTypes(ast, filename = '<input>', opts = {}) {
 
   // Helper: register a class name into the classes map if not already present.
   function registerClassStub(stmt) {
+    // Unwrap `export class Foo {}` (ExportNamedDeclaration wrapping ClassDeclaration)
+    if (stmt.type === 'ExportNamedDeclaration' && stmt.declaration?.type === 'ClassDeclaration') {
+      stmt = stmt.declaration;
+    }
     if (stmt.type !== 'ClassDeclaration' || !stmt.id?.name) return;
     if (classes.has(stmt.id.name)) return;
     const typeInfo = {
@@ -167,8 +171,12 @@ export function inferTypes(ast, filename = '<input>', opts = {}) {
       fields: new Map(), methods: new Map(), constructor: null,
       staticFields: new Map(), staticMethods: new Map(), staticGetters: new Map(),
       superClassName: stmt.superClass?.name ?? null,
+      ordered: stmt._ordered ?? false,
     });
-    TYPES[stmt.id.name] = typeInfo;
+    // Don't overwrite existing primitive/non-class types (e.g. TYPES.ptr has kind='ptr')
+    if (!TYPES[stmt.id.name] || TYPES[stmt.id.name].kind === 'class') {
+      TYPES[stmt.id.name] = typeInfo;
+    }
   }
 
   // Pass 1: register all std class names so cross-module references resolve
@@ -288,6 +296,20 @@ function inferStatement(stmt, scope, signatures, classes, filename, ctx) {
 
     case 'ClassDeclaration':
       inferClass(stmt, scope, signatures, classes, filename, ctx);
+      break;
+
+    case 'ExportNamedDeclaration':
+      // Only recurse for class declarations — export function stubs (e.g. std/wasm.js intrinsics)
+      // must NOT be added to signatures as real functions (they're replaced by opcodes).
+      if (stmt.declaration?.type === 'ClassDeclaration') {
+        inferStatement(stmt.declaration, scope, signatures, classes, filename, ctx);
+      }
+      break;
+
+    case 'ExportDefaultDeclaration':
+      if (stmt.declaration?.type === 'ClassDeclaration') {
+        inferStatement(stmt.declaration, scope, signatures, classes, filename, ctx);
+      }
       break;
 
     case 'ImportDeclaration':

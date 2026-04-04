@@ -19,9 +19,16 @@ export function buildClassLayouts(classes) {
     const classId = nextClassId++;
     let offset = 12; // 12-byte header: rc_class(4) + vtable_ptr(4) + class_id(4)
     const fields = new Map();
-    for (const [name, typeInfo] of classInfo.fields.entries()) {
+    // Sort fields by descending typeSize for compact layout (largest first).
+    // Skip sort if class is annotated //@ordered (preserve declaration order).
+    const fieldEntries = Array.from(classInfo.fields.entries()).map(([name, typeInfo]) => {
       const resolved = resolveFieldType(typeInfo);
-      const size = typeSize(resolved);
+      return { name, resolved, size: typeSize(resolved) };
+    });
+    if (!classInfo.ordered) {
+      fieldEntries.sort((a, b) => b.size - a.size);
+    }
+    for (const { name, resolved, size } of fieldEntries) {
       fields.set(name, { offset, type: resolved });
       offset += size;
     }

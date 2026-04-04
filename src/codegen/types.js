@@ -177,7 +177,7 @@ export function genCast(mod, value, src, dst) {
  * @returns {boolean}
  */
 export function isHeapType(type) {
-  return type?.kind === 'class' || type?.kind === 'array';
+  return type?.kind === 'class' || type?.kind === 'array' || type?.name === 'str';
 }
 
 /**

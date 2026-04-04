@@ -5,7 +5,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { readFile } from 'fs/promises';
-import { dirname } from 'path';
+import { dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { compileSource, wasmToWat } from './compiler.js';
 
@@ -67,26 +67,52 @@ function watPathFrom(wasmPath) {
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
+/**
+ * Find `--flag <value>` in an argument list.
+ * @param {string[]} args
+ * @param {string} flag
+ * @returns {string|null}
+ */
+function parseFlag(args, flag) {
+  const idx = args.indexOf(flag);
+  return idx !== -1 ? args[idx + 1] ?? null : null;
+}
+
 async function cmdCompile(args) {
-  const input     = args[0];
-  const output    = parseOutput(args);
-  const emitWat   = args.includes('--emit-wat');
-  const saveWat   = args.includes('--save-wat');
-  if (!input)  die('Usage: jswat compile <input.js> -o <output.wasm> [--emit-wat] [--save-wat]');
+  const input      = args[0];
+  const output     = parseOutput(args);
+  const emitWat    = args.includes('--emit-wat');
+  const saveWat    = args.includes('--save-wat');
+  const lib        = args.includes('--lib');
+  const target     = parseFlag(args, '--target') ?? 'wasm32-wasip1';
+  const emitLayout = parseFlag(args, '--emit-layout');
+
+  if (!input)  die('Usage: jswat compile <input.js> -o <output.wasm> [--emit-wat] [--save-wat] [--lib] [--target wasm32-wasip1|wasm32-unknown] [--emit-layout <file>]');
   if (!output) die('Missing -o <output> flag');
 
-  const result = await compile({ input, output });
+  const source = await readFile(input, 'utf8');
+  const result = await compileSource(source, input, {
+    readFile: (p) => readFileSync(p, 'utf8'),
+    stdRoot: STD_ROOT,
+    target,
+    lib,
+  });
 
   for (const w of result.warnings) stderr(`warning: ${w}`);
 
   mkdirSync(dirname(output), { recursive: true });
-  if(!saveWat) {
-  writeFileSync(output, result.wasm);
-  stdout(`Compiled ${input} → ${output}`)};
-  if (emitWat||saveWat) {
-    const watPath =saveWat?output : watPathFrom(output);
+  if (!saveWat) {
+    writeFileSync(output, result.wasm);
+    stdout(`Compiled ${input} → ${output}`);
+  }
+  if (emitWat || saveWat) {
+    const watPath = saveWat ? output : watPathFrom(output);
     writeFileSync(watPath, result.wat, 'utf8');
     stdout(`WAT      ${input} → ${watPath}`);
+  }
+  if (emitLayout) {
+    writeFileSync(resolve(emitLayout), JSON.stringify(result.layoutMap, null, 2), 'utf8');
+    stdout(`Layout   ${input} → ${emitLayout}`);
   }
 }
 

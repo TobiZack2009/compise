@@ -18,6 +18,27 @@ const none = binaryen.none;
  * @param {string} name
  */
 export function buildStdStub(mod, name) {
+  // Lookup table for known functions with non-trivial signatures.
+  const KNOWN = {
+    '__jswat_random_float':    { p: [],      r: f64,  body: () => mod.f64.const(0) },
+    '__jswat_random_seed':     { p: [i32],   r: none, body: () => mod.nop() },
+    '__jswat_random_int':      { p: [i32,i32], r: i32, body: () => mod.return(mod.i32.const(0)) },
+    '__jswat_random_shuffle':  { p: [i32,i32], r: none, body: () => mod.nop() },
+    '__jswat_clock_now':       { p: [],      r: i32,  body: () => mod.return(mod.i32.const(0)) },
+    '__jswat_clock_monotonic': { p: [],      r: i32,  body: () => mod.return(mod.i32.const(0)) },
+    '__jswat_clock_sleep':     { p: [i32,i32], r: none, body: () => mod.nop() },
+    '__jswat_fs_read':         { p: [i32],   r: i32,  body: () => mod.return(mod.i32.const(0)) },
+    '__jswat_fs_write':        { p: [i32,i32], r: none, body: () => mod.nop() },
+    '__jswat_fs_append':       { p: [i32,i32], r: none, body: () => mod.nop() },
+    '__jswat_fs_exists':       { p: [i32],   r: i32,  body: () => mod.return(mod.i32.const(0)) },
+    '__jswat_fs_delete':       { p: [i32],   r: none, body: () => mod.nop() },
+    '__jswat_fs_mkdir':        { p: [i32],   r: none, body: () => mod.nop() },
+  };
+  const known = KNOWN[name];
+  if (known) {
+    mod.addFunction(name, binaryen.createType(known.p), known.r, [], known.body());
+    return;
+  }
   const hasArg    = name.includes('write') || name.includes('log') || name.includes('error');
   const returnsPtr = name.includes('read') || name.includes('from');
   const params = hasArg ? binaryen.createType([i32]) : binaryen.createType([]);
@@ -35,8 +56,9 @@ export function buildStdStub(mod, name) {
  * @param {boolean} hasFs
  * @param {boolean} hasClock
  * @param {boolean} hasRandom
+ * @param {boolean} [hasProcess]
  */
-export function buildWasiImports(mod, hasIo, hasFs, hasClock, hasRandom) {
+export function buildWasiImports(mod, hasIo, hasFs, hasClock, hasRandom, hasProcess = false) {
   if (hasIo || hasFs) {
     mod.addFunctionImport('fd_write', 'wasi_snapshot_preview1', 'fd_write',
       binaryen.createType([i32, i32, i32, i32]), i32);
@@ -64,6 +86,10 @@ export function buildWasiImports(mod, hasIo, hasFs, hasClock, hasRandom) {
   if (hasRandom) {
     mod.addFunctionImport('random_get', 'wasi_snapshot_preview1', 'random_get',
       binaryen.createType([i32, i32]), i32);
+  }
+  if (hasProcess) {
+    mod.addFunctionImport('proc_exit', 'wasi_snapshot_preview1', 'proc_exit',
+      binaryen.createType([i32]), none);
   }
 }
 
@@ -286,15 +312,16 @@ export function buildStringFunctions(mod) {
     ),
     // if isNeg: len++
     mod.if(getIsNeg(), mod.local.set(3, mod.i32.add(getLen(), mod.i32.const(1)))),
-    // ptr = alloc_bytes(len+8, 0)
-    mod.local.set(4, mod.call('__jswat_alloc_bytes',
-      [mod.i32.add(getLen(), mod.i32.const(8)), mod.i32.const(0)], i32)),
-    // ptr[0]=len, ptr[4]=0
-    mod.i32.store(0, 0, getPtr(), getLen()),
-    mod.i32.store(4, 0, getPtr(), mod.i32.const(0)),
-    // write = ptr + 8 + len - 1
+    // ptr = alloc(len+12)  — 12-byte header: [rc:4][len:4][hash:4][bytes...]
+    mod.local.set(4, mod.call('__jswat_alloc',
+      [mod.i32.add(getLen(), mod.i32.const(12))], i32)),
+    // ptr[0]=rc=1, ptr[4]=len, ptr[8]=hash=0
+    mod.i32.store(0, 0, getPtr(), mod.i32.const(1)),
+    mod.i32.store(4, 0, getPtr(), getLen()),
+    mod.i32.store(8, 0, getPtr(), mod.i32.const(0)),
+    // write = ptr + 12 + len - 1
     mod.local.set(6, mod.i32.sub(
-      mod.i32.add(getPtr(), mod.i32.add(mod.i32.const(8), getLen())),
+      mod.i32.add(getPtr(), mod.i32.add(mod.i32.const(12), getLen())),
       mod.i32.const(1))),
     // write digits backwards
     mod.if(
@@ -317,9 +344,9 @@ export function buildStringFunctions(mod) {
         ], none),
       ], none)
     ),
-    // if isNeg: write '-' at ptr+8
+    // if isNeg: write '-' at ptr+12
     mod.if(getIsNeg(),
-      mod.i32.store8(0, 0, mod.i32.add(getPtr(), mod.i32.const(8)), mod.i32.const(45))),
+      mod.i32.store8(0, 0, mod.i32.add(getPtr(), mod.i32.const(12)), mod.i32.const(45))),
     mod.return(getPtr()),
   ], i32);
 
@@ -327,11 +354,11 @@ export function buildStringFunctions(mod) {
     binaryen.createType([i32]), i32,
     [i32, i32, i32, i32, i32, i32], body);
 
-  // __jswat_str_length(str:i32) -> i32
+  // __jswat_str_length(str:i32) -> i32  — len is at offset 4 in 12-byte header
   mod.addFunction('__jswat_str_length',
     binaryen.createType([i32]), i32, [],
     mod.if(mod.i32.eqz(mod.local.get(0, i32)), mod.i32.const(0),
-      mod.i32.load(0, 0, mod.local.get(0, i32))));
+      mod.i32.load(4, 0, mod.local.get(0, i32))));
 
   // __jswat_str_char_at(str:i32, idx:i32) -> i32
   // Returns the byte value at position idx; -1 if out of range.
@@ -340,9 +367,9 @@ export function buildStringFunctions(mod) {
     const gidx = () => mod.local.get(1, i32);
     const body = mod.block(null, [
       mod.if(mod.i32.eqz(gstr()), mod.return(mod.i32.const(-1))),
-      mod.if(mod.i32.ge_u(gidx(), mod.i32.load(0, 0, gstr())), mod.return(mod.i32.const(-1))),
+      mod.if(mod.i32.ge_u(gidx(), mod.i32.load(4, 0, gstr())), mod.return(mod.i32.const(-1))),
       mod.return(mod.i32.load8_u(0, 0,
-        mod.i32.add(mod.i32.add(gstr(), mod.i32.const(8)), gidx()))),
+        mod.i32.add(mod.i32.add(gstr(), mod.i32.const(12)), gidx()))),
     ], i32);
     mod.addFunction('__jswat_str_char_at', binaryen.createType([i32, i32]), i32, [], body);
   }
@@ -357,21 +384,22 @@ export function buildStringFunctions(mod) {
     const gtotal = () => mod.local.get(4, i32);
     const gptr   = () => mod.local.get(5, i32);
     const body = mod.block(null, [
-      mod.local.set(2, mod.if(mod.i32.eqz(ga()), mod.i32.const(0), mod.i32.load(0, 0, ga()), i32)),
-      mod.local.set(3, mod.if(mod.i32.eqz(gb()), mod.i32.const(0), mod.i32.load(0, 0, gb()), i32)),
+      mod.local.set(2, mod.if(mod.i32.eqz(ga()), mod.i32.const(0), mod.i32.load(4, 0, ga()), i32)),
+      mod.local.set(3, mod.if(mod.i32.eqz(gb()), mod.i32.const(0), mod.i32.load(4, 0, gb()), i32)),
       mod.local.set(4, mod.i32.add(gla(), glb())),
-      mod.local.set(5, mod.call('__jswat_alloc_bytes',
-        [mod.i32.add(gtotal(), mod.i32.const(8)), mod.i32.const(0)], i32)),
-      mod.i32.store(0, 0, gptr(), gtotal()),
-      mod.i32.store(4, 0, gptr(), mod.i32.const(0)),
+      mod.local.set(5, mod.call('__jswat_alloc',
+        [mod.i32.add(gtotal(), mod.i32.const(12))], i32)),
+      mod.i32.store(0, 0, gptr(), mod.i32.const(1)),   // rc = 1
+      mod.i32.store(4, 0, gptr(), gtotal()),            // len at 4
+      mod.i32.store(8, 0, gptr(), mod.i32.const(0)),   // hash at 8
       mod.if(mod.i32.gt_u(gla(), mod.i32.const(0)),
         mod.memory.copy(
-          mod.i32.add(gptr(), mod.i32.const(8)),
-          mod.i32.add(ga(), mod.i32.const(8)), gla())),
+          mod.i32.add(gptr(), mod.i32.const(12)),
+          mod.i32.add(ga(), mod.i32.const(12)), gla())),
       mod.if(mod.i32.gt_u(glb(), mod.i32.const(0)),
         mod.memory.copy(
-          mod.i32.add(mod.i32.add(gptr(), mod.i32.const(8)), gla()),
-          mod.i32.add(gb(), mod.i32.const(8)), glb())),
+          mod.i32.add(mod.i32.add(gptr(), mod.i32.const(12)), gla()),
+          mod.i32.add(gb(), mod.i32.const(12)), glb())),
       mod.return(gptr()),
     ], i32);
     mod.addFunction('__jswat_str_concat', binaryen.createType([i32, i32]), i32, [i32, i32, i32, i32], body);
@@ -388,7 +416,7 @@ export function buildStringFunctions(mod) {
     const gptr   = () => mod.local.get(5, i32);
     const body = mod.block(null, [
       mod.if(mod.i32.eqz(gstr()), mod.return(mod.i32.const(0))),
-      mod.local.set(3, mod.i32.load(0, 0, gstr())),    // strlen
+      mod.local.set(3, mod.i32.load(4, 0, gstr())),    // strlen — len at offset 4
       // clamp start/end
       mod.if(mod.i32.lt_s(gstart(), mod.i32.const(0)),
         mod.local.set(1, mod.i32.const(0))),
@@ -400,13 +428,14 @@ export function buildStringFunctions(mod) {
         mod.local.set(2, gstrlen())),
       mod.if(mod.i32.le_u(gend(), gstart()), mod.return(mod.i32.const(0))),
       mod.local.set(4, mod.i32.sub(gend(), gstart())),  // slice length
-      mod.local.set(5, mod.call('__jswat_alloc_bytes',
-        [mod.i32.add(gslen(), mod.i32.const(8)), mod.i32.const(0)], i32)),
-      mod.i32.store(0, 0, gptr(), gslen()),
-      mod.i32.store(4, 0, gptr(), mod.i32.const(0)),
+      mod.local.set(5, mod.call('__jswat_alloc',
+        [mod.i32.add(gslen(), mod.i32.const(12))], i32)),
+      mod.i32.store(0, 0, gptr(), mod.i32.const(1)),   // rc = 1
+      mod.i32.store(4, 0, gptr(), gslen()),             // len at 4
+      mod.i32.store(8, 0, gptr(), mod.i32.const(0)),   // hash at 8
       mod.memory.copy(
-        mod.i32.add(gptr(), mod.i32.const(8)),
-        mod.i32.add(mod.i32.add(gstr(), mod.i32.const(8)), gstart()),
+        mod.i32.add(gptr(), mod.i32.const(12)),
+        mod.i32.add(mod.i32.add(gstr(), mod.i32.const(12)), gstart()),
         gslen()),
       mod.return(gptr()),
     ], i32);
@@ -425,8 +454,8 @@ export function buildStringFunctions(mod) {
     const body = mod.block(null, [
       mod.if(mod.i32.eqz(gstr()), mod.return(mod.i32.const(-1))),
       mod.if(mod.i32.eqz(gneedle()), mod.return(mod.i32.const(-1))),
-      mod.local.set(2, mod.i32.load(0, 0, gstr())),
-      mod.local.set(3, mod.i32.load(0, 0, gneedle())),
+      mod.local.set(2, mod.i32.load(4, 0, gstr())),    // len at offset 4
+      mod.local.set(3, mod.i32.load(4, 0, gneedle())), // len at offset 4
       mod.if(mod.i32.eqz(gnlen()), mod.return(mod.i32.const(0))),
       mod.local.set(4, mod.i32.const(0)),
       mod.block('search_done', [
@@ -441,8 +470,8 @@ export function buildStringFunctions(mod) {
               mod.br_if('match_done', mod.i32.ge_u(gj(), gnlen())),
               mod.if(
                 mod.i32.ne(
-                  mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gstr(), mod.i32.const(8)), mod.i32.add(gi(), gj()))),
-                  mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gneedle(), mod.i32.const(8)), gj()))),
+                  mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gstr(), mod.i32.const(12)), mod.i32.add(gi(), gj()))),
+                  mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gneedle(), mod.i32.const(12)), gj()))),
                 mod.block(null, [mod.local.set(5, mod.i32.const(-1)), mod.br('match_done')], none)),
               mod.local.set(5, mod.i32.add(gj(), mod.i32.const(1))),
               mod.br('match_inner'),
@@ -470,8 +499,8 @@ export function buildStringFunctions(mod) {
     const body = mod.block(null, [
       mod.if(mod.i32.eqz(gstr()),    mod.return(mod.i32.const(0))),
       mod.if(mod.i32.eqz(gprefix()), mod.return(mod.i32.const(1))),  // empty prefix always matches
-      mod.local.set(2, mod.i32.load(0, 0, gstr())),
-      mod.local.set(3, mod.i32.load(0, 0, gprefix())),
+      mod.local.set(2, mod.i32.load(4, 0, gstr())),    // len at offset 4
+      mod.local.set(3, mod.i32.load(4, 0, gprefix())), // len at offset 4
       mod.if(mod.i32.gt_u(gplen(), gslen()), mod.return(mod.i32.const(0))),
       mod.local.set(4, mod.i32.const(0)),
       mod.block('sw_done', [
@@ -479,8 +508,8 @@ export function buildStringFunctions(mod) {
           mod.br_if('sw_done', mod.i32.ge_u(gi(), gplen())),
           mod.if(
             mod.i32.ne(
-              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gstr(),    mod.i32.const(8)), gi())),
-              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gprefix(), mod.i32.const(8)), gi()))),
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gstr(),    mod.i32.const(12)), gi())),
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gprefix(), mod.i32.const(12)), gi()))),
             mod.return(mod.i32.const(0))),
           mod.local.set(4, mod.i32.add(gi(), mod.i32.const(1))),
           mod.br('sw_loop'),
@@ -503,8 +532,8 @@ export function buildStringFunctions(mod) {
     const body = mod.block(null, [
       mod.if(mod.i32.eqz(gstr()),    mod.return(mod.i32.const(0))),
       mod.if(mod.i32.eqz(gsuffix()), mod.return(mod.i32.const(1))),
-      mod.local.set(2, mod.i32.load(0, 0, gstr())),
-      mod.local.set(3, mod.i32.load(0, 0, gsuffix())),
+      mod.local.set(2, mod.i32.load(4, 0, gstr())),    // len at offset 4
+      mod.local.set(3, mod.i32.load(4, 0, gsuffix())), // len at offset 4
       mod.if(mod.i32.gt_u(gsfxlen(), gslen()), mod.return(mod.i32.const(0))),
       // soff = slen - sfxlen  (offset in str where suffix must start)
       mod.local.set(5, mod.i32.sub(gslen(), gsfxlen())),
@@ -514,8 +543,8 @@ export function buildStringFunctions(mod) {
           mod.br_if('ew_done', mod.i32.ge_u(gi(), gsfxlen())),
           mod.if(
             mod.i32.ne(
-              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gstr(),    mod.i32.const(8)), mod.i32.add(gsoff(), gi()))),
-              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gsuffix(), mod.i32.const(8)), gi()))),
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gstr(),    mod.i32.const(12)), mod.i32.add(gsoff(), gi()))),
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gsuffix(), mod.i32.const(12)), gi()))),
             mod.return(mod.i32.const(0))),
           mod.local.set(4, mod.i32.add(gi(), mod.i32.const(1))),
           mod.br('ew_loop'),
@@ -538,8 +567,8 @@ export function buildStringFunctions(mod) {
       mod.if(mod.i32.eq(ga(), gb()), mod.return(mod.i32.const(1))),  // same pointer (incl both null)
       mod.if(mod.i32.eqz(ga()), mod.return(mod.i32.const(0))),
       mod.if(mod.i32.eqz(gb()), mod.return(mod.i32.const(0))),
-      mod.local.set(2, mod.i32.load(0, 0, ga())),
-      mod.local.set(3, mod.i32.load(0, 0, gb())),
+      mod.local.set(2, mod.i32.load(4, 0, ga())),  // len at offset 4
+      mod.local.set(3, mod.i32.load(4, 0, gb())),  // len at offset 4
       mod.if(mod.i32.ne(gla(), glb()), mod.return(mod.i32.const(0))),
       mod.local.set(4, mod.i32.const(0)),
       mod.block('eq_done', [
@@ -547,8 +576,8 @@ export function buildStringFunctions(mod) {
           mod.br_if('eq_done', mod.i32.ge_u(gi(), gla())),
           mod.if(
             mod.i32.ne(
-              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(ga(), mod.i32.const(8)), gi())),
-              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gb(), mod.i32.const(8)), gi()))),
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(ga(), mod.i32.const(12)), gi())),
+              mod.i32.load8_u(0, 0, mod.i32.add(mod.i32.add(gb(), mod.i32.const(12)), gi()))),
             mod.return(mod.i32.const(0))),
           mod.local.set(4, mod.i32.add(gi(), mod.i32.const(1))),
           mod.br('eq_loop'),
@@ -1211,8 +1240,8 @@ export function buildIoFunctions(mod, ioBase) {
     const getLen = () => mod.local.get(2, i32);
     const getPtr = () => mod.local.get(3, i32);
     const body = mod.block(null, [
-      mod.local.set(2, mod.i32.load(0, 0, getStr())),
-      mod.local.set(3, mod.i32.add(getStr(), mod.i32.const(8))),
+      mod.local.set(2, mod.i32.load(4, 0, getStr())),            // len at offset 4
+      mod.local.set(3, mod.i32.add(getStr(), mod.i32.const(12))), // bytes at offset 12
       mod.i32.store(0, 0, mod.i32.const(ioBase),     getPtr()),
       mod.i32.store(0, 0, mod.i32.const(ioBase + 4), getLen()),
       mod.drop(mod.call('fd_write', [
@@ -1231,8 +1260,8 @@ export function buildIoFunctions(mod, ioBase) {
     const getLen = () => mod.local.get(2, i32);
     const getPtr = () => mod.local.get(3, i32);
     const body = mod.block(null, [
-      mod.local.set(2, mod.i32.load(0, 0, getStr())),
-      mod.local.set(3, mod.i32.add(getStr(), mod.i32.const(8))),
+      mod.local.set(2, mod.i32.load(4, 0, getStr())),            // len at offset 4
+      mod.local.set(3, mod.i32.add(getStr(), mod.i32.const(12))), // bytes at offset 12
       mod.i32.store(0, 0, mod.i32.const(ioBase),      getPtr()),
       mod.i32.store(0, 0, mod.i32.const(ioBase + 4),  getLen()),
       mod.i32.store(0, 0, mod.i32.const(ioBase + 8),  mod.i32.const(ioBase + 32)),
@@ -1287,12 +1316,18 @@ export function buildIoFunctions(mod, ioBase) {
         mod.i32.const(ioBase + 24),
       ], i32)),
       mod.local.set(2, mod.i32.load(0, 0, mod.i32.const(ioBase + 24))),
-      mod.if(mod.i32.eqz(getNread()), mod.return(mod.i32.const(0))),
+      mod.if(mod.i32.eqz(getNread()), mod.block(null, [
+        mod.call('__jswat_free_bytes', [getBuf(), getSz()], none),
+        mod.return(mod.i32.const(0)),
+      ], none)),
+      // Allocate str with 12-byte header: [rc:4][len:4][hash:4][bytes...]
       mod.local.set(3, mod.call('__jswat_alloc',
-        [mod.i32.add(getNread(), mod.i32.const(8))], i32)),
-      mod.i32.store(0, 0, getStr(), getNread()),
-      mod.i32.store(4, 0, getStr(), mod.i32.const(0)),
-      mod.memory.copy(mod.i32.add(getStr(), mod.i32.const(8)), getBuf(), getNread()),
+        [mod.i32.add(getNread(), mod.i32.const(12))], i32)),
+      mod.i32.store(0, 0, getStr(), mod.i32.const(1)),   // rc = 1
+      mod.i32.store(4, 0, getStr(), getNread()),          // len at 4
+      mod.i32.store(8, 0, getStr(), mod.i32.const(0)),   // hash at 8
+      mod.memory.copy(mod.i32.add(getStr(), mod.i32.const(12)), getBuf(), getNread()),
+      mod.call('__jswat_free_bytes', [getBuf(), getSz()], none),
       mod.return(getStr()),
     ], i32);
     mod.addFunction('__jswat_stdin_read',
@@ -1328,12 +1363,18 @@ export function buildIoFunctions(mod, ioBase) {
           mod.br('read'),
         ], none)),
       ], none),
-      mod.if(mod.i32.eqz(getTotal()), mod.return(mod.i32.const(0))),
+      mod.if(mod.i32.eqz(getTotal()), mod.block(null, [
+        mod.call('__jswat_free_bytes', [getBuf(), mod.i32.const(1024)], none),
+        mod.return(mod.i32.const(0)),
+      ], none)),
+      // Allocate str with 12-byte header: [rc:4][len:4][hash:4][bytes...]
       mod.local.set(3, mod.call('__jswat_alloc',
-        [mod.i32.add(getTotal(), mod.i32.const(8))], i32)),
-      mod.i32.store(0, 0, getStr(), getTotal()),
-      mod.i32.store(4, 0, getStr(), mod.i32.const(0)),
-      mod.memory.copy(mod.i32.add(getStr(), mod.i32.const(8)), getBuf(), getTotal()),
+        [mod.i32.add(getTotal(), mod.i32.const(12))], i32)),
+      mod.i32.store(0, 0, getStr(), mod.i32.const(1)),   // rc = 1
+      mod.i32.store(4, 0, getStr(), getTotal()),          // len at 4
+      mod.i32.store(8, 0, getStr(), mod.i32.const(0)),   // hash at 8
+      mod.memory.copy(mod.i32.add(getStr(), mod.i32.const(12)), getBuf(), getTotal()),
+      mod.call('__jswat_free_bytes', [getBuf(), mod.i32.const(1024)], none),
       mod.return(getStr()),
     ], i32);
     mod.addFunction('__jswat_stdin_read_line',
@@ -1378,12 +1419,18 @@ export function buildIoFunctions(mod, ioBase) {
           mod.br('read'),
         ], none)),
       ], none),
-      mod.if(mod.i32.eqz(getTotal()), mod.return(mod.i32.const(0))),
+      mod.if(mod.i32.eqz(getTotal()), mod.block(null, [
+        mod.call('__jswat_free_bytes', [getBuf(), getCap()], none),
+        mod.return(mod.i32.const(0)),
+      ], none)),
+      // Allocate str with 12-byte header: [rc:4][len:4][hash:4][bytes...]
       mod.local.set(5, mod.call('__jswat_alloc',
-        [mod.i32.add(getTotal(), mod.i32.const(8))], i32)),
-      mod.i32.store(0, 0, getStr(), getTotal()),
-      mod.i32.store(4, 0, getStr(), mod.i32.const(0)),
-      mod.memory.copy(mod.i32.add(getStr(), mod.i32.const(8)), getBuf(), getTotal()),
+        [mod.i32.add(getTotal(), mod.i32.const(12))], i32)),
+      mod.i32.store(0, 0, getStr(), mod.i32.const(1)),   // rc = 1
+      mod.i32.store(4, 0, getStr(), getTotal()),          // len at 4
+      mod.i32.store(8, 0, getStr(), mod.i32.const(0)),   // hash at 8
+      mod.memory.copy(mod.i32.add(getStr(), mod.i32.const(12)), getBuf(), getTotal()),
+      mod.call('__jswat_free_bytes', [getBuf(), getCap()], none),
       mod.return(getStr()),
     ], i32);
     mod.addFunction('__jswat_stdin_read_all',
@@ -1406,8 +1453,8 @@ export function buildFsFunctions(mod, fsBase) {
     return mod.call('path_open', [
       mod.i32.const(3),
       mod.i32.const(0),
-      mod.i32.add(getPath(), mod.i32.const(8)),
-      mod.i32.load(0, 0, getPath()),
+      mod.i32.add(getPath(), mod.i32.const(12)),  // bytes at offset 12
+      mod.i32.load(4, 0, getPath()),               // len at offset 4
       mod.i32.const(oflags),
       mod.i64.const(511, 0),
       mod.i64.const(511, 0),
@@ -1440,10 +1487,12 @@ export function buildFsFunctions(mod, fsBase) {
       mod.drop(mod.call('fd_close', [getFd()], i32)),
       mod.if(mod.i32.eqz(getNread()), mod.return(mod.i32.const(0))),
       mod.local.set(4, mod.call('__jswat_alloc',
-        [mod.i32.add(getNread(), mod.i32.const(8))], i32)),
-      mod.i32.store(0, 0, getStr(), getNread()),
-      mod.i32.store(4, 0, getStr(), mod.i32.const(0)),
-      mod.memory.copy(mod.i32.add(getStr(), mod.i32.const(8)), getBuf(), getNread()),
+        [mod.i32.add(getNread(), mod.i32.const(12))], i32)),
+      mod.i32.store(0, 0, getStr(), mod.i32.const(1)),   // rc = 1
+      mod.i32.store(4, 0, getStr(), getNread()),          // len at 4
+      mod.i32.store(8, 0, getStr(), mod.i32.const(0)),   // hash at 8
+      mod.memory.copy(mod.i32.add(getStr(), mod.i32.const(12)), getBuf(), getNread()),
+      mod.call('__jswat_free_bytes', [getBuf(), mod.i32.const(4096)], none),
       mod.return(getStr()),
     ], i32);
     mod.addFunction('__jswat_fs_read',
@@ -1463,9 +1512,9 @@ export function buildFsFunctions(mod, fsBase) {
       ),
       mod.local.set(2, mod.i32.load(0, 0, mod.i32.const(fsBase))),
       mod.i32.store(0, 0, mod.i32.const(fsBase + 4),
-        mod.i32.add(getContent(), mod.i32.const(8))),
+        mod.i32.add(getContent(), mod.i32.const(12))),  // bytes at offset 12
       mod.i32.store(0, 0, mod.i32.const(fsBase + 8),
-        mod.i32.load(0, 0, getContent())),
+        mod.i32.load(4, 0, getContent())),               // len at offset 4
       mod.drop(mod.call('fd_write', [
         getFd(), mod.i32.const(fsBase + 4), mod.i32.const(1), mod.i32.const(fsBase + 12),
       ], i32)),
@@ -1489,9 +1538,9 @@ export function buildFsFunctions(mod, fsBase) {
       ),
       mod.local.set(2, mod.i32.load(0, 0, mod.i32.const(fsBase))),
       mod.i32.store(0, 0, mod.i32.const(fsBase + 4),
-        mod.i32.add(getContent(), mod.i32.const(8))),
+        mod.i32.add(getContent(), mod.i32.const(12))),  // bytes at offset 12
       mod.i32.store(0, 0, mod.i32.const(fsBase + 8),
-        mod.i32.load(0, 0, getContent())),
+        mod.i32.load(4, 0, getContent())),               // len at offset 4
       mod.drop(mod.call('fd_write', [
         getFd(), mod.i32.const(fsBase + 4), mod.i32.const(1), mod.i32.const(fsBase + 12),
       ], i32)),
@@ -1510,8 +1559,8 @@ export function buildFsFunctions(mod, fsBase) {
       mod.return(mod.i32.eqz(mod.call('path_filestat_get', [
         mod.i32.const(3),
         mod.i32.const(0),
-        mod.i32.add(getPath(), mod.i32.const(8)),
-        mod.i32.load(0, 0, getPath()),
+        mod.i32.add(getPath(), mod.i32.const(12)),  // bytes at offset 12
+        mod.i32.load(4, 0, getPath()),               // len at offset 4
         mod.i32.const(fsBase + 32),
       ], i32))));
   }
@@ -1523,8 +1572,8 @@ export function buildFsFunctions(mod, fsBase) {
       binaryen.createType([i32]), i32, [],
       mod.return(mod.i32.eqz(mod.call('path_unlink_file', [
         mod.i32.const(3),
-        mod.i32.add(getPath(), mod.i32.const(8)),
-        mod.i32.load(0, 0, getPath()),
+        mod.i32.add(getPath(), mod.i32.const(12)),  // bytes at offset 12
+        mod.i32.load(4, 0, getPath()),               // len at offset 4
       ], i32))));
   }
 
@@ -1535,8 +1584,8 @@ export function buildFsFunctions(mod, fsBase) {
       binaryen.createType([i32]), i32, [],
       mod.return(mod.i32.eqz(mod.call('path_create_directory', [
         mod.i32.const(3),
-        mod.i32.add(getPath(), mod.i32.const(8)),
-        mod.i32.load(0, 0, getPath()),
+        mod.i32.add(getPath(), mod.i32.const(12)),  // bytes at offset 12
+        mod.i32.load(4, 0, getPath()),               // len at offset 4
       ], i32))));
   }
 
@@ -2010,6 +2059,199 @@ export function buildIterFunctions(mod) {
     ], none);
     mod.addFunction('__jswat_iter_for_each', binaryen.createType([i32, i32]), none, [i32], body);
   }
+
+  // ── __jswat_iter_skip(iter:i32, n:i32) -> i32 ────────────────────────────
+  // Returns a new TakeIter-style iter that skips n elements.
+  // Implemented as: advance n times, then return original iter.
+  // params: iter(0:i32), n(1:i32); locals: rem(2:i32), val(3:i32)
+  {
+    const giter = () => mod.local.get(0, i32);
+    const gn    = () => mod.local.get(1, i32);
+    const grem  = () => mod.local.get(2, i32);
+    const gval  = () => mod.local.get(3, i32);
+    const body = mod.block(null, [
+      mod.local.set(2, gn()),
+      mod.block('skip_done', [
+        mod.loop('skip_loop', mod.block(null, [
+          mod.br_if('skip_done', mod.i32.eqz(grem())),
+          mod.local.set(3, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('skip_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.local.set(2, mod.i32.sub(grem(), mod.i32.const(1))),
+          mod.br('skip_loop'),
+        ], none)),
+      ], none),
+      mod.return(giter()),
+    ], i32);
+    mod.addFunction('__jswat_iter_skip', binaryen.createType([i32, i32]), i32, [i32, i32], body);
+  }
+
+  // ── __jswat_iter_sum(iter:i32) -> i32 ────────────────────────────────────
+  // params: iter(0:i32); locals: acc(1:i32), val(2:i32)
+  {
+    const giter = () => mod.local.get(0, i32);
+    const gacc  = () => mod.local.get(1, i32);
+    const gval  = () => mod.local.get(2, i32);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.i32.const(0)),
+      mod.block('sum_done', [
+        mod.loop('sum_loop', mod.block(null, [
+          mod.local.set(2, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('sum_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.local.set(1, mod.i32.add(gacc(), gval())),
+          mod.br('sum_loop'),
+        ], none)),
+      ], none),
+      mod.return(gacc()),
+    ], i32);
+    mod.addFunction('__jswat_iter_sum', binaryen.createType([i32]), i32, [i32, i32], body);
+  }
+
+  // ── __jswat_iter_reduce(iter:i32, fn_idx:i32, init:i32) -> i32 ───────────
+  // params: iter(0:i32), fn_idx(1:i32), init(2:i32); locals: acc(3:i32), val(4:i32)
+  {
+    const giter   = () => mod.local.get(0, i32);
+    const gfn_idx = () => mod.local.get(1, i32);
+    const ginit   = () => mod.local.get(2, i32);
+    const gacc    = () => mod.local.get(3, i32);
+    const gval    = () => mod.local.get(4, i32);
+    const body = mod.block(null, [
+      mod.local.set(3, ginit()),
+      mod.block('red_done', [
+        mod.loop('red_loop', mod.block(null, [
+          mod.local.set(4, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('red_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.local.set(3, mod.call_indirect('0', gfn_idx(), [gacc(), gval()],
+            binaryen.createType([i32, i32]), i32)),
+          mod.br('red_loop'),
+        ], none)),
+      ], none),
+      mod.return(gacc()),
+    ], i32);
+    mod.addFunction('__jswat_iter_reduce', binaryen.createType([i32, i32, i32]), i32, [i32, i32], body);
+  }
+
+  // ── __jswat_iter_find(iter:i32, fn_idx:i32) -> i32  (-1 if not found) ────
+  // params: iter(0:i32), fn_idx(1:i32); locals: val(2:i32)
+  {
+    const giter   = () => mod.local.get(0, i32);
+    const gfn_idx = () => mod.local.get(1, i32);
+    const gval    = () => mod.local.get(2, i32);
+    const body = mod.block(null, [
+      mod.block('find_done', [
+        mod.loop('find_loop', mod.block(null, [
+          mod.local.set(2, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('find_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.if(
+            mod.call_indirect('0', gfn_idx(), [gval()],
+              binaryen.createType([i32]), i32),
+            mod.return(gval())),
+          mod.br('find_loop'),
+        ], none)),
+      ], none),
+      mod.return(mod.i32.const(-1)),
+    ], i32);
+    mod.addFunction('__jswat_iter_find', binaryen.createType([i32, i32]), i32, [i32], body);
+  }
+
+  // ── __jswat_iter_any(iter:i32, fn_idx:i32) -> i32  (1=true, 0=false) ────
+  // params: iter(0:i32), fn_idx(1:i32); locals: val(2:i32)
+  {
+    const giter   = () => mod.local.get(0, i32);
+    const gfn_idx = () => mod.local.get(1, i32);
+    const gval    = () => mod.local.get(2, i32);
+    const body = mod.block(null, [
+      mod.block('any_done', [
+        mod.loop('any_loop', mod.block(null, [
+          mod.local.set(2, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('any_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.if(
+            mod.call_indirect('0', gfn_idx(), [gval()],
+              binaryen.createType([i32]), i32),
+            mod.return(mod.i32.const(1))),
+          mod.br('any_loop'),
+        ], none)),
+      ], none),
+      mod.return(mod.i32.const(0)),
+    ], i32);
+    mod.addFunction('__jswat_iter_any', binaryen.createType([i32, i32]), i32, [i32], body);
+  }
+
+  // ── __jswat_iter_all(iter:i32, fn_idx:i32) -> i32  (1=true, 0=false) ────
+  // params: iter(0:i32), fn_idx(1:i32); locals: val(2:i32)
+  {
+    const giter   = () => mod.local.get(0, i32);
+    const gfn_idx = () => mod.local.get(1, i32);
+    const gval    = () => mod.local.get(2, i32);
+    const body = mod.block(null, [
+      mod.block('all_done', [
+        mod.loop('all_loop', mod.block(null, [
+          mod.local.set(2, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('all_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.if(
+            mod.i32.eqz(mod.call_indirect('0', gfn_idx(), [gval()],
+              binaryen.createType([i32]), i32)),
+            mod.return(mod.i32.const(0))),
+          mod.br('all_loop'),
+        ], none)),
+      ], none),
+      mod.return(mod.i32.const(1)),
+    ], i32);
+    mod.addFunction('__jswat_iter_all', binaryen.createType([i32, i32]), i32, [i32], body);
+  }
+
+  // ── __jswat_iter_min(iter:i32) -> i32  (-1 if empty) ────────────────────
+  // params: iter(0:i32); locals: best(1:i32), val(2:i32), first(3:i32)
+  {
+    const giter  = () => mod.local.get(0, i32);
+    const gbest  = () => mod.local.get(1, i32);
+    const gval   = () => mod.local.get(2, i32);
+    const gfirst = () => mod.local.get(3, i32);
+    const body = mod.block(null, [
+      mod.local.set(3, mod.i32.const(1)),  // first = true
+      mod.block('min_done', [
+        mod.loop('min_loop', mod.block(null, [
+          mod.local.set(2, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('min_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.if(
+            mod.i32.or(gfirst(), mod.i32.lt_s(gval(), gbest())),
+            mod.block(null, [
+              mod.local.set(1, gval()),
+              mod.local.set(3, mod.i32.const(0)),
+            ], none)),
+          mod.br('min_loop'),
+        ], none)),
+      ], none),
+      mod.return(mod.if(gfirst(), mod.i32.const(-1), gbest(), binaryen.i32)),
+    ], i32);
+    mod.addFunction('__jswat_iter_min', binaryen.createType([i32]), i32, [i32, i32, i32], body);
+  }
+
+  // ── __jswat_iter_max(iter:i32) -> i32  (-1 if empty) ────────────────────
+  // params: iter(0:i32); locals: best(1:i32), val(2:i32), first(3:i32)
+  {
+    const giter  = () => mod.local.get(0, i32);
+    const gbest  = () => mod.local.get(1, i32);
+    const gval   = () => mod.local.get(2, i32);
+    const gfirst = () => mod.local.get(3, i32);
+    const body = mod.block(null, [
+      mod.local.set(3, mod.i32.const(1)),  // first = true
+      mod.block('max_done', [
+        mod.loop('max_loop', mod.block(null, [
+          mod.local.set(2, mod.call('__jswat_iter_next', [giter()], i32)),
+          mod.br_if('max_done', mod.i32.eq(gval(), mod.i32.const(-1))),
+          mod.if(
+            mod.i32.or(gfirst(), mod.i32.gt_s(gval(), gbest())),
+            mod.block(null, [
+              mod.local.set(1, gval()),
+              mod.local.set(3, mod.i32.const(0)),
+            ], none)),
+          mod.br('max_loop'),
+        ], none)),
+      ], none),
+      mod.return(mod.if(gfirst(), mod.i32.const(-1), gbest(), binaryen.i32)),
+    ], i32);
+    mod.addFunction('__jswat_iter_max', binaryen.createType([i32]), i32, [i32, i32, i32], body);
+  }
 }
 
 // ── std/random ────────────────────────────────────────────────────────────────
@@ -2305,6 +2547,49 @@ export function buildRcFunctions(mod) {
     mod.addFunction('__jswat_rc_dec',
       binaryen.createType([i32]), none, [i32, i32, i32], body);
   }
+
+  // __jswat_str_rc_inc(ptr: i32) -> void
+  // Sentinel: rc = 0xFFFFFFFF (-1 as i32) means pinned static str; never increment.
+  // params: ptr(0); locals: rc(1)
+  {
+    const getPtr = () => mod.local.get(0, i32);
+    const getRc  = () => mod.local.get(1, i32);
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(getPtr()), mod.return()),
+      mod.local.set(1, mod.i32.load(0, 0, getPtr())),
+      mod.if(mod.i32.eq(getRc(), mod.i32.const(-1)), mod.return()),  // sentinel: pinned
+      mod.i32.store(0, 0, getPtr(), mod.i32.add(getRc(), mod.i32.const(1))),
+    ], none);
+    mod.addFunction('__jswat_str_rc_inc',
+      binaryen.createType([i32]), none, [i32], body);
+  }
+
+  // __jswat_str_rc_dec(ptr: i32) -> void
+  // When rc hits 0: free(ptr, len + 12).
+  // params: ptr(0); locals: rc(1), newRc(2), len(3)
+  {
+    const getPtr   = () => mod.local.get(0, i32);
+    const getRc    = () => mod.local.get(1, i32);
+    const getNewRc = () => mod.local.get(2, i32);
+    const getLen   = () => mod.local.get(3, i32);
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(getPtr()), mod.return()),
+      mod.local.set(1, mod.i32.load(0, 0, getPtr())),
+      mod.if(mod.i32.eq(getRc(), mod.i32.const(-1)), mod.return()),  // sentinel: pinned
+      mod.local.set(2, mod.i32.sub(getRc(), mod.i32.const(1))),
+      mod.if(
+        mod.i32.eqz(getNewRc()),
+        mod.block(null, [
+          mod.local.set(3, mod.i32.load(4, 0, getPtr())),             // len at offset 4
+          mod.call('__jswat_free', [getPtr(),
+            mod.i32.add(getLen(), mod.i32.const(12))], none),
+        ], none),
+        mod.i32.store(0, 0, getPtr(), getNewRc()),
+      ),
+    ], none);
+    mod.addFunction('__jswat_str_rc_dec',
+      binaryen.createType([i32]), none, [i32, i32, i32], body);
+  }
 }
 
 // ── String parsing ────────────────────────────────────────────────────────────
@@ -2312,7 +2597,7 @@ export function buildRcFunctions(mod) {
 /**
  * Build __jswat_parse_i32 and __jswat_parse_f64 for str→number casts.
  *
- * String layout: [len:4][hash:4][bytes...]  — ptr points to offset 0.
+ * String layout: [rc:4][len:4][hash:4][bytes...]  — ptr points to offset 0.
  *
  * @param {any} mod  binaryen Module
  */
@@ -2327,13 +2612,11 @@ export function buildParseFunctions(mod) {
     const getCh     = () => mod.local.get(3, i32);
     const getResult = () => mod.local.get(4, i32);
     const getNeg    = () => mod.local.get(5, i32);
-    // base = ptr + 4 (skip len field; hash field at +4 is also skipped, actual bytes start at ptr+8)
-    // Wait — string layout is [len:4][hash:4][bytes...], ptr points to the string header.
-    // So bytes start at ptr+8.
-    const getBase   = () => mod.i32.add(getPtr(), mod.i32.const(8));
+    // String layout: [rc:4][len:4][hash:4][bytes...], bytes start at ptr+12
+    const getBase   = () => mod.i32.add(getPtr(), mod.i32.const(12));
     const body = mod.block(null, [
       mod.if(mod.i32.eqz(getPtr()), mod.return(mod.i32.const(0))),
-      mod.local.set(1, mod.i32.load(0, 0, getPtr())),   // len = str[0]
+      mod.local.set(1, mod.i32.load(4, 0, getPtr())),   // len at offset 4
       mod.local.set(2, mod.i32.const(0)),                // i = 0
       mod.local.set(4, mod.i32.const(0)),                // result = 0
       mod.local.set(5, mod.i32.const(0)),                // neg = 0
@@ -2399,10 +2682,10 @@ export function buildParseFunctions(mod) {
     const getFrac    = () => mod.local.get(5, f64);
     const getFracDiv = () => mod.local.get(6, f64);
     const getNeg     = () => mod.local.get(7, i32);
-    const getBase    = () => mod.i32.add(getPtr(), mod.i32.const(8));
+    const getBase    = () => mod.i32.add(getPtr(), mod.i32.const(12));
     const body = mod.block(null, [
       mod.if(mod.i32.eqz(getPtr()), mod.return(mod.f64.const(0))),
-      mod.local.set(1, mod.i32.load(0, 0, getPtr())),
+      mod.local.set(1, mod.i32.load(4, 0, getPtr())),  // len at offset 4
       mod.local.set(2, mod.i32.const(0)),
       mod.local.set(4, mod.f64.const(0)),
       mod.local.set(5, mod.f64.const(0)),
@@ -2479,5 +2762,370 @@ export function buildParseFunctions(mod) {
     ], f64);
     mod.addFunction('__jswat_parse_f64',
       binaryen.createType([i32]), f64, [i32, i32, i32, f64, f64, f64, i32], body);
+  }
+}
+
+// ── std/process ───────────────────────────────────────────────────────────────
+
+/**
+ * Build Process runtime functions.
+ * @param {any} mod  binaryen Module
+ * @param {boolean} isUnknown  true for wasm32-unknown target
+ */
+export function buildProcessFunctions(mod, isUnknown) {
+  // __jswat_process_exit(code:i32) -> void
+  // wasip1: call proc_exit; unknown: unreachable (trap)
+  {
+    const body = isUnknown
+      ? mod.unreachable()
+      : mod.block(null, [
+          mod.call('proc_exit', [mod.local.get(0, i32)], none),
+          mod.unreachable(),
+        ], none);
+    mod.addFunction('__jswat_process_exit',
+      binaryen.createType([i32]), none, [], body);
+  }
+
+  // __jswat_process_env(name:i32) -> i32 (str ptr, or 0 if not found)
+  // Returns 0 (null) — full WASI environ_get deferred
+  mod.addFunction('__jswat_process_env',
+    binaryen.createType([i32]), i32, [],
+    mod.return(mod.i32.const(0)));
+
+  // __jswat_process_args() -> i32 (str ptr, or 0)
+  // Returns 0 (null) — full WASI args_get deferred
+  mod.addFunction('__jswat_process_args',
+    binaryen.createType([]), i32, [],
+    mod.return(mod.i32.const(0)));
+}
+
+// ── std/encoding ──────────────────────────────────────────────────────────────
+
+/**
+ * Build Base64 and UTF8 encoding runtime functions.
+ * @param {any} mod  binaryen Module
+ */
+export function buildEncodingFunctions(mod) {
+  // Base64 alphabet: A-Z a-z 0-9 + /  (64 chars)
+  // Stored as a data segment at compile time; we compute offsets from the str.
+
+  // __jswat_base64_encode(src:i32) -> i32 (new str ptr)
+  // str layout: [rc:4][len:4][hash:4][bytes...]
+  // Output length: ceil(len/3)*4 + padding
+  {
+    // params: src(0); locals: slen(1), olen(2), out(3), si(4), oi(5), b0(6), b1(7), b2(8)
+    const getSrc   = () => mod.local.get(0, i32);
+    const getSlen  = () => mod.local.get(1, i32);
+    const getOlen  = () => mod.local.get(2, i32);
+    const getOut   = () => mod.local.get(3, i32);
+    const getSi    = () => mod.local.get(4, i32);
+    const getOi    = () => mod.local.get(5, i32);
+    const getB0    = () => mod.local.get(6, i32);
+    const getB1    = () => mod.local.get(7, i32);
+    const getB2    = () => mod.local.get(8, i32);
+    const srcBytes = () => mod.i32.add(getSrc(), mod.i32.const(12));
+    const outBytes = () => mod.i32.add(getOut(), mod.i32.const(12));
+
+    // Base64 table: each index maps to an ASCII character code
+    const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    /** @param {number} idx */
+    const b64char = (idx) => {
+      // inline 64-entry lookup via nested i32.select or just a function call
+      // Simplest: compute from the index
+      // 0-25 → 65-90 (A-Z), 26-51 → 97-122 (a-z), 52-61 → 48-57 (0-9), 62 → 43 (+), 63 → 47 (/)
+      return mod.if(
+        mod.i32.lt_u(idx, mod.i32.const(26)),
+        mod.i32.add(idx, mod.i32.const(65)),   // A-Z
+        mod.if(
+          mod.i32.lt_u(idx, mod.i32.const(52)),
+          mod.i32.add(idx, mod.i32.const(71)),  // a-z: idx-26+97 = idx+71
+          mod.if(
+            mod.i32.lt_u(idx, mod.i32.const(62)),
+            mod.i32.sub(idx, mod.i32.const(4)), // 0-9: idx-52+48 = idx-4
+            mod.if(
+              mod.i32.eq(idx, mod.i32.const(62)),
+              mod.i32.const(43),               // +
+              mod.i32.const(47),               // /
+              i32
+            ),
+            i32
+          ),
+          i32
+        ),
+        i32
+      );
+    };
+
+    const writeChar = (outIdx, val) =>
+      mod.i32.store8(0, 0, mod.i32.add(outBytes(), outIdx), val);
+
+    const body = mod.block(null, [
+      // if src == 0, return 0
+      mod.if(mod.i32.eqz(getSrc()), mod.return(mod.i32.const(0))),
+      // slen = src[4]  (len field)
+      mod.local.set(1, mod.i32.load(4, 0, getSrc())),
+      // olen = ((slen + 2) / 3) * 4
+      mod.local.set(2, mod.i32.mul(
+        mod.i32.div_u(mod.i32.add(getSlen(), mod.i32.const(2)), mod.i32.const(3)),
+        mod.i32.const(4)
+      )),
+      // out = alloc(olen + 12)
+      mod.local.set(3, mod.call('__jswat_alloc', [mod.i32.add(getOlen(), mod.i32.const(12))], i32)),
+      // write header: rc=1, len=olen, hash=0
+      mod.i32.store(0, 0, getOut(), mod.i32.const(1)),
+      mod.i32.store(4, 0, getOut(), getOlen()),
+      mod.i32.store(8, 0, getOut(), mod.i32.const(0)),
+      // si=0, oi=0
+      mod.local.set(4, mod.i32.const(0)),
+      mod.local.set(5, mod.i32.const(0)),
+      // encode loop
+      mod.block('enc_done', [
+        mod.loop('enc_loop', mod.block(null, [
+          mod.br_if('enc_done', mod.i32.ge_u(getSi(), getSlen())),
+          // b0 = src[si]
+          mod.local.set(6, mod.i32.load8_u(0, 0, mod.i32.add(srcBytes(), getSi()))),
+          // b1 = si+1 < slen ? src[si+1] : 0
+          mod.local.set(7, mod.if(
+            mod.i32.lt_u(mod.i32.add(getSi(), mod.i32.const(1)), getSlen()),
+            mod.i32.load8_u(0, 0, mod.i32.add(srcBytes(), mod.i32.add(getSi(), mod.i32.const(1)))),
+            mod.i32.const(0),
+            i32
+          )),
+          // b2 = si+2 < slen ? src[si+2] : 0
+          mod.local.set(8, mod.if(
+            mod.i32.lt_u(mod.i32.add(getSi(), mod.i32.const(2)), getSlen()),
+            mod.i32.load8_u(0, 0, mod.i32.add(srcBytes(), mod.i32.add(getSi(), mod.i32.const(2)))),
+            mod.i32.const(0),
+            i32
+          )),
+          // out[oi] = b64[(b0>>2) & 0x3F]
+          writeChar(getOi(), b64char(mod.i32.shr_u(getB0(), mod.i32.const(2)))),
+          // out[oi+1] = b64[((b0&3)<<4)|(b1>>4)]
+          writeChar(mod.i32.add(getOi(), mod.i32.const(1)),
+            b64char(mod.i32.or(
+              mod.i32.shl(mod.i32.and(getB0(), mod.i32.const(3)), mod.i32.const(4)),
+              mod.i32.shr_u(getB1(), mod.i32.const(4))
+            ))),
+          // out[oi+2] = si+1 < slen ? b64[((b1&0xF)<<2)|(b2>>6)] : '='
+          writeChar(mod.i32.add(getOi(), mod.i32.const(2)), mod.if(
+            mod.i32.lt_u(mod.i32.add(getSi(), mod.i32.const(1)), getSlen()),
+            b64char(mod.i32.or(
+              mod.i32.shl(mod.i32.and(getB1(), mod.i32.const(15)), mod.i32.const(2)),
+              mod.i32.shr_u(getB2(), mod.i32.const(6))
+            )),
+            mod.i32.const(61), // '='
+            i32
+          )),
+          // out[oi+3] = si+2 < slen ? b64[b2&0x3F] : '='
+          writeChar(mod.i32.add(getOi(), mod.i32.const(3)), mod.if(
+            mod.i32.lt_u(mod.i32.add(getSi(), mod.i32.const(2)), getSlen()),
+            b64char(mod.i32.and(getB2(), mod.i32.const(63))),
+            mod.i32.const(61), // '='
+            i32
+          )),
+          mod.local.set(4, mod.i32.add(getSi(), mod.i32.const(3))),
+          mod.local.set(5, mod.i32.add(getOi(), mod.i32.const(4))),
+          mod.br('enc_loop'),
+        ], none)),
+      ]),
+      mod.return(getOut()),
+    ], i32);
+    mod.addFunction('__jswat_base64_encode',
+      binaryen.createType([i32]), i32, [i32, i32, i32, i32, i32, i32, i32, i32], body);
+  }
+
+  // __jswat_base64_decode(src:i32) -> i32 (new str ptr with decoded bytes)
+  {
+    // params: src(0); locals: slen(1), olen(2), out(3), si(4), oi(5),
+    //         c0(6), c1(7), c2(8), c3(9), v0(10), v1(11), v2(12), v3(13)
+    const getSrc   = () => mod.local.get(0, i32);
+    const getSlen  = () => mod.local.get(1, i32);
+    const getOlen  = () => mod.local.get(2, i32);
+    const getOut   = () => mod.local.get(3, i32);
+    const getSi    = () => mod.local.get(4, i32);
+    const getOi    = () => mod.local.get(5, i32);
+    const getC0    = () => mod.local.get(6, i32);
+    const getC1    = () => mod.local.get(7, i32);
+    const getC2    = () => mod.local.get(8, i32);
+    const getC3    = () => mod.local.get(9, i32);
+    const getV0    = () => mod.local.get(10, i32);
+    const getV1    = () => mod.local.get(11, i32);
+    const getV2    = () => mod.local.get(12, i32);
+    const getV3    = () => mod.local.get(13, i32);
+    const srcBytes = () => mod.i32.add(getSrc(), mod.i32.const(12));
+    const outBytes = () => mod.i32.add(getOut(), mod.i32.const(12));
+
+    // Decode a base64 char to 0-63 (returns 0 for padding '=')
+    const b64val = (ch) => mod.if(
+      mod.i32.and(mod.i32.ge_u(ch, mod.i32.const(65)), mod.i32.le_u(ch, mod.i32.const(90))),
+      mod.i32.sub(ch, mod.i32.const(65)),          // A-Z → 0-25
+      mod.if(
+        mod.i32.and(mod.i32.ge_u(ch, mod.i32.const(97)), mod.i32.le_u(ch, mod.i32.const(122))),
+        mod.i32.sub(ch, mod.i32.const(71)),         // a-z → 26-51
+        mod.if(
+          mod.i32.and(mod.i32.ge_u(ch, mod.i32.const(48)), mod.i32.le_u(ch, mod.i32.const(57))),
+          mod.i32.add(ch, mod.i32.const(4)),         // 0-9 → 52-61
+          mod.if(
+            mod.i32.eq(ch, mod.i32.const(43)),
+            mod.i32.const(62),                       // + → 62
+            mod.i32.const(63),                       // / or = → 63/0
+            i32
+          ),
+          i32
+        ),
+        i32
+      ),
+      i32
+    );
+
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(getSrc()), mod.return(mod.i32.const(0))),
+      mod.local.set(1, mod.i32.load(4, 0, getSrc())),
+      // olen = (slen / 4) * 3, minus padding '=' chars at end
+      mod.local.set(2, mod.i32.mul(
+        mod.i32.div_u(getSlen(), mod.i32.const(4)), mod.i32.const(3)
+      )),
+      // Subtract 1 for each trailing '=' padding char (up to 2)
+      mod.if(mod.i32.and(
+        mod.i32.gt_u(getSlen(), mod.i32.const(0)),
+        mod.i32.eq(mod.i32.load8_u(0, 0, mod.i32.add(srcBytes(), mod.i32.sub(getSlen(), mod.i32.const(1)))), mod.i32.const(61))
+      ), mod.local.set(2, mod.i32.sub(getOlen(), mod.i32.const(1)))),
+      mod.if(mod.i32.and(
+        mod.i32.gt_u(getSlen(), mod.i32.const(1)),
+        mod.i32.eq(mod.i32.load8_u(0, 0, mod.i32.add(srcBytes(), mod.i32.sub(getSlen(), mod.i32.const(2)))), mod.i32.const(61))
+      ), mod.local.set(2, mod.i32.sub(getOlen(), mod.i32.const(1)))),
+      mod.local.set(3, mod.call('__jswat_alloc', [mod.i32.add(getOlen(), mod.i32.const(12))], i32)),
+      mod.i32.store(0, 0, getOut(), mod.i32.const(1)),
+      mod.i32.store(4, 0, getOut(), getOlen()),
+      mod.i32.store(8, 0, getOut(), mod.i32.const(0)),
+      mod.local.set(4, mod.i32.const(0)),
+      mod.local.set(5, mod.i32.const(0)),
+      mod.block('dec_done', [
+        mod.loop('dec_loop', mod.block(null, [
+          mod.br_if('dec_done', mod.i32.ge_u(mod.i32.add(getSi(), mod.i32.const(3)), getSlen())),
+          // read 4 chars
+          mod.local.set(6,  mod.i32.load8_u(0, 0, mod.i32.add(srcBytes(), getSi()))),
+          mod.local.set(7,  mod.i32.load8_u(0, 0, mod.i32.add(srcBytes(), mod.i32.add(getSi(), mod.i32.const(1))))),
+          mod.local.set(8,  mod.i32.load8_u(0, 0, mod.i32.add(srcBytes(), mod.i32.add(getSi(), mod.i32.const(2))))),
+          mod.local.set(9,  mod.i32.load8_u(0, 0, mod.i32.add(srcBytes(), mod.i32.add(getSi(), mod.i32.const(3))))),
+          mod.local.set(10, b64val(getC0())),
+          mod.local.set(11, b64val(getC1())),
+          mod.local.set(12, b64val(getC2())),
+          mod.local.set(13, b64val(getC3())),
+          // byte0 = (v0<<2) | (v1>>4)
+          mod.i32.store8(0, 0, mod.i32.add(outBytes(), getOi()),
+            mod.i32.or(mod.i32.shl(getV0(), mod.i32.const(2)), mod.i32.shr_u(getV1(), mod.i32.const(4)))),
+          // byte1 = ((v1&0xF)<<4) | (v2>>2) — only if c2 != '='
+          mod.if(mod.i32.ne(getC2(), mod.i32.const(61)),
+            mod.i32.store8(0, 0, mod.i32.add(outBytes(), mod.i32.add(getOi(), mod.i32.const(1))),
+              mod.i32.or(mod.i32.shl(mod.i32.and(getV1(), mod.i32.const(15)), mod.i32.const(4)),
+                         mod.i32.shr_u(getV2(), mod.i32.const(2))))),
+          // byte2 = ((v2&3)<<6) | v3 — only if c3 != '='
+          mod.if(mod.i32.ne(getC3(), mod.i32.const(61)),
+            mod.i32.store8(0, 0, mod.i32.add(outBytes(), mod.i32.add(getOi(), mod.i32.const(2))),
+              mod.i32.or(mod.i32.shl(mod.i32.and(getV2(), mod.i32.const(3)), mod.i32.const(6)), getV3()))),
+          mod.local.set(4, mod.i32.add(getSi(), mod.i32.const(4))),
+          mod.local.set(5, mod.i32.add(getOi(), mod.i32.const(3))),
+          mod.br('dec_loop'),
+        ], none)),
+      ]),
+      mod.return(getOut()),
+    ], i32);
+    mod.addFunction('__jswat_base64_decode',
+      binaryen.createType([i32]), i32,
+      [i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32], body);
+  }
+
+  // __jswat_utf8_validate(s:i32) -> i32 (bool)
+  // Checks that the str bytes form valid UTF-8 sequences.
+  {
+    // params: s(0); locals: len(1), i(2), b(3), cont(4)
+    const getS    = () => mod.local.get(0, i32);
+    const getLen  = () => mod.local.get(1, i32);
+    const getI    = () => mod.local.get(2, i32);
+    const getB    = () => mod.local.get(3, i32);
+    const getCont = () => mod.local.get(4, i32);
+    const sBytes  = () => mod.i32.add(getS(), mod.i32.const(12));
+
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(getS()), mod.return(mod.i32.const(1))), // null → valid
+      mod.local.set(1, mod.i32.load(4, 0, getS())),
+      mod.local.set(2, mod.i32.const(0)),
+      mod.local.set(4, mod.i32.const(0)), // expected continuation bytes
+      mod.block('val_done', [
+        mod.loop('val_loop', mod.block(null, [
+          mod.br_if('val_done', mod.i32.ge_u(getI(), getLen())),
+          mod.local.set(3, mod.i32.load8_u(0, 0, mod.i32.add(sBytes(), getI()))),
+          mod.if(
+            mod.i32.gt_u(getCont(), mod.i32.const(0)),
+            // expecting continuation byte: must be 10xxxxxx
+            mod.block(null, [
+              mod.if(
+                mod.i32.ne(mod.i32.and(getB(), mod.i32.const(0xC0)), mod.i32.const(0x80)),
+                mod.return(mod.i32.const(0))),
+              mod.local.set(4, mod.i32.sub(getCont(), mod.i32.const(1))),
+            ], none),
+            // lead byte
+            mod.if(
+              mod.i32.lt_u(getB(), mod.i32.const(0x80)),
+              mod.nop(), // ASCII
+              mod.if(
+                mod.i32.eq(mod.i32.and(getB(), mod.i32.const(0xE0)), mod.i32.const(0xC0)),
+                mod.local.set(4, mod.i32.const(1)), // 2-byte
+                mod.if(
+                  mod.i32.eq(mod.i32.and(getB(), mod.i32.const(0xF0)), mod.i32.const(0xE0)),
+                  mod.local.set(4, mod.i32.const(2)), // 3-byte
+                  mod.if(
+                    mod.i32.eq(mod.i32.and(getB(), mod.i32.const(0xF8)), mod.i32.const(0xF0)),
+                    mod.local.set(4, mod.i32.const(3)), // 4-byte
+                    mod.return(mod.i32.const(0))        // invalid lead byte
+                  )
+                )
+              )
+            )
+          ),
+          mod.local.set(2, mod.i32.add(getI(), mod.i32.const(1))),
+          mod.br('val_loop'),
+        ], none)),
+      ]),
+      // valid if no pending continuation bytes
+      mod.return(mod.i32.eqz(getCont())),
+    ], i32);
+    mod.addFunction('__jswat_utf8_validate',
+      binaryen.createType([i32]), i32, [i32, i32, i32, i32], body);
+  }
+
+  // __jswat_utf8_char_count(s:i32) -> i32 (number of Unicode codepoints)
+  {
+    // params: s(0); locals: len(1), i(2), b(3), count(4)
+    const getS     = () => mod.local.get(0, i32);
+    const getLen   = () => mod.local.get(1, i32);
+    const getI     = () => mod.local.get(2, i32);
+    const getB     = () => mod.local.get(3, i32);
+    const getCount = () => mod.local.get(4, i32);
+    const sBytes   = () => mod.i32.add(getS(), mod.i32.const(12));
+
+    const body = mod.block(null, [
+      mod.if(mod.i32.eqz(getS()), mod.return(mod.i32.const(0))),
+      mod.local.set(1, mod.i32.load(4, 0, getS())),
+      mod.local.set(2, mod.i32.const(0)),
+      mod.local.set(4, mod.i32.const(0)),
+      mod.block('cc_done', [
+        mod.loop('cc_loop', mod.block(null, [
+          mod.br_if('cc_done', mod.i32.ge_u(getI(), getLen())),
+          mod.local.set(3, mod.i32.load8_u(0, 0, mod.i32.add(sBytes(), getI()))),
+          // count codepoint start bytes: not a UTF-8 continuation byte (10xxxxxx)
+          mod.if(
+            mod.i32.ne(mod.i32.and(getB(), mod.i32.const(0xC0)), mod.i32.const(0x80)),
+            mod.local.set(4, mod.i32.add(getCount(), mod.i32.const(1)))
+          ),
+          mod.local.set(2, mod.i32.add(getI(), mod.i32.const(1))),
+          mod.br('cc_loop'),
+        ], none)),
+      ]),
+      mod.return(getCount()),
+    ], i32);
+    mod.addFunction('__jswat_utf8_char_count',
+      binaryen.createType([i32]), i32, [i32, i32, i32, i32], body);
   }
 }

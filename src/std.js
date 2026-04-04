@@ -66,6 +66,23 @@ export const STD_NAMESPACES = {
       sleep: { params: [TYPES.isize], returnType: TYPES.void, stub: '__jswat_clock_sleep' },
     },
   },
+  'std/process': {
+    Process: {
+      exit: { params: [TYPES.i32], returnType: TYPES.void, stub: '__jswat_process_exit' },
+      env:  { params: [TYPES.str], returnType: TYPES.str,  stub: '__jswat_process_env'  },
+      args: { params: [],          returnType: TYPES.str,  stub: '__jswat_process_args' },
+    },
+  },
+  'std/encoding': {
+    Base64: {
+      encode: { params: [TYPES.str], returnType: TYPES.str,  stub: '__jswat_base64_encode' },
+      decode: { params: [TYPES.str], returnType: TYPES.str,  stub: '__jswat_base64_decode' },
+    },
+    UTF8: {
+      validate:  { params: [TYPES.str], returnType: TYPES.bool,  stub: '__jswat_utf8_validate'    },
+      charCount: { params: [TYPES.str], returnType: TYPES.usize, stub: '__jswat_utf8_char_count'  },
+    },
+  },
   'std/collections': {
     Map: {
       set: { params: [TYPES.Map, TYPES.str, TYPES.isize], returnType: TYPES.void, stub: '__jswat_map_set' },

@@ -81,11 +81,11 @@ export function collectLocals(body, params) {
     locals.push({ name: '__tmp_f64', type: TYPES.f64 });
   }
 
-  // Collect heap-typed locals (class/array) for RC management.
+  // Collect heap-typed locals (class/array/str) for RC management.
   // Only non-param locals can be owned by the function.
   const heapLocals = new Map();
   for (const { name, type } of locals) {
-    if (type?.kind === 'class' || type?.kind === 'array') {
+    if (type?.kind === 'class' || type?.kind === 'array' || type?.name === 'str') {
       heapLocals.set(name, type);
     }
   }
@@ -342,9 +342,17 @@ export function genExpr(node, filename, ctx) {
             case 'map':    return mod.call('__jswat_iter_map',     [objExpr, ...argExprs], binaryen.i32);
             case 'filter': return mod.call('__jswat_iter_filter',  [objExpr, ...argExprs], binaryen.i32);
             case 'take':   return mod.call('__jswat_iter_take',    [objExpr, ...argExprs], binaryen.i32);
+            case 'skip':   return mod.call('__jswat_iter_skip',    [objExpr, ...argExprs], binaryen.i32);
             case 'collect':return mod.call('__jswat_iter_collect', [objExpr], binaryen.i32);
             case 'count':  return mod.call('__jswat_iter_count',   [objExpr], binaryen.i32);
+            case 'sum':    return mod.call('__jswat_iter_sum',     [objExpr], binaryen.i32);
+            case 'min':    return mod.call('__jswat_iter_min',     [objExpr], binaryen.i32);
+            case 'max':    return mod.call('__jswat_iter_max',     [objExpr], binaryen.i32);
             case 'forEach':return mod.call('__jswat_iter_for_each',[objExpr, ...argExprs], binaryen.none);
+            case 'find':   return mod.call('__jswat_iter_find',    [objExpr, ...argExprs], binaryen.i32);
+            case 'any':    return mod.call('__jswat_iter_any',     [objExpr, ...argExprs], binaryen.i32);
+            case 'all':    return mod.call('__jswat_iter_all',     [objExpr, ...argExprs], binaryen.i32);
+            case 'reduce': return mod.call('__jswat_iter_reduce',  [objExpr, ...argExprs], binaryen.i32);
             default: throw new CodegenError(`Unknown iter method '${methodName}' (${filename})`);
           }
         }
@@ -386,6 +394,14 @@ export function genExpr(node, filename, ctx) {
               if (expected && actual && expected !== actual) return genCast(mod, expr, actual, expected);
               return expr;
             });
+            // Pad missing args with zero/empty defaults
+            while (argExprs.length < (std.params?.length ?? 0)) {
+              const pt = std.params[argExprs.length];
+              if (pt?.name === 'str') argExprs.push(mod.i32.const(ctx._strings?.get('') ?? 0));
+              else if (pt?.wasmType === 'f64') argExprs.push(mod.f64.const(0));
+              else if (pt?.wasmType === 'i64') argExprs.push(mod.i64.const(0, 0));
+              else argExprs.push(mod.i32.const(0));
+            }
             const retType = node._type ? toBinType(node._type) : binaryen.none;
             return mod.call(std.stub, argExprs, retType);
           }
@@ -619,7 +635,7 @@ export function genExpr(node, filename, ctx) {
         return mod.call('__jswat_array_length', [genExpr(node.object, filename, ctx)], binaryen.i32);
       }
       if (!node.computed && objType?.kind === 'str' && node.property?.name === 'length') {
-        return mod.i32.load(0, 0, genExpr(node.object, filename, ctx));
+        return mod.i32.load(4, 0, genExpr(node.object, filename, ctx));  // len at offset 4 in 12-byte header
       }
       // Static field/getter access: ClassName.field or ClassName.#field
       if (!node.computed && objType?.kind === 'class') {

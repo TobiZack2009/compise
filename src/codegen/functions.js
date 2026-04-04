@@ -37,7 +37,7 @@ export function astHasArray(ast) {
 
 /**
  * Build string data segments and address map.
- * Layout: [len:4][hash:4][bytes...]
+ * Layout: [rc:4][len:4][hash:4][bytes...]  (12-byte header; rc=0xFFFFFFFF = pinned sentinel)
  * @param {object} ast
  * @returns {{ map: Map<string, number>, segments: Array<{data: Uint8Array, offset: number}>, size: number }}
  */
@@ -53,7 +53,7 @@ export function buildStringTable(ast) {
       if (!strings.has(node.value)) {
         const bytes = encoder.encode(node.value);
         const len = bytes.length;
-        const total = 8 + len;
+        const total = 12 + len;
         strings.set(node.value, { offset, bytes, len });
         offset += total;
       }
@@ -64,7 +64,7 @@ export function buildStringTable(ast) {
       if (!strings.has(cooked)) {
         const bytes = encoder.encode(cooked);
         const len = bytes.length;
-        const total = 8 + len;
+        const total = 12 + len;
         strings.set(cooked, { offset, bytes, len });
         offset += total;
       }
@@ -87,11 +87,12 @@ export function buildStringTable(ast) {
   const map = new Map();
   for (const [value, info] of strings.entries()) {
     map.set(value, info.offset);
-    const bytes = new Uint8Array(8 + info.len);
+    const bytes = new Uint8Array(12 + info.len);
     const dv = new DataView(bytes.buffer);
-    dv.setUint32(0, info.len, true);
-    dv.setUint32(4, 0, true);
-    bytes.set(info.bytes, 8);
+    dv.setUint32(0, 0xFFFFFFFF, true); // rc = pinned sentinel (never freed)
+    dv.setUint32(4, info.len, true);   // len at offset 4
+    dv.setUint32(8, 0, true);          // hash at offset 8
+    bytes.set(info.bytes, 12);         // bytes at offset 12
     segments.push({ data: bytes, offset: info.offset });
   }
   return { map, segments, size: offset };

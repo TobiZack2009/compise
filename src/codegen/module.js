@@ -13,6 +13,7 @@ import {
   buildCollectionsFunctions, buildWasiImports, buildIoFunctions, buildFsFunctions,
   buildClockFunctions, buildRandomFunctions, buildMathFunctions, buildIterFunctions,
   buildPoolFunctions, buildArenaFunctions, buildRcFunctions, buildParseFunctions,
+  buildProcessFunctions, buildEncodingFunctions,
 } from './runtime.js';
 import { astHasArray, buildStringTable, genFunction, genMethod, genConstructor, genStaticMethod } from './functions.js';
 import { collectLocals } from './expressions.js';
@@ -26,11 +27,12 @@ import { genStatement } from './statements.js';
  * @param {Map<string, object>} classes
  * @param {Map} imports
  * @param {string} [filename='<input>']
- * @param {{ stdModules?: Array<{ ast: object, filename: string }> }} [opts]
- * @returns {{ wat: string, binary: Uint8Array }}
+ * @param {{ stdModules?: Array<{ ast: object, filename: string }>, target?: string, lib?: boolean }} [opts]
+ * @returns {{ wat: string, binary: Uint8Array, layoutMap: object }}
  */
 export function generateWat(ast, signatures, classes, imports, filename = '<input>', opts = {}) {
-  const { stdModules = [] } = opts;
+  const { stdModules = [], target = 'wasm32-wasip1', lib = false } = opts;
+  const isUnknown = target === 'wasm32-unknown';
   const mod = new binaryen.Module();
 
   // ── Class layouts ─────────────────────────────────────────────────────────
@@ -61,6 +63,7 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
 
   function astHasStrMethods(node) {
     if (!node || typeof node !== 'object') return false;
+    if (node.type === 'TemplateLiteral') return true; // template literals use __jswat_str_concat
     if (node.type === 'CallExpression' && node.callee?.type === 'MemberExpression') {
       const m = node.callee.property?.name;
       if (['slice','indexOf','concat','charAt','startsWith','endsWith','includes','equals'].includes(m) &&
@@ -134,8 +137,12 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   const hasPool = Array.from(signatures.values()).some(sig => sig.external?.name?.startsWith('__jswat_pool_'));
   const hasArena = Array.from(signatures.values()).some(sig => sig.external?.name?.startsWith('__jswat_arena_'));
 
+  const hasProcess  = Array.from(stdStubs).some(n => n.startsWith('__jswat_process_'));
+  const hasEncoding = Array.from(stdStubs).some(n =>
+    n.startsWith('__jswat_base64_') || n.startsWith('__jswat_utf8_'));
+
   // ── WASI imports ──────────────────────────────────────────────────────────
-  buildWasiImports(mod, hasIo, hasFs, hasClock, hasRandom);
+  if (!isUnknown) buildWasiImports(mod, hasIo, hasFs, hasClock, hasRandom, hasProcess);
 
   // ── @external imports from std modules ────────────────────────────────────
   // Track already-imported names to avoid duplicates (binaryen throws on dupes)
@@ -169,10 +176,10 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   buildParseFunctions(mod);
 
   // ── Runtime functions ─────────────────────────────────────────────────────
-  if (hasIo)          buildIoFunctions(mod, ioBase);
-  if (hasFs)          buildFsFunctions(mod, ioBase + 64);
-  if (hasClock)       buildClockFunctions(mod, ioBase + 128);
-  if (hasRandom)      buildRandomFunctions(mod, ioBase + 192);
+  if (!isUnknown && hasIo)     buildIoFunctions(mod, ioBase);
+  if (!isUnknown && hasFs)     buildFsFunctions(mod, ioBase + 64);
+  if (!isUnknown && hasClock)  buildClockFunctions(mod, ioBase + 128);
+  if (!isUnknown && hasRandom) buildRandomFunctions(mod, ioBase + 192);
   if (hasMem)         buildMemFunctions(mod);
   if (hasString)      buildStringFunctions(mod);
   if (hasArray)       buildArrayFunctions(mod);
@@ -181,14 +188,16 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   if (hasIter)        { if (!hasArray) buildArrayFunctions(mod); buildIterFunctions(mod); }
   if (hasPool)        buildPoolFunctions(mod);
   if (hasArena)       buildArenaFunctions(mod);
+  if (hasProcess)     buildProcessFunctions(mod, isUnknown);
+  if (hasEncoding)    buildEncodingFunctions(mod);
 
   // ── Std stubs (no-ops for unused imports) ─────────────────────────────────
   for (const stub of stdStubs) {
-    if (hasIo && (stub.includes('console') || stub.includes('stdout') ||
+    if (hasIo && !isUnknown && (stub.includes('console') || stub.includes('stdout') ||
                   stub.includes('stderr')  || stub.includes('stdin'))) continue;
-    if (hasFs   && stub.startsWith('__jswat_fs_'))       continue;
-    if (hasClock  && stub.startsWith('__jswat_clock_'))  continue;
-    if (hasRandom && stub.startsWith('__jswat_random_')) continue;
+    if (hasFs   && !isUnknown && stub.startsWith('__jswat_fs_'))       continue;
+    if (hasClock  && !isUnknown && stub.startsWith('__jswat_clock_'))  continue;
+    if (hasRandom && !isUnknown && stub.startsWith('__jswat_random_')) continue;
     if (hasMem  && (stub.startsWith('__jswat_alloc_') || stub.startsWith('__jswat_ptr_'))) continue;
     if (hasString && stub.startsWith('__jswat_string_')) continue;
     if (hasCollections && (
@@ -198,8 +207,10 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
       stub.startsWith('__jswat_stack_') ||
       stub.startsWith('__jswat_deque_')
     )) continue;
-    if (hasMath && stub.startsWith('__jswat_math_')) continue;
-    if (hasIter && stub.startsWith('__jswat_iter_')) continue;
+    if (hasMath     && stub.startsWith('__jswat_math_'))    continue;
+    if (hasIter     && stub.startsWith('__jswat_iter_'))    continue;
+    if (hasProcess  && stub.startsWith('__jswat_process_')) continue;
+    if (hasEncoding && (stub.startsWith('__jswat_base64_') || stub.startsWith('__jswat_utf8_'))) continue;
     buildStdStub(mod, stub);
   }
 
@@ -230,6 +241,16 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
       } catch (_) { /* getFunction not available or other error — proceed */ }
       const paramTypes = sig.params.map(p => toBinType(p.type));
       const retType    = toBinType(sig.returnType);
+      if (isUnknown) {
+        // wasm32-unknown: emit a no-op stub directly — no WASI external to call
+        const body = retType === binaryen.none ? mod.nop()
+                   : mod.return(retType === binaryen.f64 ? mod.f64.const(0)
+                              : retType === binaryen.f32 ? mod.f32.const(0)
+                              : retType === binaryen.i64 ? mod.i64.const(0, 0)
+                              : mod.i32.const(0));
+        mod.addFunction(internalName, binaryen.createType(paramTypes), retType, [], body);
+        continue;
+      }
       const paramRefs  = sig.params.map((_, i) => mod.local.get(i, paramTypes[i]));
       const callExpr   = mod.call(externalName, paramRefs, retType);
       const body       = retType === binaryen.none ? callExpr : mod.return(callExpr);
@@ -312,14 +333,14 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
     mod.addActiveElementSegment('0', 'elems', fnTable, mod.i32.const(0));
   }
 
-  // ── Top-level statements → __start / _start ───────────────────────────────
+  // ── Top-level statements → __start / _start (or __jswat_init for lib/unknown) ──
   const topLevelStmts = ast.body.filter(n =>
     n.type !== 'FunctionDeclaration' &&
     n.type !== 'ClassDeclaration'    &&
     n.type !== 'ImportDeclaration'
   );
 
-  if (topLevelStmts.length > 0) {
+  if (topLevelStmts.length > 0 && !lib) {
     const fakeBlock = { type: 'BlockStatement', body: topLevelStmts };
     const { locals, heapLocals: startHeapLocals } = collectLocals(fakeBlock, []);
 
@@ -338,10 +359,18 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
       startCtx._varTypes, startBody);
     mod.addFunctionExport('__start', '__start');
 
-    mod.addFunction('_start',
-      binaryen.createType([]), binaryen.none, [],
-      mod.call('__start', [], binaryen.none));
-    mod.addFunctionExport('_start', '_start');
+    if (isUnknown) {
+      // wasm32-unknown: export __jswat_init instead of _start
+      mod.addFunction('__jswat_init',
+        binaryen.createType([]), binaryen.none, [],
+        mod.call('__start', [], binaryen.none));
+      mod.addFunctionExport('__jswat_init', '__jswat_init');
+    } else {
+      mod.addFunction('_start',
+        binaryen.createType([]), binaryen.none, [],
+        mod.call('__start', [], binaryen.none));
+      mod.addFunctionExport('_start', '_start');
+    }
   }
 
   // ── Emit ──────────────────────────────────────────────────────────────────
@@ -350,5 +379,17 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   const binary = mod.emitBinary();
   mod.dispose();
 
-  return { wat, binary };
+  // ── Build layoutMap for --emit-layout ─────────────────────────────────────
+  const layoutMap = {};
+  for (const [name, layout] of layouts.entries()) {
+    layoutMap[name] = {
+      size: layout.size,
+      classId: layout.classId,
+      fields: Object.fromEntries(
+        Array.from(layout.fields.entries()).map(([fn, fi]) => [fn, { offset: fi.offset, type: fi.type?.name ?? fi.type?.kind ?? 'i32' }])
+      ),
+    };
+  }
+
+  return { wat, binary, layoutMap };
 }

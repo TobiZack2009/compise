@@ -21,9 +21,10 @@ import { genExpr, genExprStatement } from './expressions.js';
 export function genHeapCleanup(ctx, skipLocal) {
   const mod = ctx.mod;
   const stmts = [];
-  for (const [name] of ctx._heapLocals) {
+  for (const [name, type] of ctx._heapLocals) {
     if (name === skipLocal) continue;
-    stmts.push(mod.call('__jswat_rc_dec', [ctx.localGet(name)], binaryen.none));
+    const rcDecFn = type?.name === 'str' ? '__jswat_str_rc_dec' : '__jswat_rc_dec';
+    stmts.push(mod.call(rcDecFn, [ctx.localGet(name)], binaryen.none));
     stmts.push(ctx.localSet(name, mod.i32.const(0)));
   }
   return stmts;
@@ -110,7 +111,8 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
           if (isHeapType(decl.init._type) &&
               decl.init.type !== 'NewExpression' &&
               decl.init.type !== 'CallExpression') {
-            stmts.push(mod.call('__jswat_rc_inc', [ctx.localGet(decl.id.name)], binaryen.none));
+            const rcIncFn = decl.init._type?.name === 'str' ? '__jswat_str_rc_inc' : '__jswat_rc_inc';
+            stmts.push(mod.call(rcIncFn, [ctx.localGet(decl.id.name)], binaryen.none));
           }
         }
       }

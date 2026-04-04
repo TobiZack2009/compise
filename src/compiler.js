@@ -11,7 +11,7 @@ import { generateWat } from './codegen/index.js';
 import { ModuleResolver } from './resolver.js';
 
 /**
- * @typedef {{ wat: string, wasm: Uint8Array|null, warnings: string[] }} CompileResult
+ * @typedef {{ wat: string, wasm: Uint8Array|null, warnings: string[], layoutMap?: object }} CompileResult
  */
 
 // Lazy-initialised wabt singleton
@@ -63,11 +63,11 @@ export async function wasmToWat(wasmBuffer) {
  * Compile js.wat source text directly (without reading from disk).
  * @param {string} source  js.wat source
  * @param {string} [filename='<input>']
- * @param {{ checkOnly?: boolean, readFile?: ((path: string) => string) | null, stdRoot?: string | null }} [opts]
+ * @param {{ checkOnly?: boolean, readFile?: ((path: string) => string) | null, stdRoot?: string | null, target?: string, lib?: boolean }} [opts]
  * @returns {Promise<CompileResult>}
  */
 export async function compileSource(source, filename = '<input>', opts = {}) {
-  const { checkOnly = false, readFile = null, stdRoot = null } = opts;
+  const { checkOnly = false, readFile = null, stdRoot = null, target = 'wasm32-wasip1', lib = false } = opts;
 
   // 1. Parse
   const ast = parseSource(source, filename);
@@ -96,9 +96,9 @@ export async function compileSource(source, filename = '<input>', opts = {}) {
   }
 
   // 5. Code generation + assemble (binaryen emits binary directly)
-  const { wat, binary: wasm } =
-    generateWat(typedAst, signatures, classes, imports, filename, { stdModules });
+  const { wat, binary: wasm, layoutMap } =
+    generateWat(typedAst, signatures, classes, imports, filename, { stdModules, target, lib });
 
-  return { wat, wasm, warnings };
+  return { wat, wasm, warnings, layoutMap };
 }
 
