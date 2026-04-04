@@ -194,12 +194,13 @@ function buildAllocBytesFn(mod) {
 
   const body = mod.block(null, [
     mod.local.set(3, mod.i32.add(getN(), mod.i32.const(4))),
-    // ptr = alloc(size); then fill ptr+4..ptr+4+n with fill
+    // ptr = alloc(size)
+    mod.local.set(2, mod.call('__jswat_alloc', [getSize()], binaryen.i32)),
+    // store n in header so __jswat_free_bytes_auto can recover the size
+    mod.i32.store(0, 0, getPtr(), getN()),
+    // fill ptr+4..ptr+4+n with fill
     mod.memory.fill(
-      mod.i32.add(
-        mod.local.tee(2, mod.call('__jswat_alloc', [getSize()], binaryen.i32), binaryen.i32),
-        mod.i32.const(4)
-      ),
+      mod.i32.add(getPtr(), mod.i32.const(4)),
       getFill(),
       getN()
     ),
@@ -232,6 +233,30 @@ function buildFreeBytesFn(mod) {
     [binaryen.i32, binaryen.i32],
     body);
   mod.addFunctionExport('__jswat_free_bytes', '__jswat_free_bytes');
+}
+
+function buildFreeByteAutoFn(mod) {
+  // params: dataPtr(0)
+  // vars: hdr(1), n(2), size(3)
+  // Reads n from the 4-byte header stored by __jswat_alloc_bytes, then frees.
+  const getDataPtr = () => mod.local.get(0, binaryen.i32);
+  const getHdr     = () => mod.local.get(1, binaryen.i32);
+  const getN       = () => mod.local.get(2, binaryen.i32);
+  const getSize    = () => mod.local.get(3, binaryen.i32);
+
+  const body = mod.block(null, [
+    mod.if(mod.i32.eqz(getDataPtr()), mod.return()),
+    mod.local.set(1, mod.i32.sub(getDataPtr(), mod.i32.const(4))),  // hdr = dataPtr - 4
+    mod.local.set(2, mod.i32.load(0, 0, getHdr())),                  // n = *(hdr)
+    mod.local.set(3, mod.i32.add(getN(), mod.i32.const(4))),         // size = n + 4
+    mod.call('__jswat_free', [getHdr(), getSize()], binaryen.none),
+  ], binaryen.none);
+
+  mod.addFunction('__jswat_free_bytes_auto',
+    binaryen.createType([binaryen.i32]), binaryen.none,
+    [binaryen.i32, binaryen.i32, binaryen.i32],
+    body);
+  mod.addFunctionExport('__jswat_free_bytes_auto', '__jswat_free_bytes_auto');
 }
 
 function buildReallocFn(mod) {
@@ -280,6 +305,7 @@ export function buildAllocator(mod) {
   buildFreeFn(mod);
   buildAllocBytesFn(mod);
   buildFreeBytesFn(mod);
+  buildFreeByteAutoFn(mod);
   buildReallocFn(mod);
 
   // __alloc / __free wrappers

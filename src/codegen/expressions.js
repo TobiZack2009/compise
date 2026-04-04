@@ -53,6 +53,15 @@ export function collectLocals(body, params) {
         node.left?._type?.kind === 'str') { needsTmp = true; needsStrScratch = true; }
     // Detect str-producing operations that require the scratch pair
     if (node.type === 'TemplateLiteral') needsStrScratch = true;
+    // Cast of str from function call: isize(fn_returning_str()) needs __tmp + __str_tmp to free the buffer
+    if (node.type === 'CallExpression' &&
+        node.callee?.type === 'Identifier' &&
+        TYPES[node.callee.name] && !TYPES[node.callee.name]?.abstract &&
+        node.arguments?.[0]?.type === 'CallExpression' &&
+        node.arguments[0]?._type?.kind === 'str') {
+      needsTmp = true;
+      needsStrScratch = true;
+    }
     if (node.type === 'ForOfStatement') {
       const id = forOfCounter++;
       node._forOfId = id;
@@ -348,8 +357,33 @@ export function genExpr(node, filename, ctx) {
         }
         const castTarget = TYPES[callee.name];
         if (castTarget && !castTarget.abstract) {
-          const argExpr = genExpr(node.arguments[0], filename, ctx);
-          const srcType = node.arguments[0]?._type;
+          const arg = node.arguments[0];
+          const srcType = arg?._type;
+          // str from a function call: parse then free the heap buffer to avoid leaking
+          if (srcType?.kind === 'str' && (castTarget.isInteger || castTarget.isFloat) &&
+              arg?.type === 'CallExpression') {
+            const strPtrExpr = genExpr(arg, filename, ctx);
+            const lenExpr = mod.global.get('__str_len_out', binaryen.i32);
+            // local.tee saves ptr to __str_tmp and passes it to the parse call
+            const savedPtr = ctx.localTee('__str_tmp', strPtrExpr);
+            if (castTarget.isFloat) {
+              const parsedF64 = mod.call('__jswat_parse_f64', [savedPtr, lenExpr], binaryen.f64);
+              return mod.block(null, [
+                ctx.localSet('__tmp_f64', parsedF64),
+                mod.call('__jswat_free_bytes_auto', [ctx.localGet('__str_tmp')], binaryen.none),
+                ctx.localGet('__tmp_f64'),
+              ], binaryen.f64);
+            } else {
+              const parsedI32 = mod.call('__jswat_parse_i32', [savedPtr, lenExpr], binaryen.i32);
+              const resultBin = castTarget.wasmType === 'i64' ? binaryen.i64 : binaryen.i32;
+              return mod.block(null, [
+                ctx.localSet('__tmp', parsedI32),
+                mod.call('__jswat_free_bytes_auto', [ctx.localGet('__str_tmp')], binaryen.none),
+                castTarget.wasmType === 'i64' ? mod.i64.extend_s(ctx.localGet('__tmp')) : ctx.localGet('__tmp'),
+              ], resultBin);
+            }
+          }
+          const argExpr = genExpr(arg, filename, ctx);
           return genCast(mod, argExpr, srcType, castTarget);
         }
         const stdFn = resolveStdFunction(ctx._imports, callee.name);
