@@ -6,6 +6,24 @@
 import binaryen from 'binaryen';
 import { TYPES } from '../types.js';
 import { CodegenError, GenContext, toBinType } from './context.js';
+
+/**
+ * Expand str-typed params to two WASM params each: name (ptr) and name__len (len).
+ * This reflects the str fat-pointer calling convention: each str param becomes
+ * two i32 WASM params.
+ * @param {Array<{ name: string, type: import('../types.js').TypeInfo }>} params
+ * @returns {Array<{ name: string, type: import('../types.js').TypeInfo }>}
+ */
+export function expandStrParams(params) {
+  const result = [];
+  for (const p of params) {
+    result.push(p);
+    if (p.type?.kind === 'str') {
+      result.push({ name: p.name + '__len', type: TYPES.isize });
+    }
+  }
+  return result;
+}
 import { collectLocals } from './expressions.js';
 import { genStatement, genHeapCleanup } from './statements.js';
 
@@ -37,14 +55,24 @@ export function astHasArray(ast) {
 
 /**
  * Build string data segments and address map.
- * Layout: [rc:4][len:4][hash:4][bytes...]  (12-byte header; rc=0xFFFFFFFF = pinned sentinel)
+ *
+ * Fat-pointer layout (spec §str): string literals are raw UTF-8 bytes in the
+ * WASM data segment — NO header.  The str fat pointer carries (ptr, len) as
+ * two separate i32 values; ptr points directly at the first byte.
+ *
+ * Memory map:
+ *   [0..3]  reserved null-sentinel region — ptr=0 means null str
+ *   [4..]   string bytes, packed with 4-byte alignment between entries
+ *
  * @param {object} ast
- * @returns {{ map: Map<string, number>, segments: Array<{data: Uint8Array, offset: number}>, size: number }}
+ * @returns {{ map: Map<string, {ptr:number, len:number}>, segments: Array<{data: Uint8Array, offset: number}>, size: number }}
  */
 export function buildStringTable(ast) {
   const encoder = new TextEncoder();
   const strings = new Map();
-  let offset = 8;  // Reserve address 0 as null pointer sentinel
+  // Reserve address 0 as null sentinel; first real string starts at 4.
+  // Even empty string "" gets ptr=4, len=0 (non-null, zero length).
+  let offset = 4;
 
   /** @param {object} node */
   function visit(node) {
@@ -52,10 +80,10 @@ export function buildStringTable(ast) {
     if (node.type === 'Literal' && typeof node.value === 'string') {
       if (!strings.has(node.value)) {
         const bytes = encoder.encode(node.value);
-        const len = bytes.length;
-        const total = 12 + len;
-        strings.set(node.value, { offset, bytes, len });
-        offset += total;
+        strings.set(node.value, { offset, bytes, len: bytes.length });
+        offset += bytes.length;
+        // Align to 4 bytes for the next string
+        if (offset % 4 !== 0) offset += 4 - (offset % 4);
       }
     }
     // Also collect template literal quasi (static) strings
@@ -63,10 +91,9 @@ export function buildStringTable(ast) {
       const cooked = node.value?.cooked ?? '';
       if (!strings.has(cooked)) {
         const bytes = encoder.encode(cooked);
-        const len = bytes.length;
-        const total = 12 + len;
-        strings.set(cooked, { offset, bytes, len });
-        offset += total;
+        strings.set(cooked, { offset, bytes, len: bytes.length });
+        offset += bytes.length;
+        if (offset % 4 !== 0) offset += 4 - (offset % 4);
       }
     }
     for (const key of Object.keys(node)) {
@@ -86,14 +113,11 @@ export function buildStringTable(ast) {
   const segments = [];
   const map = new Map();
   for (const [value, info] of strings.entries()) {
-    map.set(value, info.offset);
-    const bytes = new Uint8Array(12 + info.len);
-    const dv = new DataView(bytes.buffer);
-    dv.setUint32(0, 0xFFFFFFFF, true); // rc = pinned sentinel (never freed)
-    dv.setUint32(4, info.len, true);   // len at offset 4
-    dv.setUint32(8, 0, true);          // hash at offset 8
-    bytes.set(info.bytes, 12);         // bytes at offset 12
-    segments.push({ data: bytes, offset: info.offset });
+    map.set(value, { ptr: info.offset, len: info.len });
+    if (info.len > 0) {
+      // Only emit a data segment if there are actual bytes to write
+      segments.push({ data: info.bytes, offset: info.offset });
+    }
   }
   return { map, segments, size: offset };
 }
@@ -132,8 +156,9 @@ export function genFunction(node, mod, signatures, classes, layouts, imports, st
   const sig  = signatures.get(name);
   if (!sig) throw new CodegenError(`No signature for function '${name}' (${filename})`);
 
-  const params    = sig.params.map(p => ({ name: p.name, type: p.type }));
-  const { locals: localVars, heapLocals } = collectLocals(node.body, sig.params);
+  // Expand str params to two WASM params each (ptr + len).
+  const params    = expandStrParams(sig.params.map(p => ({ name: p.name, type: p.type })));
+  const { locals: localVars, heapLocals } = collectLocals(node.body, params);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
   ctx._strings = stringTable.map;
@@ -175,7 +200,7 @@ export function genFunction(node, mod, signatures, classes, layouts, imports, st
  */
 export function genMethod(classInfo, methodName, fnNode, sig, mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames) {
   const name   = `${classInfo.name}_${methodName}`;
-  const params = [{ name: 'this', type: classInfo.type }, ...sig.params.map(p => ({ name: p.name, type: p.type }))];
+  const params = expandStrParams([{ name: 'this', type: classInfo.type }, ...sig.params.map(p => ({ name: p.name, type: p.type }))]);
   const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
@@ -215,7 +240,7 @@ export function genMethod(classInfo, methodName, fnNode, sig, mod, classes, layo
  */
 export function genConstructor(classInfo, fnNode, sig, mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames) {
   const name   = `${classInfo.name}__ctor`;
-  const params = [{ name: 'this', type: classInfo.type }, ...sig.params.map(p => ({ name: p.name, type: p.type }))];
+  const params = expandStrParams([{ name: 'this', type: classInfo.type }, ...sig.params.map(p => ({ name: p.name, type: p.type }))]);
   const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
@@ -243,7 +268,7 @@ export function genConstructor(classInfo, fnNode, sig, mod, classes, layouts, im
 export function genStaticMethod(classInfo, methodName, fnNode, sig, mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames, isGetter) {
   const suffix = isGetter ? `__sg_${methodName}` : `__sm_${methodName}`;
   const name = `${classInfo.name}${suffix}`;
-  const params = sig.params.map(p => ({ name: p.name, type: p.type }));
+  const params = expandStrParams(sig.params.map(p => ({ name: p.name, type: p.type })));
   const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);

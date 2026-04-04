@@ -6,7 +6,7 @@ import binaryen from 'binaryen';
 import { TYPES } from '../types.js';
 import { CodegenError } from './context.js';
 import { genLoad, isHeapType } from './types.js';
-import { genExpr, genExprStatement } from './expressions.js';
+import { genExpr, genExprStatement, genStrExprAsPair } from './expressions.js';
 
 // ── RC heap cleanup helper ─────────────────────────────────────────────────────
 
@@ -23,8 +23,8 @@ export function genHeapCleanup(ctx, skipLocal) {
   const stmts = [];
   for (const [name, type] of ctx._heapLocals) {
     if (name === skipLocal) continue;
-    const rcDecFn = type?.name === 'str' ? '__jswat_str_rc_dec' : '__jswat_rc_dec';
-    stmts.push(mod.call(rcDecFn, [ctx.localGet(name)], binaryen.none));
+    // str is a value-type fat pointer — not heap-managed, never RC-dec'd.
+    stmts.push(mod.call('__jswat_rc_dec', [ctx.localGet(name)], binaryen.none));
     stmts.push(ctx.localSet(name, mod.i32.const(0)));
   }
   return stmts;
@@ -75,6 +75,16 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
 
   switch (stmt.type) {
     case 'ReturnStatement': {
+      // Str-returning functions: set __str_len_out before returning the ptr so callers
+      // using the fat-pointer convention can recover the len.
+      if (stmt.argument && fnReturnType?.kind === 'str') {
+        const [ptrRef, lenRef] = genStrExprAsPair(stmt.argument, filename, ctx);
+        return mod.block(null, [
+          mod.global.set('__str_len_out', lenRef),
+          mod.return(ptrRef),
+        ], binaryen.none);
+      }
+
       const heapLocals = ctx._heapLocals;
       if (!heapLocals || heapLocals.size === 0) {
         return stmt.argument
@@ -105,14 +115,20 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
       const stmts = [];
       for (const decl of stmt.declarations) {
         if (decl.init) {
-          stmts.push(ctx.localSet(decl.id.name, genExpr(decl.init, filename, ctx)));
-          // If copying an existing heap reference (not a NewExpression or CallExpression),
-          // rc_inc the new owner.
-          if (isHeapType(decl.init._type) &&
-              decl.init.type !== 'NewExpression' &&
-              decl.init.type !== 'CallExpression') {
-            const rcIncFn = decl.init._type?.name === 'str' ? '__jswat_str_rc_inc' : '__jswat_rc_inc';
-            stmts.push(mod.call(rcIncFn, [ctx.localGet(decl.id.name)], binaryen.none));
+          if (decl.init._type?.kind === 'str') {
+            // Str fat pointer: set both `name` (ptr) and `name__len` (len).
+            const [ptrRef, lenRef] = genStrExprAsPair(decl.init, filename, ctx);
+            stmts.push(ctx.localSet(decl.id.name, ptrRef));
+            stmts.push(ctx.localSet(decl.id.name + '__len', lenRef));
+          } else {
+            stmts.push(ctx.localSet(decl.id.name, genExpr(decl.init, filename, ctx)));
+            // If copying an existing heap reference (not a NewExpression or CallExpression),
+            // rc_inc the new owner.
+            if (isHeapType(decl.init._type) &&
+                decl.init.type !== 'NewExpression' &&
+                decl.init.type !== 'CallExpression') {
+              stmts.push(mod.call('__jswat_rc_inc', [ctx.localGet(decl.id.name)], binaryen.none));
+            }
           }
         }
       }

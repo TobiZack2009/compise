@@ -17,6 +17,7 @@ import { CodegenError } from './context.js';
  */
 export function typeSize(typeInfo) {
   if (!typeInfo) return 4;
+  if (typeInfo.kind === 'str') return 8;  // fat pointer: ptr:i32 + len:i32
   if (typeInfo.wasmType === 'i64' || typeInfo.wasmType === 'f64') return 8;
   if (typeInfo.wasmType === 'f32') return 4;
   if (typeInfo.kind === 'bool') return 1;
@@ -126,12 +127,15 @@ export function genBinOp(mod, op, typeInfo, left, right) {
 export function genCast(mod, value, src, dst) {
   if (!src || src === dst) return value;
   // str → integer/float: parse string content (must come before same-wasmType short-circuit)
-  if (src.name === 'str' && dst.isInteger) {
-    const parsed = mod.call('__jswat_parse_i32', [value], binaryen.i32);
+  // __str_len_out is set when genExpr evaluates the str argument (see genExpr Identifier/Literal/call)
+  if (src.kind === 'str' && dst.isInteger) {
+    const parsed = mod.call('__jswat_parse_i32',
+      [value, mod.global.get('__str_len_out', binaryen.i32)], binaryen.i32);
     return dst.wasmType === 'i64' ? mod.i64.extend_s(parsed) : parsed;
   }
-  if (src.name === 'str' && dst.isFloat) {
-    return mod.call('__jswat_parse_f64', [value], binaryen.f64);
+  if (src.kind === 'str' && dst.isFloat) {
+    return mod.call('__jswat_parse_f64',
+      [value, mod.global.get('__str_len_out', binaryen.i32)], binaryen.f64);
   }
   // Same WASM type — may still need narrow-type masking
   if (src.wasmType === dst.wasmType) {
@@ -173,11 +177,12 @@ export function genCast(mod, value, src, dst) {
 
 /**
  * Returns true if the type lives on the heap and needs RC management.
+ * str is a value-type fat pointer (ptr, len) — not heap-managed.
  * @param {TypeInfo | undefined} type
  * @returns {boolean}
  */
 export function isHeapType(type) {
-  return type?.kind === 'class' || type?.kind === 'array' || type?.name === 'str';
+  return type?.kind === 'class' || type?.kind === 'array';
 }
 
 /**

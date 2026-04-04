@@ -19,16 +19,17 @@ async function instantiate(source) {
   return instance.exports;
 }
 
-// Decode a str pointer from WASM memory: len at offset 4, bytes at offset 12.
-function readStr(mem, ptr) {
+// Decode a str fat pointer from WASM memory.
+// ptr = raw bytes address; len comes from the __str_len_out exported global.
+function readStr(exports, ptr) {
   if (!ptr) return '';
-  const view = new DataView(mem.buffer);
-  const len  = view.getUint32(ptr + 4, true);
-  return new TextDecoder().decode(new Uint8Array(mem.buffer, ptr + 12, len));
+  const len = exports.__str_len_out.value;
+  if (!len) return '';
+  return new TextDecoder().decode(new Uint8Array(exports.memory.buffer, ptr, len));
 }
 
 describe('std/encoding — Base64 encode', () => {
-  let exp, mem;
+  let exp;
   before(async () => {
     exp = await instantiate(`
       import { Base64 } from 'std/encoding';
@@ -39,22 +40,21 @@ describe('std/encoding — Base64 encode', () => {
       //@export
       function encodeABC()   { return Base64.encode('abc'); }
     `);
-    mem = exp.memory;
   });
 
   it('Base64.encode("hello") → "aGVsbG8="', () => {
-    assert.equal(readStr(mem, exp.encodeHello()), 'aGVsbG8=');
+    assert.equal(readStr(exp, exp.encodeHello()), 'aGVsbG8=');
   });
   it('Base64.encode("") → ""', () => {
-    assert.equal(readStr(mem, exp.encodeEmpty()), '');
+    assert.equal(readStr(exp, exp.encodeEmpty()), '');
   });
   it('Base64.encode("abc") → "YWJj"', () => {
-    assert.equal(readStr(mem, exp.encodeABC()), 'YWJj');
+    assert.equal(readStr(exp, exp.encodeABC()), 'YWJj');
   });
 });
 
 describe('std/encoding — Base64 decode', () => {
-  let exp, mem;
+  let exp;
   before(async () => {
     exp = await instantiate(`
       import { Base64 } from 'std/encoding';
@@ -63,14 +63,13 @@ describe('std/encoding — Base64 decode', () => {
       //@export
       function decodeABC()   { return Base64.decode('YWJj'); }
     `);
-    mem = exp.memory;
   });
 
   it('Base64.decode("aGVsbG8=") → "hello"', () => {
-    assert.equal(readStr(mem, exp.decodeHello()), 'hello');
+    assert.equal(readStr(exp, exp.decodeHello()), 'hello');
   });
   it('Base64.decode("YWJj") → "abc"', () => {
-    assert.equal(readStr(mem, exp.decodeABC()), 'abc');
+    assert.equal(readStr(exp, exp.decodeABC()), 'abc');
   });
 });
 

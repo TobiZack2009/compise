@@ -23,6 +23,7 @@ export function collectLocals(body, params) {
   const locals = [];
   const seen = new Set(paramNames);
   let needsTmp = false;
+  let needsStrScratch = false;
   let forOfCounter = 0;
 
   /** @param {object} node */
@@ -33,12 +34,25 @@ export function collectLocals(body, params) {
       if (!seen.has(name)) {
         seen.add(name);
         locals.push({ name, type: node._type });
+        // Each str-typed local gets a shadow `name__len` local for the fat pointer len.
+        if (node._type?.kind === 'str') {
+          seen.add(name + '__len');
+          locals.push({ name: name + '__len', type: TYPES.isize });
+          needsStrScratch = true;
+        }
       }
     }
     if (node.type === 'NewExpression' || node.type === 'ArrayExpression') needsTmp = true;
     if (node.type === 'MemberExpression' && node.computed) needsTmp = true;
     if (node.type === 'UpdateExpression' && !node.prefix) needsTmp = true;
     if (node.type === 'AssignmentExpression' && node.left?.type === 'MemberExpression') needsTmp = true;
+    // str field read: needs __tmp to save object ptr for double load (ptr + len)
+    if (node.type === 'MemberExpression' && !node.computed && node._type?.kind === 'str') needsTmp = true;
+    // str field write: needs both __tmp (object ptr) and __str_tmp/__str_tmp__len (str ptr/len)
+    if (node.type === 'AssignmentExpression' && node.left?.type === 'MemberExpression' &&
+        node.left?._type?.kind === 'str') { needsTmp = true; needsStrScratch = true; }
+    // Detect str-producing operations that require the scratch pair
+    if (node.type === 'TemplateLiteral') needsStrScratch = true;
     if (node.type === 'ForOfStatement') {
       const id = forOfCounter++;
       node._forOfId = id;
@@ -75,17 +89,29 @@ export function collectLocals(body, params) {
     }
   }
 
+  // Also flag str scratch if any str-typed params exist
+  for (const p of params) {
+    if (p.type?.kind === 'str') needsStrScratch = true;
+  }
+
   visit(body);
   if (needsTmp && !seen.has('__tmp')) {
     locals.push({ name: '__tmp',     type: TYPES.isize });
     locals.push({ name: '__tmp_f64', type: TYPES.f64 });
   }
+  // Str scratch pair: used as accumulator for TemplateLiteral and complex str sub-expressions.
+  if (needsStrScratch && !seen.has('__str_tmp')) {
+    seen.add('__str_tmp');
+    seen.add('__str_tmp__len');
+    locals.push({ name: '__str_tmp',     type: TYPES.isize });
+    locals.push({ name: '__str_tmp__len', type: TYPES.isize });
+  }
 
-  // Collect heap-typed locals (class/array/str) for RC management.
-  // Only non-param locals can be owned by the function.
+  // Collect heap-typed locals (class/array) for RC management.
+  // str is a value-type fat pointer — NOT heap-managed.
   const heapLocals = new Map();
   for (const { name, type } of locals) {
-    if (type?.kind === 'class' || type?.kind === 'array' || type?.name === 'str') {
+    if (type?.kind === 'class' || type?.kind === 'array') {
       heapLocals.set(name, type);
     }
   }
@@ -111,6 +137,39 @@ function sizeClassIdx(size) {
 
 /** Compute initial rc_class word: bits[31:28]=sizeClassIdx, bits[27:0]=1 (initial rc). */
 function computeRcClassInit(size) { return (sizeClassIdx(size) << 28) | 1; }
+
+// ── Str fat-pointer helpers ───────────────────────────────────────────────────
+
+/**
+ * Generate both halves of a str fat pointer for a str-typed expression node.
+ *
+ * Convention:
+ *  - Literal string  → (i32.const dataAddr,   i32.const byteLen)      (compile-time constants)
+ *  - Identifier str  → (localGet(name),        localGet(name + '__len'))
+ *  - Any other expr  → (genExpr(node),         global.get('__str_len_out'))
+ *    The third case relies on str-returning runtime functions setting __str_len_out
+ *    before returning the ptr.  Since WASM evaluates args left-to-right, by the
+ *    time lenRef is consumed the call has already set the global.
+ *
+ * @param {object} node  str-typed AST expression
+ * @param {string} filename
+ * @param {import('./context.js').GenContext} ctx
+ * @returns {[number, number]}  [ptrRef, lenRef]  (both ExpressionRef)
+ */
+export function genStrExprAsPair(node, filename, ctx) {
+  const mod = ctx.mod;
+  if (node.type === 'Literal' && typeof node.value === 'string') {
+    const info = ctx._strings?.get(node.value);
+    if (!info) throw new CodegenError(`Unmapped string literal (${filename})`);
+    return [mod.i32.const(info.ptr), mod.i32.const(info.len)];
+  }
+  if (node.type === 'Identifier' && node._type?.kind === 'str') {
+    return [ctx.localGet(node.name), ctx.localGet(node.name + '__len')];
+  }
+  // Complex expression — evaluate via genExpr, which sets __str_len_out as a side-effect.
+  const ptrRef = genExpr(node, filename, ctx);
+  return [ptrRef, mod.global.get('__str_len_out', binaryen.i32)];
+}
 
 // ── Expression code generation ───────────────────────────────────────────────
 
@@ -187,9 +246,15 @@ export function genExpr(node, filename, ctx) {
       if (node.value === null) return mod.i32.const(0); // null pointer
       const type = node._type;
       if (type?.name === 'str' && typeof node.value === 'string') {
-        const addr = ctx._strings?.get(node.value);
-        if (addr === undefined) throw new CodegenError(`Unmapped string literal (${filename})`);
-        return mod.i32.const(addr);
+        const info = ctx._strings?.get(node.value);
+        if (!info) throw new CodegenError(`Unmapped string literal (${filename})`);
+        // Publish the len to __str_len_out so callers using genStrExprAsPair's
+        // "complex" path (which reads the global) also get the correct len.
+        // The block returns the ptr as its value.
+        return mod.block(null, [
+          mod.global.set('__str_len_out', mod.i32.const(info.len)),
+          mod.i32.const(info.ptr),
+        ], binaryen.i32);
       }
       if (!type || type === TYPES.void) {
         if (typeof node.value === 'number') {
@@ -212,6 +277,13 @@ export function genExpr(node, filename, ctx) {
     case 'Identifier':
       if (node._fnRef && ctx._fnTableMap?.has(node._fnRef)) {
         return mod.i32.const(ctx._fnTableMap.get(node._fnRef));
+      }
+      // For str locals, publish len to __str_len_out so callers (genCast, etc.) can read it
+      if (node._type?.kind === 'str') {
+        return mod.block(null, [
+          mod.global.set('__str_len_out', ctx.localGet(node.name + '__len')),
+          ctx.localGet(node.name),
+        ], binaryen.i32);
       }
       return ctx.localGet(node.name);
 
@@ -251,10 +323,22 @@ export function genExpr(node, filename, ctx) {
         if (!parentCtorInfo || parentCtorInfo._builtin) return mod.nop();
         const provided = node.arguments ?? [];
         const ctorParams = parentCtorInfo?.node.params ?? [];
-        const argExprs = ctorParams.map((p, i) => {
-          if (i < provided.length) return genExpr(provided[i], filename, ctx);
-          return p.type === 'AssignmentPattern' ? genExpr(p.right, filename, ctx) : mod.i32.const(0);
-        });
+        const argExprs = [];
+        for (let ci = 0; ci < ctorParams.length; ci++) {
+          const cp = ctorParams[ci];
+          const cpType = cp.type === 'AssignmentPattern' ? (cp.left?._type ?? cp._type) : cp._type;
+          const cpIsStr = cpType?.kind === 'str';
+          if (ci < provided.length) {
+            if (cpIsStr) { const [p, l] = genStrExprAsPair(provided[ci], filename, ctx); argExprs.push(p, l); }
+            else argExprs.push(genExpr(provided[ci], filename, ctx));
+          } else if (cp.type === 'AssignmentPattern') {
+            if (cpIsStr) { const [p, l] = genStrExprAsPair(cp.right, filename, ctx); argExprs.push(p, l); }
+            else argExprs.push(genExpr(cp.right, filename, ctx));
+          } else {
+            if (cpIsStr) { argExprs.push(mod.i32.const(0), mod.i32.const(0)); }
+            else argExprs.push(mod.i32.const(0));
+          }
+        }
         return mod.call(`${parentName}__ctor`, [ctx.localGet('this'), ...argExprs], binaryen.none);
       }
       if (callee.type === 'Identifier') {
@@ -285,7 +369,14 @@ export function genExpr(node, filename, ctx) {
           const paramType = binaryen.createType(new Array(arity).fill(binaryen.i32));
           return mod.call_indirect('0', idxExpr, argExprs, paramType, binaryen.i32);
         }
-        const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
+        const argExprs = [];
+        for (const arg of node.arguments) {
+          if (arg._type?.kind === 'str') {
+            const [p, l] = genStrExprAsPair(arg, filename, ctx); argExprs.push(p, l);
+          } else {
+            argExprs.push(genExpr(arg, filename, ctx));
+          }
+        }
         const retType = node._type ? toBinType(node._type) : binaryen.none;
         return mod.call(callee.name, argExprs, retType);
       }
@@ -357,19 +448,30 @@ export function genExpr(node, filename, ctx) {
           }
         }
         if (objType?.kind === 'str' && methodName) {
-          const objExpr = genExpr(callee.object, filename, ctx);
-          const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
+          // Fat pointer: receiver is (ptr, len); str arguments also expand to (ptr, len).
+          const [objPtr, objLen] = genStrExprAsPair(callee.object, filename, ctx);
+          // Expand each argument: str args become two args (ptr, len); others are plain.
+          const expandedArgs = [];
+          for (const arg of node.arguments) {
+            if (arg._type?.kind === 'str') {
+              const [p, l] = genStrExprAsPair(arg, filename, ctx);
+              expandedArgs.push(p, l);
+            } else {
+              expandedArgs.push(genExpr(arg, filename, ctx));
+            }
+          }
           switch (methodName) {
-            case 'slice':      return mod.call('__jswat_str_slice',       [objExpr, ...argExprs], binaryen.i32);
-            case 'indexOf':    return mod.call('__jswat_str_index_of',    [objExpr, ...argExprs], binaryen.i32);
-            case 'concat':     return mod.call('__jswat_str_concat',      [objExpr, ...argExprs], binaryen.i32);
-            case 'charAt':     return mod.call('__jswat_str_char_at',     [objExpr, ...argExprs], binaryen.i32);
-            case 'startsWith': return mod.call('__jswat_str_starts_with', [objExpr, ...argExprs], binaryen.i32);
-            case 'endsWith':   return mod.call('__jswat_str_ends_with',   [objExpr, ...argExprs], binaryen.i32);
+            // Str-returning methods set __str_len_out before returning ptr.
+            case 'slice':      return mod.call('__jswat_str_slice',       [objPtr, objLen, ...expandedArgs], binaryen.i32);
+            case 'indexOf':    return mod.call('__jswat_str_index_of',    [objPtr, objLen, ...expandedArgs], binaryen.i32);
+            case 'concat':     return mod.call('__jswat_str_concat',      [objPtr, objLen, ...expandedArgs], binaryen.i32);
+            case 'charAt':     return mod.call('__jswat_str_char_at',     [objPtr, objLen, ...expandedArgs], binaryen.i32);
+            case 'startsWith': return mod.call('__jswat_str_starts_with', [objPtr, objLen, ...expandedArgs], binaryen.i32);
+            case 'endsWith':   return mod.call('__jswat_str_ends_with',   [objPtr, objLen, ...expandedArgs], binaryen.i32);
             case 'includes':   return mod.i32.ge_s(
-                                 mod.call('__jswat_str_index_of', [objExpr, ...argExprs], binaryen.i32),
+                                 mod.call('__jswat_str_index_of', [objPtr, objLen, ...expandedArgs], binaryen.i32),
                                  mod.i32.const(0));
-            case 'equals':     return mod.call('__jswat_str_equals',      [objExpr, ...argExprs], binaryen.i32);
+            case 'equals':     return mod.call('__jswat_str_equals',      [objPtr, objLen, ...expandedArgs], binaryen.i32);
             default: throw new CodegenError(`Unknown str method '${methodName}' (${filename})`);
           }
         }
@@ -387,20 +489,36 @@ export function genExpr(node, filename, ctx) {
           const def = resolveStdDefault(ctx._imports, callee.object.name, methodName);
           const std = ns ?? def;
           if (std) {
-            const argExprs = node.arguments.map((arg, i) => {
-              const expr = genExpr(arg, filename, ctx);
-              const expected = std.params?.[i];
-              const actual = arg._type;
-              if (expected && actual && expected !== actual) return genCast(mod, expr, actual, expected);
-              return expr;
-            });
-            // Pad missing args with zero/empty defaults
-            while (argExprs.length < (std.params?.length ?? 0)) {
-              const pt = std.params[argExprs.length];
-              if (pt?.name === 'str') argExprs.push(mod.i32.const(ctx._strings?.get('') ?? 0));
-              else if (pt?.wasmType === 'f64') argExprs.push(mod.f64.const(0));
-              else if (pt?.wasmType === 'i64') argExprs.push(mod.i64.const(0, 0));
-              else argExprs.push(mod.i32.const(0));
+            // Build expanded arg list: str args become two i32 args (ptr, len).
+            const argExprs = [];
+            let paramIdx = 0;
+            for (const arg of node.arguments) {
+              if (arg._type?.kind === 'str') {
+                const [p, l] = genStrExprAsPair(arg, filename, ctx);
+                argExprs.push(p, l);
+              } else {
+                const expr = genExpr(arg, filename, ctx);
+                const expected = std.params?.[paramIdx];
+                const actual = arg._type;
+                if (expected && actual && expected !== actual) argExprs.push(genCast(mod, expr, actual, expected));
+                else argExprs.push(expr);
+              }
+              paramIdx++;
+            }
+            // Pad missing logical params with zero/empty defaults
+            while (paramIdx < (std.params?.length ?? 0)) {
+              const pt = std.params[paramIdx];
+              if (pt?.kind === 'str') {
+                // Null str: (ptr=0, len=0)
+                argExprs.push(mod.i32.const(0), mod.i32.const(0));
+              } else if (pt?.wasmType === 'f64') {
+                argExprs.push(mod.f64.const(0));
+              } else if (pt?.wasmType === 'i64') {
+                argExprs.push(mod.i64.const(0, 0));
+              } else {
+                argExprs.push(mod.i32.const(0));
+              }
+              paramIdx++;
             }
             const retType = node._type ? toBinType(node._type) : binaryen.none;
             return mod.call(std.stub, argExprs, retType);
@@ -423,7 +541,14 @@ export function genExpr(node, filename, ctx) {
         if (className) {
           const ci = ctx._classes?.get(className);
           if (ci?.staticMethods?.has(methodName)) {
-            const argExprs = node.arguments.map(arg => genExpr(arg, filename, ctx));
+            const argExprs = [];
+            for (const arg of node.arguments) {
+              if (arg._type?.kind === 'str') {
+                const [p, l] = genStrExprAsPair(arg, filename, ctx); argExprs.push(p, l);
+              } else {
+                argExprs.push(genExpr(arg, filename, ctx));
+              }
+            }
             const retType = node._type ? toBinType(node._type) : binaryen.none;
             return mod.call(`${className}__sm_${methodName}`, argExprs, retType);
           }
@@ -434,15 +559,24 @@ export function genExpr(node, filename, ctx) {
         }
         const fnName = `${className}_${methodName}`;
         const methodSig = ctx._classes?.get(className)?.methods?.get(methodName)?.signature;
-        const argExprs = node.arguments.map((arg, i) => {
-          const expr = genExpr(arg, filename, ctx);
-          const expectedType = methodSig?.params?.[i]?.type;
-          if (!expectedType) return expr;
-          const actualWt = binaryen.getExpressionType(expr);
-          const expectedWt = toBinType(expectedType);
-          if (actualWt !== expectedWt) return genCast(mod, expr, arg._type, expectedType);
-          return expr;
-        });
+        const argExprs = [];
+        let methodArgIdx = 0;
+        for (const arg of node.arguments) {
+          if (arg._type?.kind === 'str') {
+            const [p, l] = genStrExprAsPair(arg, filename, ctx); argExprs.push(p, l);
+          } else {
+            const expr = genExpr(arg, filename, ctx);
+            const expectedType = methodSig?.params?.[methodArgIdx]?.type;
+            if (expectedType && arg._type && expectedType !== arg._type) {
+              const actualWt = binaryen.getExpressionType(expr);
+              const expectedWt = toBinType(expectedType);
+              argExprs.push(actualWt !== expectedWt ? genCast(mod, expr, arg._type, expectedType) : expr);
+            } else {
+              argExprs.push(expr);
+            }
+          }
+          methodArgIdx++;
+        }
         const retType = node._type ? toBinType(node._type) : binaryen.none;
         return mod.call(fnName, [objExpr, ...argExprs], retType);
       }
@@ -531,6 +665,18 @@ export function genExpr(node, filename, ctx) {
         }
         const field = resolveFieldAccess(left, ctx, filename);
         const objExpr = genExpr(left.object, filename, ctx);
+        // str field: 8-byte layout [ptr at offset, len at offset+4]
+        if (field.type?.kind === 'str') {
+          const [ptrExpr, lenExpr] = genStrExprAsPair(node.right, filename, ctx);
+          return mod.block(null, [
+            ctx.localSet('__tmp', objExpr),
+            ctx.localSet('__str_tmp', ptrExpr),
+            ctx.localSet('__str_tmp__len', lenExpr),
+            mod.i32.store(field.offset,     0, ctx.localGet('__tmp'), ctx.localGet('__str_tmp')),
+            mod.i32.store(field.offset + 4, 0, ctx.localGet('__tmp'), ctx.localGet('__str_tmp__len')),
+            ctx.localGet('__str_tmp'),
+          ], binaryen.i32);
+        }
         const rawValueExpr = genExpr(node.right, filename, ctx);
         // Auto-cast if right-side type differs from field type (e.g. Math.max f64 into i32 field)
         const rightType = node.right._type;
@@ -635,7 +781,20 @@ export function genExpr(node, filename, ctx) {
         return mod.call('__jswat_array_length', [genExpr(node.object, filename, ctx)], binaryen.i32);
       }
       if (!node.computed && objType?.kind === 'str' && node.property?.name === 'length') {
-        return mod.i32.load(4, 0, genExpr(node.object, filename, ctx));  // len at offset 4 in 12-byte header
+        // Fat pointer: len is the shadow local (Identifier) or the __str_len_out global (complex expr).
+        if (node.object.type === 'Identifier' && node.object._type?.kind === 'str') {
+          return ctx.localGet(node.object.name + '__len');
+        }
+        if (node.object.type === 'Literal' && typeof node.object.value === 'string') {
+          const info = ctx._strings?.get(node.object.value);
+          return mod.i32.const(info?.len ?? 0);
+        }
+        // Complex expr: evaluate for side effect (sets __str_len_out), drop result, read global.
+        const ptrExpr = genExpr(node.object, filename, ctx);
+        return mod.block(null, [
+          mod.drop(ptrExpr),
+          mod.global.get('__str_len_out', binaryen.i32),
+        ], binaryen.i32);
       }
       // Static field/getter access: ClassName.field or ClassName.#field
       if (!node.computed && objType?.kind === 'class') {
@@ -663,6 +822,15 @@ export function genExpr(node, filename, ctx) {
       // Struct field read
       const field = resolveFieldAccess(node, ctx, filename);
       const base = genExpr(node.object, filename, ctx);
+      // str field: 8-byte layout [ptr:i32 at offset, len:i32 at offset+4]
+      // Save base to __tmp (needs two loads), set __str_len_out from len word, return ptr.
+      if (field.type?.kind === 'str') {
+        return mod.block(null, [
+          ctx.localSet('__tmp', base),
+          mod.global.set('__str_len_out', mod.i32.load(field.offset + 4, 0, ctx.localGet('__tmp'))),
+          mod.i32.load(field.offset, 0, ctx.localGet('__tmp')),
+        ], binaryen.i32);
+      }
       return genLoad(mod, base, field.type, field.offset);
     }
 
@@ -683,10 +851,22 @@ export function genExpr(node, filename, ctx) {
           const ctorName = `${className}__ctor`;
           const provided = node.arguments ?? [];
           const ctorParams = ctorInfo.node.params ?? [];
-          const argExprs = ctorParams.map((p, i) => {
-            if (i < provided.length) return genExpr(provided[i], filename, ctx);
-            return p.type === 'AssignmentPattern' ? genExpr(p.right, filename, ctx) : mod.i32.const(0);
-          });
+          const argExprs = [];
+          for (let ci = 0; ci < ctorParams.length; ci++) {
+            const cp = ctorParams[ci];
+            const cpType = cp.type === 'AssignmentPattern' ? (cp.left?._type ?? cp._type) : cp._type;
+            const cpIsStr = cpType?.kind === 'str';
+            if (ci < provided.length) {
+              if (cpIsStr) { const [p, l] = genStrExprAsPair(provided[ci], filename, ctx); argExprs.push(p, l); }
+              else argExprs.push(genExpr(provided[ci], filename, ctx));
+            } else if (cp.type === 'AssignmentPattern') {
+              if (cpIsStr) { const [p, l] = genStrExprAsPair(cp.right, filename, ctx); argExprs.push(p, l); }
+              else argExprs.push(genExpr(cp.right, filename, ctx));
+            } else {
+              if (cpIsStr) { argExprs.push(mod.i32.const(0), mod.i32.const(0)); }
+              else argExprs.push(mod.i32.const(0));
+            }
+          }
           const classId = layout.classId ?? 1;
           const rcInit = computeRcClassInit(layout.size);
           return mod.block(null, [
@@ -739,39 +919,62 @@ export function genExpr(node, filename, ctx) {
     }
 
     case 'TemplateLiteral': {
-      // Build a string by concatenating quasis and expressions
-      // quasis[0] expr[0] quasis[1] expr[1] ... quasis[n]
+      // Build a string by concatenating quasis and expressions using fat pointers.
+      // Accumulates into scratch locals __str_tmp (ptr) and __str_tmp__len (len).
       const quasis = node.quasis ?? [];
       const exprs  = node.expressions ?? [];
-      // Start with the first quasi (static string)
+
+      const stmts = [];
+
+      // Initialise accumulator with the first static quasi.
       const firstCooked = quasis[0]?.value?.cooked ?? '';
-      const firstAddr = ctx._strings?.get(firstCooked);
-      let result = firstAddr !== undefined
-        ? mod.i32.const(firstAddr)
-        : mod.i32.const(ctx._strings?.get('') ?? 8); // empty string fallback
+      const firstInfo = ctx._strings?.get(firstCooked);
+      const firstPtr = firstInfo ? firstInfo.ptr : 0;
+      const firstLen = firstInfo ? firstInfo.len : 0;
+      stmts.push(ctx.localSet('__str_tmp',     mod.i32.const(firstPtr)));
+      stmts.push(ctx.localSet('__str_tmp__len', mod.i32.const(firstLen)));
 
       for (let i = 0; i < exprs.length; i++) {
-        const exprRef = genExpr(exprs[i], filename, ctx);
-        const exprType = exprs[i]._type;
-        // Coerce non-string expression to str
-        let strExpr;
-        if (exprType?.kind === 'str' || exprType?.name === 'str') {
-          strExpr = exprRef;
+        const exprNode = exprs[i];
+        const exprType = exprNode._type;
+
+        let exprPtr, exprLen;
+        if (exprType?.kind === 'str') {
+          [exprPtr, exprLen] = genStrExprAsPair(exprNode, filename, ctx);
         } else {
-          // Integer → string conversion
-          strExpr = mod.call('__jswat_string_from_i32', [exprRef], binaryen.i32);
+          // Non-str expression: convert to str via __jswat_string_from_i32 (sets __str_len_out).
+          exprPtr = mod.call('__jswat_string_from_i32', [genExpr(exprNode, filename, ctx)], binaryen.i32);
+          exprLen = mod.global.get('__str_len_out', binaryen.i32);
         }
-        result = mod.call('__jswat_str_concat', [result, strExpr], binaryen.i32);
-        // Append the next quasi
+
+        // concat(acc_ptr, acc_len, expr_ptr, expr_len) → captures result into __str_tmp
+        stmts.push(ctx.localSet('__str_tmp',
+          mod.call('__jswat_str_concat', [
+            ctx.localGet('__str_tmp'), ctx.localGet('__str_tmp__len'),
+            exprPtr, exprLen,
+          ], binaryen.i32)));
+        stmts.push(ctx.localSet('__str_tmp__len', mod.global.get('__str_len_out', binaryen.i32)));
+
+        // Append the next quasi if non-empty.
         const nextCooked = quasis[i + 1]?.value?.cooked ?? '';
         if (nextCooked.length > 0) {
-          const nextAddr = ctx._strings?.get(nextCooked);
-          if (nextAddr !== undefined) {
-            result = mod.call('__jswat_str_concat', [result, mod.i32.const(nextAddr)], binaryen.i32);
+          const nextInfo = ctx._strings?.get(nextCooked);
+          if (nextInfo && nextInfo.len > 0) {
+            stmts.push(ctx.localSet('__str_tmp',
+              mod.call('__jswat_str_concat', [
+                ctx.localGet('__str_tmp'), ctx.localGet('__str_tmp__len'),
+                mod.i32.const(nextInfo.ptr), mod.i32.const(nextInfo.len),
+              ], binaryen.i32)));
+            stmts.push(ctx.localSet('__str_tmp__len', mod.global.get('__str_len_out', binaryen.i32)));
           }
         }
       }
-      return result;
+
+      // Publish final len to __str_len_out so callers of this expression can read it.
+      stmts.push(mod.global.set('__str_len_out', ctx.localGet('__str_tmp__len')));
+      // Return the accumulated ptr as the block's value.
+      stmts.push(ctx.localGet('__str_tmp'));
+      return mod.block(null, stmts, binaryen.i32);
     }
 
     default:

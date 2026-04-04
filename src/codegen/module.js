@@ -49,6 +49,11 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
       passive: false,
     })));
 
+  // __str_len_out: mutable global used as the len return channel for str-returning
+  // functions (fat pointer calling convention — ptr returned normally, len via this global).
+  mod.addGlobal('__str_len_out', binaryen.i32, true, mod.i32.const(0));
+  mod.addGlobalExport('__str_len_out', '__str_len_out');  // expose to JS for str-returning exports
+
   // ── Feature detection (must precede table creation) ───────────────────────
   const stdStubs = collectStdStubs(imports);
   const hasArray = astHasArray(ast);
@@ -239,8 +244,13 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
         const exists = mod.getFunction(internalName);
         if (exists) continue; // already provided by runtime
       } catch (_) { /* getFunction not available or other error — proceed */ }
-      const paramTypes = sig.params.map(p => toBinType(p.type));
-      const retType    = toBinType(sig.returnType);
+      // Expand str params: each str becomes (ptr:i32, len:i32) per fat-pointer convention.
+      const expandedTypes = [];
+      for (const p of sig.params) {
+        expandedTypes.push(toBinType(p.type));
+        if (p.type?.kind === 'str') expandedTypes.push(binaryen.i32); // len
+      }
+      const retType = toBinType(sig.returnType);
       if (isUnknown) {
         // wasm32-unknown: emit a no-op stub directly — no WASI external to call
         const body = retType === binaryen.none ? mod.nop()
@@ -248,14 +258,14 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
                               : retType === binaryen.f32 ? mod.f32.const(0)
                               : retType === binaryen.i64 ? mod.i64.const(0, 0)
                               : mod.i32.const(0));
-        mod.addFunction(internalName, binaryen.createType(paramTypes), retType, [], body);
+        mod.addFunction(internalName, binaryen.createType(expandedTypes), retType, [], body);
         continue;
       }
-      const paramRefs  = sig.params.map((_, i) => mod.local.get(i, paramTypes[i]));
-      const callExpr   = mod.call(externalName, paramRefs, retType);
-      const body       = retType === binaryen.none ? callExpr : mod.return(callExpr);
+      const paramRefs = expandedTypes.map((t, i) => mod.local.get(i, t));
+      const callExpr  = mod.call(externalName, paramRefs, retType);
+      const body      = retType === binaryen.none ? callExpr : mod.return(callExpr);
       mod.addFunction(internalName,
-        binaryen.createType(paramTypes), retType, [], body);
+        binaryen.createType(expandedTypes), retType, [], body);
     }
   }
 
