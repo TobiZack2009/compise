@@ -3,52 +3,60 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$SCRIPT_DIR/.."
 
-echo "============================================================"
-echo " js.wat benchmark suite — Sieve of Eratosthenes (N=10M)"
-echo "                           Fibonacci under u64"
-echo "============================================================"
-echo ""
+BENCHMARKS=(sieve fibonacci matrix mandelbrot quicksort monte-carlo list-dot)
 
-# ── Rust native ──────────────────────────────────────────────────────────────
-if [ ! -f "$SCRIPT_DIR/bench-native" ]; then
-  echo "[build] Rust native..."
-  rustc -O "$SCRIPT_DIR/bench.rs" -o "$SCRIPT_DIR/bench-native"
-fi
-echo "── Rust (native) ──────────────────────────────────────────"
-"$SCRIPT_DIR/bench-native"
-echo ""
+run_benchmark() {
+  local name="$1"
+  local dir="$SCRIPT_DIR/$name"
 
-# ── Rust wasip1 ──────────────────────────────────────────────────────────────
-WASM_RUST="$SCRIPT_DIR/bench-wasi/target/wasm32-wasip1/release/bench-wasi.wasm"
-if [ ! -f "$WASM_RUST" ]; then
-  echo "[build] Rust wasip1..."
-  (cd "$SCRIPT_DIR/bench-wasi" && cargo build --target wasm32-wasip1 --release)
-fi
-echo "── Rust (wasm32-wasip1 / wasmtime) ────────────────────────"
-wasmtime "$WASM_RUST"
-echo ""
+  echo ""
+  echo "════════════════════════════════════════════════════════════"
+  echo "  $name"
+  echo "════════════════════════════════════════════════════════════"
 
-# ── Python 3 ─────────────────────────────────────────────────────────────────
-echo "── Python 3 ───────────────────────────────────────────────"
-python3 "$SCRIPT_DIR/bench.py"
-echo ""
+  # ── Rust (native) ──────────────────────────────────────────────
+  local native="$dir/bench-native"
+  if [ ! -f "$native" ]; then
+    echo "[build] Rust native ($name)..."
+    rustc -O "$dir/bench.rs" -o "$native"
+  fi
+  echo "── Rust (native) ──"
+  "$native"
 
-# ── Node.js ──────────────────────────────────────────────────────────────────
-echo "── Node.js ────────────────────────────────────────────────"
-node "$SCRIPT_DIR/bench.js"
-echo ""
+  # ── Node.js ────────────────────────────────────────────────────
+  if [ -f "$dir/bench.js" ]; then
+    echo "── Node.js ──"
+    node "$dir/bench.js"
+  fi
 
-# ── js.wat (wasip1 / wasmtime) ───────────────────────────────────────────────
-WASM_JSWAT="$SCRIPT_DIR/bench-jswat.wasm"
-if [ ! -f "$WASM_JSWAT" ]; then
-  echo "[build] js.wat..."
-  node "$ROOT/src/cli.js" compile "$SCRIPT_DIR/bench.jswat.js" \
-    -o "$WASM_JSWAT" --target wasm32-wasip1
-fi
-echo "── js.wat (wasm32-wasip1 / wasmtime) ──────────────────────"
-wasmtime "$WASM_JSWAT"
-echo ""
+  # ── Python 3 ───────────────────────────────────────────────────
+  if [ -f "$dir/bench.py" ]; then
+    echo "── Python 3 ──"
+    python3 "$dir/bench.py"
+  fi
 
-echo "============================================================"
-echo " Done."
-echo "============================================================"
+  # ── js.wat (wasm32-wasip1 / wasmtime) ─────────────────────────
+  local wasm="$dir/bench.wasm"
+  if [ -f "$dir/bench.jswat.js" ]; then
+    if [ ! -f "$wasm" ]; then
+      echo "[build] js.wat ($name)..."
+      node "$ROOT/src/cli.js" compile "$dir/bench.jswat.js" \
+        -o "$wasm" --target wasm32-wasip1
+    fi
+    echo "── js.wat (wasm32-wasip1 / wasmtime) ──"
+    wasmtime "$wasm"
+  fi
+}
+
+echo "════════════════════════════════════════════════════════════"
+echo "  js.wat benchmark suite"
+echo "════════════════════════════════════════════════════════════"
+
+for bench in "${BENCHMARKS[@]}"; do
+  run_benchmark "$bench"
+done
+
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo "  Done."
+echo "════════════════════════════════════════════════════════════"
