@@ -1,0 +1,8 @@
+[package]
+name = "bench-wasi"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bench-wasi"
+path = "src/main.rs"
