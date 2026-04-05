@@ -15,9 +15,10 @@ import { genBinOp, genCast, maybeNarrow, genLoad, genStore, resolveFieldType } f
  * locals that must be declared at the top of the WAT function.
  * @param {object} body  BlockStatement node
  * @param {Array<{ name: string, type: TypeInfo }>} params  already declared params
+ * @param {import('../types.js').TypeInfo|null} [returnType]  function return type (used to type __result)
  * @returns {Array<{ name: string, type: TypeInfo }>}
  */
-export function collectLocals(body, params) {
+export function collectLocals(body, params, returnType = null) {
   const paramNames = new Set(params.map(p => p.name));
   /** @type {Array<{ name: string, type: TypeInfo }>} */
   const locals = [];
@@ -126,9 +127,14 @@ export function collectLocals(body, params) {
   }
 
   // Add __result local for the result-save pattern used at ReturnStatement cleanup.
+  // Type it to match the function return type so we can save non-i32 return values.
   if (heapLocals.size > 0 && !seen.has('__result')) {
     seen.add('__result');
-    locals.push({ name: '__result', type: TYPES.isize });
+    const rWasm = returnType?.wasmType ?? '';
+    const resultType = rWasm === 'f64' ? TYPES.f64
+                     : rWasm === 'i64' ? TYPES.i64
+                     : TYPES.isize;
+    locals.push({ name: '__result', type: resultType });
   }
 
   return { locals, heapLocals };
@@ -829,6 +835,23 @@ export function genExpr(node, filename, ctx) {
           mod.drop(ptrExpr),
           mod.global.get('__str_len_out', binaryen.i32),
         ], binaryen.i32);
+      }
+      // Compile-time $-property access: ClassName.$byteSize, ClassName.$classId, etc.
+      // Also: instance.$addr, instance.$val for Box-like access
+      if (!node.computed && node.property?.name?.startsWith?.('$')) {
+        const propName = node.property.name;
+        // Instance-level: e.$addr → the heap pointer itself
+        if (propName === '$addr' && objType?.kind === 'class') {
+          return genExpr(node.object, filename, ctx);
+        }
+        // Type-level: ClassName.$byteSize, ClassName.$classId, ClassName.$headerSize, ClassName.$stride
+        const layout = ctx._layouts?.get(objType?.name ?? node.object?.name);
+        if (layout) {
+          if (propName === '$byteSize') return mod.i32.const(layout.size);
+          if (propName === '$stride')   return mod.i32.const(layout.size);
+          if (propName === '$classId')  return mod.i32.const(layout.classId);
+          if (propName === '$headerSize') return mod.i32.const(12);
+        }
       }
       // Static field/getter access: ClassName.field or ClassName.#field
       if (!node.computed && objType?.kind === 'class') {

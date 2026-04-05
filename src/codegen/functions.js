@@ -158,7 +158,7 @@ export function genFunction(node, mod, signatures, classes, layouts, imports, st
 
   // Expand str params to two WASM params each (ptr + len).
   const params    = expandStrParams(sig.params.map(p => ({ name: p.name, type: p.type })));
-  const { locals: localVars, heapLocals } = collectLocals(node.body, params);
+  const { locals: localVars, heapLocals } = collectLocals(node.body, params, sig.returnType);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
   ctx._strings = stringTable.map;
@@ -201,7 +201,7 @@ export function genFunction(node, mod, signatures, classes, layouts, imports, st
 export function genMethod(classInfo, methodName, fnNode, sig, mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames) {
   const name   = `${classInfo.name}_${methodName}`;
   const params = expandStrParams([{ name: 'this', type: classInfo.type }, ...sig.params.map(p => ({ name: p.name, type: p.type }))]);
-  const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params);
+  const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params, sig.returnType);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
   ctx._strings = stringTable.map;
@@ -241,7 +241,7 @@ export function genMethod(classInfo, methodName, fnNode, sig, mod, classes, layo
 export function genConstructor(classInfo, fnNode, sig, mod, classes, layouts, imports, stringTable, filename, fnTableMap, fnTypeNames) {
   const name   = `${classInfo.name}__ctor`;
   const params = expandStrParams([{ name: 'this', type: classInfo.type }, ...sig.params.map(p => ({ name: p.name, type: p.type }))]);
-  const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params);
+  const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params, null);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
   ctx._strings = stringTable.map;
@@ -269,7 +269,7 @@ export function genStaticMethod(classInfo, methodName, fnNode, sig, mod, classes
   const suffix = isGetter ? `__sg_${methodName}` : `__sm_${methodName}`;
   const name = `${classInfo.name}${suffix}`;
   const params = expandStrParams(sig.params.map(p => ({ name: p.name, type: p.type })));
-  const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params);
+  const { locals: localVars, heapLocals } = collectLocals(fnNode.body, params, sig.returnType);
 
   const ctx = new GenContext(mod, classes, layouts, imports, fnTableMap, fnTypeNames);
   ctx._strings = stringTable.map;

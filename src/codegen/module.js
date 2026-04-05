@@ -14,10 +14,44 @@ import {
   buildClockFunctions, buildRandomFunctions, buildMathFunctions, buildIterFunctions,
   buildPoolFunctions, buildArenaFunctions, buildRcFunctions, buildParseFunctions,
   buildProcessFunctions, buildEncodingFunctions,
+  buildRawAllocFunctions, buildJsSystemImports, buildJsIoFunctions, buildJsClockFunctions,
 } from './runtime.js';
 import { astHasArray, buildStringTable, genFunction, genMethod, genConstructor, genStaticMethod } from './functions.js';
 import { collectLocals } from './expressions.js';
 import { genStatement } from './statements.js';
+
+// ── WIT type mapping ──────────────────────────────────────────────────────────
+const WIT_TYPE = {
+  i32: 's32', u32: 'u32', i64: 's64', u64: 'u64',
+  f32: 'f32', f64: 'f64', bool: 'bool', str: 'string',
+  i8: 's8', u8: 'u8', i16: 's16', u16: 'u16',
+  isize: 's32', usize: 'u32',
+};
+function toWitType(typeInfo) {
+  if (!typeInfo || typeInfo.kind === 'void') return null;
+  return WIT_TYPE[typeInfo.name] ?? WIT_TYPE[typeInfo.kind] ?? 's32';
+}
+
+/**
+ * Generate a WIT interface file from the export list.
+ * @param {Array<{jsName:string, params:Array, returnType:object}>} exportList
+ * @param {string} filename
+ * @returns {string}
+ */
+function generateWit(exportList, filename) {
+  const worldName = filename.replace(/.*[\\/]/, '').replace(/\.[^.]+$/, '').replace(/[^a-z0-9-]/gi, '-').toLowerCase() || 'module';
+  const lines = [`package jswat:${worldName}@0.1.0;`, '', `world ${worldName} {`];
+  for (const fn of exportList) {
+    const params = fn.params
+      .map((p, i) => `${p.name ?? `p${i}`}: ${toWitType(p.type) ?? 's32'}`)
+      .join(', ');
+    const ret = toWitType(fn.returnType);
+    const retStr = ret ? ` -> ${ret}` : '';
+    lines.push(`  export ${fn.jsName}: func(${params})${retStr};`);
+  }
+  lines.push('}', '');
+  return lines.join('\n');
+}
 
 /**
  * Generate a complete WASM module from a type-annotated Program AST.
@@ -28,11 +62,14 @@ import { genStatement } from './statements.js';
  * @param {Map} imports
  * @param {string} [filename='<input>']
  * @param {{ stdModules?: Array<{ ast: object, filename: string }>, target?: string, lib?: boolean }} [opts]
- * @returns {{ wat: string, binary: Uint8Array, layoutMap: object }}
+ * @returns {{ wat: string, binary: Uint8Array, layoutMap: object, exportList: Array }}
  */
 export function generateWat(ast, signatures, classes, imports, filename = '<input>', opts = {}) {
   const { stdModules = [], target = 'wasm32-wasip1', lib = false } = opts;
-  const isUnknown = target === 'wasm32-unknown';
+  const isUnknown   = target === 'wasm32-unknown';
+  const isLd        = target === 'wasm32-ld';
+  const isComponent = target === 'wasm32-component';
+  const isJs        = target.startsWith('wasm32-js-');
   const mod = new binaryen.Module();
 
   // ── Class layouts ─────────────────────────────────────────────────────────
@@ -42,7 +79,7 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   const { map: stringMap, segments, size: strSize } = buildStringTable(ast);
   const ioBase = Math.max(Math.ceil(strSize / 16) * 16, 256);
 
-  mod.setMemory(1, 256, 'memory',
+  mod.setMemory(1, 65536, 'memory',
     segments.map(s => ({
       data:    s.data,
       offset:  mod.i32.const(s.offset),
@@ -146,8 +183,9 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   const hasEncoding = Array.from(stdStubs).some(n =>
     n.startsWith('__jswat_base64_') || n.startsWith('__jswat_utf8_'));
 
-  // ── WASI imports ──────────────────────────────────────────────────────────
-  if (!isUnknown) buildWasiImports(mod, hasIo, hasFs, hasClock, hasRandom, hasProcess);
+  // ── Imports (WASI for wasip1/ld/component, env for wasm32-js-*, none for unknown) ─
+  if (!isUnknown && !isJs) buildWasiImports(mod, hasIo, hasFs, hasClock, hasRandom, hasProcess);
+  if (isJs)                buildJsSystemImports(mod, hasIo, hasFs, hasClock, hasRandom, hasProcess);
 
   // ── @external imports from std modules ────────────────────────────────────
   // Track already-imported names to avoid duplicates (binaryen throws on dupes)
@@ -175,15 +213,28 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
 
   // ── Allocator ─────────────────────────────────────────────────────────────
   buildAllocator(mod);
+  // JS bridge string codec uses __jswat_alloc_raw / __jswat_free_raw
+  if (isJs) buildRawAllocFunctions(mod);
+
+  // ── __jswat_heap_base: exported global that marks the start of heap memory.
+  // The JS bridge uses it to distinguish data-segment strings (cache-able) from heap strings.
+  if (isJs) {
+    mod.addGlobal('__jswat_heap_base', binaryen.i32, false, mod.i32.const(ioBase));
+    mod.addGlobalExport('__jswat_heap_base', '__jswat_heap_base');
+  }
 
   // ── RC runtime (always present — any class instantiation uses it) ─────────
   buildRcFunctions(mod);
   buildParseFunctions(mod);
 
   // ── Runtime functions ─────────────────────────────────────────────────────
-  if (!isUnknown && hasIo)     buildIoFunctions(mod, ioBase);
-  if (!isUnknown && hasFs)     buildFsFunctions(mod, ioBase + 64);
-  if (!isUnknown && hasClock)  buildClockFunctions(mod, ioBase + 128);
+  if (!isUnknown && !isJs && hasIo)    buildIoFunctions(mod, ioBase);
+  if (!isUnknown && !isJs && hasFs)    buildFsFunctions(mod, ioBase + 64);
+  if (!isUnknown && !isJs && hasClock) buildClockFunctions(mod, ioBase + 128);
+  if (isJs && hasIo)                   buildJsIoFunctions(mod, ioBase);
+  if (isJs && hasClock)                buildJsClockFunctions(mod);
+  // random/process work unchanged: they call random_get/proc_exit, imported from
+  // wasi_snapshot_preview1 on wasip1 or from env on JS targets.
   if (!isUnknown && hasRandom) buildRandomFunctions(mod, ioBase + 192);
   if (hasMem)         buildMemFunctions(mod);
   if (hasString)      buildStringFunctions(mod);
@@ -369,18 +420,42 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
       startCtx._varTypes, startBody);
     mod.addFunctionExport('__start', '__start');
 
-    if (isUnknown) {
-      // wasm32-unknown: export __jswat_init instead of _start
+    if (isUnknown || isJs) {
+      // wasm32-unknown / wasm32-js-*: export __jswat_init (bridge calls this after instantiation)
       mod.addFunction('__jswat_init',
         binaryen.createType([]), binaryen.none, [],
         mod.call('__start', [], binaryen.none));
       mod.addFunctionExport('__jswat_init', '__jswat_init');
+    } else if (isLd) {
+      // wasm32-ld: export __wasm_call_ctors (LLVM linker convention for static constructors)
+      mod.addFunction('__wasm_call_ctors',
+        binaryen.createType([]), binaryen.none, [],
+        mod.call('__start', [], binaryen.none));
+      mod.addFunctionExport('__wasm_call_ctors', '__wasm_call_ctors');
+    } else if (isComponent) {
+      // wasm32-component: no _start; init is called by the component model runtime
+      mod.addFunction('_initialize',
+        binaryen.createType([]), binaryen.none, [],
+        mod.call('__start', [], binaryen.none));
+      mod.addFunctionExport('_initialize', '_initialize');
     } else {
       mod.addFunction('_start',
         binaryen.createType([]), binaryen.none, [],
         mod.call('__start', [], binaryen.none));
       mod.addFunctionExport('_start', '_start');
     }
+  }
+
+  // ── @export metadata (used by JS bridge generator) ───────────────────────
+  /** @type {Array<{jsName:string, wasmName:string, params:Array, returnType:object}>} */
+  const exportList = [];
+  for (const node of ast.body) {
+    if (node.type !== 'FunctionDeclaration' || node._exportName === undefined) continue;
+    const name = node.id?.name;
+    const sig  = name ? signatures.get(name) : null;
+    if (!sig) continue;
+    exportList.push({ jsName: node._exportName, wasmName: name,
+      params: sig.params, returnType: sig.returnType });
   }
 
   // ── Emit ──────────────────────────────────────────────────────────────────
@@ -401,5 +476,8 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
     };
   }
 
-  return { wat, binary, layoutMap };
+  // ── WIT generation (wasm32-component only) ────────────────────────────────
+  const wit = isComponent ? generateWit(exportList, filename) : null;
+
+  return { wat, binary, layoutMap, exportList, wit };
 }

@@ -3115,3 +3115,271 @@ export function buildEncodingFunctions(mod) {
       binaryen.createType([i32, i32]), i32, [i32, i32, i32], body);
   }
 }
+
+// ── JS target system ──────────────────────────────────────────────────────────
+
+/**
+ * Build __jswat_alloc_raw / __jswat_free_raw exports used by the JS bridge
+ * string codec (_writeStr / _readStr via __jswat_alloc_raw / __jswat_free_raw).
+ * @param {any} mod
+ */
+export function buildRawAllocFunctions(mod) {
+  // __jswat_alloc_raw(n:i32) -> i32  — self-describing allocation (header stores n)
+  mod.addFunction('__jswat_alloc_raw',
+    binaryen.createType([i32]), i32, [],
+    mod.return(mod.call('__jswat_alloc_bytes',
+      [mod.local.get(0, i32), mod.i32.const(0)], i32)));
+  mod.addFunctionExport('__jswat_alloc_raw', '__jswat_alloc_raw');
+
+  // __jswat_free_raw(ptr:i32) -> void  — frees a self-describing allocation
+  mod.addFunction('__jswat_free_raw',
+    binaryen.createType([i32]), none, [],
+    mod.call('__jswat_free_bytes_auto', [mod.local.get(0, i32)], none));
+  mod.addFunctionExport('__jswat_free_raw', '__jswat_free_raw');
+}
+
+/**
+ * Add env.* function imports for wasm32-js-* targets.
+ * These replace WASI imports — the JS bridge provides them.
+ * @param {any} mod
+ * @param {boolean} hasIo
+ * @param {boolean} hasFs
+ * @param {boolean} hasClock
+ * @param {boolean} hasRandom
+ * @param {boolean} [hasProcess]
+ */
+export function buildJsSystemImports(mod, hasIo, hasFs, hasClock, hasRandom, hasProcess = false) {
+  if (hasIo) {
+    // __jswat_io_write(ptr:i32, len:i32, fd:i32) -> void
+    mod.addFunctionImport('__jswat_io_write', 'env', '__jswat_io_write',
+      binaryen.createType([i32, i32, i32]), none);
+    // __jswat_io_read(buf:i32, maxLen:i32) -> i32  (returns bytes actually read)
+    mod.addFunctionImport('__jswat_io_read', 'env', '__jswat_io_read',
+      binaryen.createType([i32, i32]), i32);
+  }
+  if (hasClock) {
+    mod.addFunctionImport('__jswat_clock_now', 'env', '__jswat_clock_now',
+      binaryen.createType([]), i32);
+    mod.addFunctionImport('__jswat_clock_monotonic', 'env', '__jswat_clock_monotonic',
+      binaryen.createType([]), i32);
+  }
+  if (hasRandom) {
+    // Same name/sig as WASI random_get — bridge provides it from env
+    mod.addFunctionImport('random_get', 'env', 'random_get',
+      binaryen.createType([i32, i32]), i32);
+  }
+  if (hasProcess) {
+    // Same name/sig as WASI proc_exit — bridge provides it from env
+    mod.addFunctionImport('proc_exit', 'env', 'proc_exit',
+      binaryen.createType([i32]), none);
+  }
+  if (hasFs) {
+    mod.addFunctionImport('__jswat_fs_read', 'env', '__jswat_fs_read',
+      binaryen.createType([i32, i32]), i32);
+    mod.addFunctionImport('__jswat_fs_write', 'env', '__jswat_fs_write',
+      binaryen.createType([i32, i32, i32, i32]), i32);
+    mod.addFunctionImport('__jswat_fs_append', 'env', '__jswat_fs_append',
+      binaryen.createType([i32, i32, i32, i32]), i32);
+    mod.addFunctionImport('__jswat_fs_exists', 'env', '__jswat_fs_exists',
+      binaryen.createType([i32, i32]), i32);
+    mod.addFunctionImport('__jswat_fs_delete', 'env', '__jswat_fs_delete',
+      binaryen.createType([i32, i32]), i32);
+    mod.addFunctionImport('__jswat_fs_mkdir', 'env', '__jswat_fs_mkdir',
+      binaryen.createType([i32, i32]), i32);
+    mod.addFunctionImport('__jswat_fs_readdir', 'env', '__jswat_fs_readdir',
+      binaryen.createType([i32, i32]), i32);
+  }
+}
+
+/**
+ * Build IO WASM functions for wasm32-js-* targets.
+ * Calls env.__jswat_io_write / env.__jswat_io_read instead of WASI fd_write/fd_read.
+ * @param {any} mod
+ * @param {number} ioBase  scratch memory address (for newline byte)
+ */
+export function buildJsIoFunctions(mod, ioBase) {
+  const newlineAddr = ioBase + 32;
+
+  // __jswat_write(fd:i32, ptr:i32, len:i32) -> void
+  {
+    const getFd  = () => mod.local.get(0, i32);
+    const getPtr = () => mod.local.get(1, i32);
+    const getLen = () => mod.local.get(2, i32);
+    mod.addFunction('__jswat_write',
+      binaryen.createType([i32, i32, i32]), none, [],
+      mod.call('__jswat_io_write', [getPtr(), getLen(), getFd()], none));
+  }
+
+  // __jswat_write_line(fd:i32, ptr:i32, len:i32) -> void
+  {
+    const getFd  = () => mod.local.get(0, i32);
+    const getPtr = () => mod.local.get(1, i32);
+    const getLen = () => mod.local.get(2, i32);
+    mod.addFunction('__jswat_write_line',
+      binaryen.createType([i32, i32, i32]), none, [],
+      mod.block(null, [
+        mod.call('__jswat_io_write', [getPtr(), getLen(), getFd()], none),
+        mod.i32.store8(0, 0, mod.i32.const(newlineAddr), mod.i32.const(10)),
+        mod.call('__jswat_io_write', [
+          mod.i32.const(newlineAddr), mod.i32.const(1), getFd()], none),
+      ], none));
+  }
+
+  // Thin wrapper aliases (same names as WASI variants so user code links uniformly)
+  mod.addFunction('__jswat_console_log',
+    binaryen.createType([i32, i32]), none, [],
+    mod.call('__jswat_write_line', [
+      mod.i32.const(1), mod.local.get(0, i32), mod.local.get(1, i32)], none));
+
+  mod.addFunction('__jswat_console_error',
+    binaryen.createType([i32, i32]), none, [],
+    mod.call('__jswat_write_line', [
+      mod.i32.const(2), mod.local.get(0, i32), mod.local.get(1, i32)], none));
+
+  mod.addFunction('__jswat_stdout_write',
+    binaryen.createType([i32, i32]), none, [],
+    mod.call('__jswat_write', [
+      mod.i32.const(1), mod.local.get(0, i32), mod.local.get(1, i32)], none));
+
+  mod.addFunction('__jswat_stdout_writeln',
+    binaryen.createType([i32, i32]), none, [],
+    mod.call('__jswat_write_line', [
+      mod.i32.const(1), mod.local.get(0, i32), mod.local.get(1, i32)], none));
+
+  mod.addFunction('__jswat_stderr_write',
+    binaryen.createType([i32, i32]), none, [],
+    mod.call('__jswat_write', [
+      mod.i32.const(2), mod.local.get(0, i32), mod.local.get(1, i32)], none));
+
+  // __jswat_stdin_read(size:i32) -> i32  (sets __str_len_out = bytes read)
+  // params: size(0); locals: buf(1), nread(2)
+  {
+    const getSz    = () => mod.local.get(0, i32);
+    const getBuf   = () => mod.local.get(1, i32);
+    const getNread = () => mod.local.get(2, i32);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.call('__jswat_alloc_bytes', [getSz(), mod.i32.const(0)], i32)),
+      mod.local.set(2, mod.call('__jswat_io_read', [getBuf(), getSz()], i32)),
+      mod.if(mod.i32.eqz(getNread()), mod.block(null, [
+        mod.call('__jswat_free_bytes', [getBuf(), getSz()], none),
+        mod.global.set('__str_len_out', mod.i32.const(0)),
+        mod.return(mod.i32.const(0)),
+      ], none)),
+      mod.global.set('__str_len_out', getNread()),
+      mod.return(getBuf()),
+    ], i32);
+    mod.addFunction('__jswat_stdin_read',
+      binaryen.createType([i32]), i32, [i32, i32], body);
+  }
+
+  // __jswat_stdin_read_line() -> i32  (sets __str_len_out = bytes without newline)
+  // Bridge provides one line at a time via __jswat_io_read.
+  // locals: buf(0), nread(1), cap(2), total(3), ch(4)
+  {
+    const getBuf   = () => mod.local.get(0, i32);
+    const getNread = () => mod.local.get(1, i32);
+    const getCap   = () => mod.local.get(2, i32);
+    const getTotal = () => mod.local.get(3, i32);
+    const getCh    = () => mod.local.get(4, i32);
+    const body = mod.block(null, [
+      mod.local.set(2, mod.i32.const(1024)),
+      mod.local.set(0, mod.call('__jswat_alloc_bytes', [getCap(), mod.i32.const(0)], i32)),
+      mod.local.set(3, mod.i32.const(0)),
+      mod.block('done', [
+        mod.loop('read', mod.block(null, [
+          mod.local.set(1, mod.call('__jswat_io_read', [
+            mod.i32.add(getBuf(), getTotal()),
+            mod.i32.const(1),
+          ], i32)),
+          mod.br_if('done', mod.i32.eqz(getNread())),
+          mod.local.set(4, mod.i32.load8_u(0, 0, mod.i32.add(getBuf(), getTotal()))),
+          mod.br_if('done', mod.i32.eq(getCh(), mod.i32.const(10))), // '\n'
+          mod.local.set(3, mod.i32.add(getTotal(), mod.i32.const(1))),
+          mod.br_if('done', mod.i32.ge_u(getTotal(), mod.i32.const(1023))),
+          mod.br('read'),
+        ], none)),
+      ], none),
+      mod.if(mod.i32.eqz(getTotal()), mod.block(null, [
+        mod.call('__jswat_free_bytes', [getBuf(), getCap()], none),
+        mod.global.set('__str_len_out', mod.i32.const(0)),
+        mod.return(mod.i32.const(0)),
+      ], none)),
+      mod.global.set('__str_len_out', getTotal()),
+      mod.return(getBuf()),
+    ], i32);
+    mod.addFunction('__jswat_stdin_read_line',
+      binaryen.createType([]), i32, [i32, i32, i32, i32, i32], body);
+  }
+
+  // __jswat_stdin_read_all() -> i32  (sets __str_len_out = total bytes)
+  // locals: buf(0), cap(1), total(2), nread(3), newCap(4)
+  {
+    const getBuf    = () => mod.local.get(0, i32);
+    const getCap    = () => mod.local.get(1, i32);
+    const getTotal  = () => mod.local.get(2, i32);
+    const getNread  = () => mod.local.get(3, i32);
+    const getNewCap = () => mod.local.get(4, i32);
+    const body = mod.block(null, [
+      mod.local.set(1, mod.i32.const(1024)),
+      mod.local.set(0, mod.call('__jswat_alloc_bytes', [mod.i32.const(1024), mod.i32.const(0)], i32)),
+      mod.local.set(2, mod.i32.const(0)),
+      mod.block('done', [
+        mod.loop('read', mod.block(null, [
+          mod.if(
+            mod.i32.eq(getTotal(), getCap()),
+            mod.block(null, [
+              mod.local.set(4, mod.i32.mul(getCap(), mod.i32.const(2))),
+              mod.local.set(0, mod.call('__jswat_realloc', [getBuf(), getCap(), getNewCap()], i32)),
+              mod.local.set(1, getNewCap()),
+            ], none)
+          ),
+          mod.local.set(3, mod.call('__jswat_io_read', [
+            mod.i32.add(getBuf(), getTotal()),
+            mod.i32.sub(getCap(), getTotal()),
+          ], i32)),
+          mod.br_if('done', mod.i32.eqz(getNread())),
+          mod.local.set(2, mod.i32.add(getTotal(), getNread())),
+          mod.br('read'),
+        ], none)),
+      ], none),
+      mod.if(mod.i32.eqz(getTotal()), mod.block(null, [
+        mod.call('__jswat_free_bytes', [getBuf(), getCap()], none),
+        mod.global.set('__str_len_out', mod.i32.const(0)),
+        mod.return(mod.i32.const(0)),
+      ], none)),
+      mod.global.set('__str_len_out', getTotal()),
+      mod.return(getBuf()),
+    ], i32);
+    mod.addFunction('__jswat_stdin_read_all',
+      binaryen.createType([]), i32, [i32, i32, i32, i32, i32], body);
+  }
+}
+
+/**
+ * Build clock sleep function for wasm32-js-* targets.
+ * __jswat_clock_now / __jswat_clock_monotonic are env imports — only sleep is built here.
+ * @param {any} mod
+ */
+export function buildJsClockFunctions(mod) {
+  // __jswat_clock_sleep(ms:i32) -> void — spin loop using monotonic clock
+  // params: ms(0); locals: end(1)
+  const getMs  = () => mod.local.get(0, i32);
+  const getEnd = () => mod.local.get(1, i32);
+  const body = mod.block(null, [
+    mod.local.set(1, mod.i32.add(
+      mod.i32.mul(getMs(), mod.i32.const(1000000)),
+      mod.call('__jswat_clock_monotonic', [], i32)
+    )),
+    mod.block('done', [
+      mod.loop('spin', mod.block(null, [
+        mod.if(
+          mod.i32.lt_u(mod.call('__jswat_clock_monotonic', [], i32), getEnd()),
+          mod.br('spin')
+        ),
+        mod.br('done'),
+      ], none)),
+    ], none),
+  ], none);
+  mod.addFunction('__jswat_clock_sleep',
+    binaryen.createType([i32]), none, [i32], body);
+}

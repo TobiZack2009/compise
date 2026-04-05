@@ -124,6 +124,10 @@ export function validate(ast, filename = '<input>') {
         if (node.callee?.type === 'Identifier' && node.callee.name === 'Function') {
           err("new Function() is not allowed", node);
         }
+        // Named argument constructor: `new Foo({ key: val })` — mark the ObjectExpression as allowed
+        if (node.arguments?.length === 1 && node.arguments[0]?.type === 'ObjectExpression') {
+          node.arguments[0]._namedArgBlock = true;
+        }
       },
 
       /** @param {object} node */
@@ -135,7 +139,8 @@ export function validate(ast, filename = '<input>') {
 
       /** @param {object} node */
       ObjectExpression(node) {
-        // Ban all object literals (spec: "{} outside new")
+        // Ban standalone object literals, but allow named argument blocks inside `new Foo({...})`
+        if (node._namedArgBlock) return;
         err("Object literals {} are not allowed; use class construction blocks inside new", node);
       },
 

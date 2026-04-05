@@ -5,9 +5,11 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { readFile } from 'fs/promises';
-import { dirname, resolve } from 'path';
+import { basename, dirname, resolve } from 'path';
+import { execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { compileSource, wasmToWat } from './compiler.js';
+import { generateBridge } from './codegen/js-bridge.js';
 
 const STD_ROOT = fileURLToPath(new URL('../std', import.meta.url));
 
@@ -65,6 +67,21 @@ function watPathFrom(wasmPath) {
   return wasmPath.replace(/\.wasm$/, '.wat') + (wasmPath.endsWith('.wasm') ? '' : '.wat');
 }
 
+/**
+ * Find an executable in PATH. Returns the full path if found, null otherwise.
+ * @param {string} name
+ * @returns {string|null}
+ */
+function findExecutable(name) {
+  try {
+    const which = process.platform === 'win32' ? 'where' : 'which';
+    const path = execFileSync(which, [name], { encoding: 'utf8' }).trim().split('\n')[0];
+    return path || null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 /**
@@ -87,7 +104,12 @@ async function cmdCompile(args) {
   const target     = parseFlag(args, '--target') ?? 'wasm32-wasip1';
   const emitLayout = parseFlag(args, '--emit-layout');
 
-  if (!input)  die('Usage: jswat compile <input.js> -o <output.wasm> [--emit-wat] [--save-wat] [--lib] [--target wasm32-wasip1|wasm32-unknown] [--emit-layout <file>]');
+  const isJsTarget        = target.startsWith('wasm32-js-');
+  const isLdTarget        = target === 'wasm32-ld';
+  const isComponentTarget = target === 'wasm32-component';
+  const world             = parseFlag(args, '--world') ?? '';
+  const USAGE = 'Usage: jswat compile <input.js> -o <output> [--emit-wat] [--save-wat] [--lib] [--target wasm32-wasip1|wasm32-unknown|wasm32-ld|wasm32-component|wasm32-js-esm|wasm32-js-cjs|wasm32-js-bundle] [--emit-layout <file>] [--world <wit-world>]';
+  if (!input)  die(USAGE);
   if (!output) die('Missing -o <output> flag');
 
   const source = await readFile(input, 'utf8');
@@ -101,10 +123,59 @@ async function cmdCompile(args) {
   for (const w of result.warnings) stderr(`warning: ${w}`);
 
   mkdirSync(dirname(output), { recursive: true });
-  if (!saveWat) {
+
+  if (isJsTarget) {
+    // Write the bridge JS file (output path), and a .wasm sidecar alongside it
+    // (unless it's a bundle, which inlines WASM as base64).
+    const isBundle = target === 'wasm32-js-cjs'
+      ? false : target === 'wasm32-js-bundle';
+    const wasmFilename = basename(output).replace(/\.[mc]?js$/, '') + '.wasm';
+    const wasmSidecarPath = resolve(dirname(output), wasmFilename);
+
+    const bridge = generateBridge(result.wasm, result.exportList ?? [], {
+      target,
+      wasmFilename,
+    });
+    writeFileSync(output, bridge, 'utf8');
+    stdout(`Bridge   ${input} → ${output}`);
+
+    if (!isBundle) {
+      writeFileSync(wasmSidecarPath, result.wasm);
+      stdout(`WASM     ${input} → ${wasmSidecarPath}`);
+    }
+  } else if (isComponentTarget) {
+    // Write the companion WIT file and core WASM, then optionally wrap with wasm-tools
+    const witPath = output.replace(/\.wasm$/, '') + '.wit';
+    if (result.wit) {
+      writeFileSync(witPath, result.wit, 'utf8');
+      stdout(`WIT      ${input} → ${witPath}`);
+    }
+    // Try to produce a real component binary via wasm-tools
+    const coreWasmPath = output.replace(/\.wasm$/, '') + '.core.wasm';
+    writeFileSync(coreWasmPath, result.wasm);
+    const wasmTools = findExecutable('wasm-tools');
+    if (wasmTools) {
+      try {
+        const componentArgs = ['component', 'new', coreWasmPath, '-o', output];
+        if (world) componentArgs.push('--world', world);
+        execFileSync(wasmTools, componentArgs);
+        stdout(`Component ${input} → ${output}`);
+      } catch (e) {
+        // Fallback: just write the core WASM if wasm-tools fails
+        writeFileSync(output, result.wasm);
+        stdout(`Compiled ${input} → ${output} (core WASM — wasm-tools failed: ${e.message.split('\n')[0]})`);
+      }
+    } else {
+      // No wasm-tools — write core WASM; user can wrap with wasm-tools manually
+      writeFileSync(output, result.wasm);
+      stdout(`Compiled ${input} → ${output} (core WASM — install wasm-tools to produce a component)`);
+      stdout(`  Run: wasm-tools component new ${coreWasmPath} -o ${output}`);
+    }
+  } else if (!saveWat) {
     writeFileSync(output, result.wasm);
     stdout(`Compiled ${input} → ${output}`);
   }
+
   if (emitWat || saveWat) {
     const watPath = saveWat ? output : watPathFrom(output);
     writeFileSync(watPath, result.wat, 'utf8');

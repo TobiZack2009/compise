@@ -166,12 +166,20 @@ export function inferTypes(ast, filename = '<input>', opts = {}) {
       kind: 'class', name: stmt.id.name, nullable: true, abstract: false,
       wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32,
     };
+    // Detect sealed union marker: `static $variants = []`
+    const isSealed = (stmt.body?.body ?? []).some(el =>
+      el.type === 'PropertyDefinition' && el.static &&
+      (el.key?.name === '$variants' || el.key?.value === '$variants') &&
+      el.value?.type === 'ArrayExpression'
+    );
     classes.set(stmt.id.name, {
       name: stmt.id.name, type: typeInfo,
       fields: new Map(), methods: new Map(), constructor: null,
       staticFields: new Map(), staticMethods: new Map(), staticGetters: new Map(),
       superClassName: stmt.superClass?.name ?? null,
       ordered: stmt._ordered ?? false,
+      sealed: isSealed,
+      sealedVariants: isSealed ? [] : null,
     });
     // Don't overwrite existing primitive/non-class types (e.g. TYPES.ptr has kind='ptr')
     if (!TYPES[stmt.id.name] || TYPES[stmt.id.name].kind === 'class') {
@@ -253,6 +261,17 @@ export function inferTypes(ast, filename = '<input>', opts = {}) {
 
   for (const classInfo of classes.values()) {
     if (!TYPES[classInfo.name]) TYPES[classInfo.name] = classInfo.type;
+  }
+
+  // ── Sealed union variant registration ─────────────────────────────────────
+  // After all class stubs are registered, populate sealedVariants for sealed bases.
+  for (const [name, info] of classes.entries()) {
+    if (info.superClassName) {
+      const parent = classes.get(info.superClassName);
+      if (parent?.sealed && parent.sealedVariants && !parent.sealedVariants.includes(name)) {
+        parent.sealedVariants.push(name);
+      }
+    }
   }
 
   // Register function names early with unknown return types for recursion.
@@ -404,6 +423,23 @@ function inferStatement(stmt, scope, signatures, classes, filename, ctx) {
     case 'SwitchStatement': {
       const discType = inferExpr(stmt.discriminant, scope, signatures, classes, filename, ctx);
       const discName = stmt.discriminant?.name;
+
+      // CE-CF07: sealed union switch must be exhaustive (no default allowed either)
+      if (discType?.kind === 'class') {
+        const sealedInfo = classes.get(discType.name);
+        if (sealedInfo?.sealed && sealedInfo.sealedVariants?.length > 0) {
+          const coveredVariants = new Set(stmt.cases.filter(c => c.test).map(c => c.test?.name));
+          const hasDefault = stmt.cases.some(c => !c.test);
+          if (!hasDefault) {
+            for (const v of sealedInfo.sealedVariants) {
+              if (!coveredVariants.has(v)) {
+                throw new TypeError(`CE-CF07: non-exhaustive switch on sealed union '${discType.name}': variant '${v}' not covered (${filename})`);
+              }
+            }
+          }
+        }
+      }
+
       for (const c of stmt.cases) {
         // Class type-narrowing: temporarily narrow discriminant type for case body
         const caseTestName = c.test?.name;
@@ -772,6 +808,21 @@ function collectReturnTypes(node, out, scope, signatures, classes, filename, ctx
     case 'SwitchStatement': {
       const discType = inferExpr(node.discriminant, scope, signatures, classes, filename, ctx);
       const discName = node.discriminant?.name;
+      // CE-CF07: sealed union switch must be exhaustive
+      if (discType?.kind === 'class') {
+        const sealedInfo = classes.get(discType.name);
+        if (sealedInfo?.sealed && sealedInfo.sealedVariants?.length > 0) {
+          const coveredVariants = new Set(node.cases.filter(c => c.test).map(c => c.test?.name));
+          const hasDefault = node.cases.some(c => !c.test);
+          if (!hasDefault) {
+            for (const v of sealedInfo.sealedVariants) {
+              if (!coveredVariants.has(v)) {
+                throw new TypeError(`CE-CF07: non-exhaustive switch on sealed union '${discType.name}': variant '${v}' not covered (${filename})`);
+              }
+            }
+          }
+        }
+      }
       for (const c of node.cases) {
         const caseTestName = c.test?.name;
         const narrowedType = (discType?.kind === 'class' && caseTestName && classes.has(caseTestName))
@@ -1030,6 +1081,17 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           t = TYPES.usize;
           break;
         }
+        // Compile-time $-property access (type-level or instance-level)
+        if (!node.computed && node.property?.name?.startsWith?.('$')) {
+          const propName = node.property.name;
+          const objT = inferExpr(node.object, scope, signatures, classes, filename, ctx);
+          if (propName === '$addr') { t = TYPES.usize; break; }
+          // ClassName.$byteSize / .$stride / .$classId / .$headerSize
+          if (['$byteSize', '$stride', '$classId', '$headerSize'].includes(propName)) {
+            t = TYPES.usize; break;
+          }
+          t = TYPES.usize; break;
+        }
         const objType = inferExpr(node.object, scope, signatures, classes, filename, ctx);
         if (node.computed && objType?.kind === 'array') {
           inferExpr(node.property, scope, signatures, classes, filename, ctx);
@@ -1090,10 +1152,40 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
     case 'NewExpression':
       if (node.callee?.type === 'Identifier') {
         if (classes.has(node.callee.name)) {
+          const classInfo = classes.get(node.callee.name);
+          // Named argument constructor: `new Vec2({ x: 1.0, y: 2.0 })`
+          // Rewrite to positional arguments in constructor parameter order.
+          if (node.arguments?.length === 1 && node.arguments[0]?.type === 'ObjectExpression') {
+            const objExpr = node.arguments[0];
+            const ctor = classInfo.constructor;
+            const ctorParams = ctor?.node?.params ?? [];
+            // Build a map of key → value from the ObjectExpression
+            const namedMap = new Map();
+            for (const prop of objExpr.properties ?? []) {
+              const key = prop.key?.name ?? prop.key?.value;
+              if (key) namedMap.set(key, prop.value);
+            }
+            // Validate keys: CE-C01
+            for (const [key] of namedMap) {
+              const paramExists = ctorParams.some(p =>
+                (p.type === 'AssignmentPattern' ? p.left?.name : p.name) === key
+              );
+              if (!paramExists) {
+                throw new TypeError(`CE-C01: unknown constructor argument '${key}' for class '${node.callee.name}' (${filename})`);
+              }
+            }
+            // Rewrite arguments in constructor parameter order
+            const rewritten = ctorParams.map(p => {
+              const paramName = p.type === 'AssignmentPattern' ? p.left?.name : p.name;
+              return namedMap.has(paramName) ? namedMap.get(paramName) : (p.type === 'AssignmentPattern' ? p.right : null);
+            }).filter(Boolean);
+            node.arguments = rewritten;
+            node._namedArgs = true;
+          }
           for (const arg of node.arguments ?? []) {
             inferExpr(arg, scope, signatures, classes, filename, ctx);
           }
-          t = classes.get(node.callee.name).type;
+          t = classInfo.type;
         } else if (ctx.imports?.get(node.callee.name)?.module === 'std/collections') {
           t = TYPES[node.callee.name] ?? TYPES.void;
         } else {

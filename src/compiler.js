@@ -11,7 +11,7 @@ import { generateWat } from './codegen/index.js';
 import { ModuleResolver } from './resolver.js';
 
 /**
- * @typedef {{ wat: string, wasm: Uint8Array|null, warnings: string[], layoutMap?: object }} CompileResult
+ * @typedef {{ wat: string, wasm: Uint8Array|null, binary: Uint8Array|null, warnings: string[], layoutMap?: object, exportList?: Array, wit?: string|null }} CompileResult
  */
 
 // Lazy-initialised wabt singleton
@@ -96,9 +96,9 @@ export async function compileSource(source, filename = '<input>', opts = {}) {
   }
 
   // 5. Code generation + assemble (binaryen emits binary directly)
-  const { wat, binary: wasm, layoutMap } =
+  const { wat, binary: wasm, layoutMap, exportList, wit } =
     generateWat(typedAst, signatures, classes, imports, filename, { stdModules, target, lib });
 
-  return { wat, wasm, warnings, layoutMap };
+  return { wat, wasm, binary: wasm, warnings, layoutMap, exportList, wit: wit ?? null };
 }
 

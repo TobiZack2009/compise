@@ -122,10 +122,11 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
             stmts.push(ctx.localSet(decl.id.name + '__len', lenRef));
           } else {
             stmts.push(ctx.localSet(decl.id.name, genExpr(decl.init, filename, ctx)));
-            // If copying an existing heap reference (not a NewExpression or CallExpression),
+            // If copying an existing heap reference (not a freshly-created value),
             // rc_inc the new owner.
             if (isHeapType(decl.init._type) &&
                 decl.init.type !== 'NewExpression' &&
+                decl.init.type !== 'ArrayExpression' &&
                 decl.init.type !== 'CallExpression') {
               stmts.push(mod.call('__jswat_rc_inc', [ctx.localGet(decl.id.name)], binaryen.none));
             }
