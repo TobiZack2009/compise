@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Snake — js.wat</title>
+<style>
+  body { background:#111; color:#eee; font-family:monospace; display:flex;
+         flex-direction:column; align-items:center; justify-content:center;
+         min-height:100vh; margin:0; }
+  h1   { margin-bottom:8px; font-size:1.4rem; letter-spacing:2px; color:#0f0; }
+  #info { margin-bottom:8px; font-size:1rem; }
+  canvas { border:2px solid #0f0; image-rendering:pixelated; }
+  #msg  { margin-top:12px; font-size:1.1rem; min-height:1.5em; color:#ff0; }
+  #hint { margin-top:6px; font-size:0.8rem; color:#888; }
+</style>
+</head>
+<body>
+<h1>🐍 SNAKE</h1>
+<div id="info">Score: <span id="score">0</span></div>
+<canvas id="c" width="400" height="400"></canvas>
+<div id="msg"></div>
+<div id="hint">Arrow keys / WASD to move &nbsp;|&nbsp; R to restart</div>
+
+<script type="module">
+// ── Load bridge (compiled via: jswat compile snake-html.js -o snake-bridge.mjs --target wasm32-js-bundle)
+import { setDir, step, getScore, isGameOver, getSnakeLen,
+         getSnakeX, getSnakeY, getFoodX, getFoodY,
+         getBoardW, getBoardH, reset } from './snake-bridge.mjs';
+
+const CELL = 20; // pixels per cell
+const W = getBoardW();
+const H = getBoardH();
+const canvas = document.getElementById('c');
+canvas.width  = W * CELL;
+canvas.height = H * CELL;
+const ctx = canvas.getContext('2d');
+const scoreEl = document.getElementById('score');
+const msgEl   = document.getElementById('msg');
+
+function draw() {
+  // Background
+  ctx.fillStyle = '#111';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Grid (subtle)
+  ctx.strokeStyle = '#1a1a1a';
+  ctx.lineWidth = 0.5;
+  for (let x = 0; x <= W; x++) {
+    ctx.beginPath(); ctx.moveTo(x*CELL,0); ctx.lineTo(x*CELL,canvas.height); ctx.stroke();
+  }
+  for (let y = 0; y <= H; y++) {
+    ctx.beginPath(); ctx.moveTo(0,y*CELL); ctx.lineTo(canvas.width,y*CELL); ctx.stroke();
+  }
+
+  // Snake
+  const len = getSnakeLen();
+  for (let i = 0; i < len; i++) {
+    const t = 1 - i / len;
+    const g = Math.round(100 + 155 * t);
+    ctx.fillStyle = i === 0 ? '#00ff44' : `rgb(0,${g},40)`;
+    ctx.fillRect(getSnakeX(i)*CELL+1, getSnakeY(i)*CELL+1, CELL-2, CELL-2);
+    if (i === 0) {
+      // Eyes
+      ctx.fillStyle = '#000';
+      ctx.fillRect(getSnakeX(0)*CELL+5, getSnakeY(0)*CELL+5, 3, 3);
+      ctx.fillRect(getSnakeX(0)*CELL+12, getSnakeY(0)*CELL+5, 3, 3);
+    }
+  }
+
+  // Food
+  ctx.fillStyle = '#ff3333';
+  const fx = getFoodX(), fy = getFoodY();
+  ctx.beginPath();
+  ctx.arc(fx*CELL + CELL/2, fy*CELL + CELL/2, CELL/2 - 2, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#ff9900';
+  ctx.beginPath();
+  ctx.arc(fx*CELL + CELL/2 - 2, fy*CELL + 4, 3, 0, Math.PI*2);
+  ctx.fill();
+
+  scoreEl.textContent = getScore();
+}
+
+const DIR = { ArrowUp:0, ArrowRight:1, ArrowDown:2, ArrowLeft:3,
+              w:0, d:1, s:2, a:3, W:0, D:1, S:2, A:3 };
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'r' || e.key === 'R') { reset(); msgEl.textContent = ''; return; }
+  const d = DIR[e.key];
+  if (d !== undefined) { e.preventDefault(); setDir(d); }
+});
+
+let interval = null;
+function startLoop() {
+  if (interval) clearInterval(interval);
+  interval = setInterval(() => {
+    const result = step();
+    draw();
+    if (isGameOver()) {
+      clearInterval(interval);
+      msgEl.textContent = `Game over! Score: ${getScore()}  Press R to restart.`;
+    }
+  }, 150);
+}
+
+draw();
+startLoop();
+</script>
+</body>
+</html>
