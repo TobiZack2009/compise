@@ -6,7 +6,7 @@ import binaryen from 'binaryen';
 import { TYPES } from '../types.js';
 import { resolveStdFunction, resolveStdNamespace, resolveStdDefault, resolveStdCollectionMethod, resolveStdCollectionCtor } from '../std.js';
 import { CodegenError, toBinType } from './context.js';
-import { genBinOp, genCast, maybeNarrow, genLoad, genStore, resolveFieldType } from './types.js';
+import { genBinOp, genCast, maybeNarrow, genLoad, genStore, resolveFieldType, genListLoad, genListStore, typeSize } from './types.js';
 
 // ── Local collection ─────────────────────────────────────────────────────────
 
@@ -117,11 +117,11 @@ export function collectLocals(body, params, returnType = null) {
     locals.push({ name: '__str_tmp__len', type: TYPES.isize });
   }
 
-  // Collect heap-typed locals (class/array) for RC management.
+  // Collect heap-typed locals (class/array/list) for RC management.
   // str is a value-type fat pointer — NOT heap-managed.
   const heapLocals = new Map();
   for (const { name, type } of locals) {
-    if (type?.kind === 'class' || type?.kind === 'array') {
+    if (type?.kind === 'class' || type?.kind === 'array' || type?.kind === 'list') {
       heapLocals.set(name, type);
     }
   }
@@ -133,6 +133,7 @@ export function collectLocals(body, params, returnType = null) {
     const rWasm = returnType?.wasmType ?? '';
     const resultType = rWasm === 'f64' ? TYPES.f64
                      : rWasm === 'i64' ? TYPES.i64
+                     : rWasm === 'f32' ? TYPES.f32
                      : TYPES.isize;
     locals.push({ name: '__result', type: resultType });
   }
@@ -673,6 +674,33 @@ export function genExpr(node, filename, ctx) {
             ctx.localGet('__tmp'),
           ], binaryen.i32);
         }
+        // List<T> element assignment: buf[i] = val
+        if (left.computed && left.object?._type?.kind === 'list') {
+          if (node.operator !== '=') {
+            throw new CodegenError(`Compound assignments on List elements not supported yet (${filename})`);
+          }
+          const elemType = left.object._type.elemType;
+          const binType  = toBinType(elemType);
+          const valExpr  = genExpr(node.right, filename, ctx);
+          // For f32: reinterpret bits as i32 to save in __tmp, then reinterpret back.
+          // (No f32 scratch local exists; this preserves exact bit pattern.)
+          if (elemType.wasmType === 'f32') {
+            return mod.block(null, [
+              ctx.localSet('__tmp', mod.i32.reinterpret(valExpr)),
+              genListStore(mod, genExpr(left.object, filename, ctx), genExpr(left.property, filename, ctx),
+                           mod.f32.reinterpret(ctx.localGet('__tmp')), elemType),
+              mod.f32.reinterpret(ctx.localGet('__tmp')),
+            ], binaryen.f32);
+          }
+          const tmpName  = elemType.wasmType === 'f64' ? '__tmp_f64' : '__tmp';
+          // Save value to tmp first; then pass objExpr (list ptr) and idxExpr directly to store.
+          // This avoids the conflict where __tmp would hold both the ptr and the value.
+          return mod.block(null, [
+            ctx.localSet(tmpName, valExpr),
+            genListStore(mod, genExpr(left.object, filename, ctx), genExpr(left.property, filename, ctx), ctx.localGet(tmpName), elemType),
+            ctx.localGet(tmpName),
+          ], binType);
+        }
         // Static field assignment: ClassName.field = value
         const leftObjType = left.object?._type;
         if (!left.computed && leftObjType?.kind === 'class') {
@@ -820,6 +848,30 @@ export function genExpr(node, filename, ctx) {
       if (!node.computed && objType?.kind === 'array' && node.property?.name === 'length') {
         return mod.call('__jswat_array_length', [genExpr(node.object, filename, ctx)], binaryen.i32);
       }
+      // List<T> member access
+      if (objType?.kind === 'list') {
+        const listPtr = genExpr(node.object, filename, ctx);
+        if (node.computed) {
+          // buf[i] → load element at index i
+          return mod.block(null, [
+            ctx.localSet('__tmp', listPtr),
+            genListLoad(mod, ctx.localGet('__tmp'), genExpr(node.property, filename, ctx), objType.elemType),
+          ], toBinType(objType.elemType));
+        }
+        const propName = node.property?.name;
+        if (propName === 'length') return mod.i32.load(12, 0, listPtr);
+        if (propName === '$ptr')   return mod.i32.add(listPtr, mod.i32.const(16));
+        if (propName === '$byteSize') {
+          return mod.block(null, [
+            ctx.localSet('__tmp', listPtr),
+            mod.i32.mul(
+              mod.i32.load(12, 0, ctx.localGet('__tmp')),
+              mod.i32.const(typeSize(objType.elemType)),
+            ),
+          ], binaryen.i32);
+        }
+        throw new CodegenError(`Unknown List property '${propName}' (${filename})`);
+      }
       if (!node.computed && objType?.kind === 'str' && node.property?.name === 'length') {
         // Fat pointer: len is the shadow local (Identifier) or the __str_len_out global (complex expr).
         if (node.object.type === 'Identifier' && node.object._type?.kind === 'str') {
@@ -892,6 +944,27 @@ export function genExpr(node, filename, ctx) {
     }
 
     case 'NewExpression': {
+      // List<T> allocation: new List(ElemType, count)
+      if (node._listElemType) {
+        const elemType  = node._listElemType;
+        const elemSize  = typeSize(elemType);
+        // List class_id: use a fixed sentinel (0x115700 = "LISTO")
+        const LIST_CLASS_ID = 0x115700;
+        // Generate count expr twice (pure expression, no side effects expected)
+        const countExpr1 = node._listCount ? genExpr(node._listCount, filename, ctx) : mod.i32.const(0);
+        const countExpr2 = node._listCount ? genExpr(node._listCount, filename, ctx) : mod.i32.const(0);
+        // total = 16 + count * elemSize (16 = 12-byte header + 4-byte length field)
+        const totalExpr = mod.i32.add(mod.i32.const(16), mod.i32.mul(countExpr1, mod.i32.const(elemSize)));
+        return mod.block(null, [
+          ctx.localSet('__tmp', mod.call('__alloc', [totalExpr], binaryen.i32)),
+          // Store a large-block rc_class (size-class 10 → large, rc=1): (10 << 28) | 1
+          mod.i32.store(0,  0, ctx.localGet('__tmp'), mod.i32.const((10 << 28) | 1)),
+          mod.i32.store(4,  0, ctx.localGet('__tmp'), mod.i32.const(0)),             // vtable_ptr
+          mod.i32.store(8,  0, ctx.localGet('__tmp'), mod.i32.const(LIST_CLASS_ID)), // class_id
+          mod.i32.store(12, 0, ctx.localGet('__tmp'), countExpr2),                   // length
+          ctx.localGet('__tmp'),
+        ], binaryen.i32);
+      }
       if (node.callee?.type === 'Identifier') {
         const className = node.callee.name;
         // User-defined classes take priority over stdlib collections

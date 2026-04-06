@@ -66,6 +66,10 @@ const TYPE_REGISTRY = {
   // Typed raw pointer (ptr<T>) — represented as i32 address at runtime
   // .addr returns the address, .val loads/stores the pointed-to value (f64)
   ptr:  t({ kind: 'ptr',  name: 'ptr',  nullable: true, abstract: true, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32 }),
+
+  // List<T> — fixed-size inline-data typed array (RC-managed heap object)
+  // Layout: [ rc_class:4 | vtable_ptr:4 | class_id:4 | length:4 | elem_0 | ... ]
+  List: t({ kind: 'list', name: 'List', nullable: true, abstract: true, wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32, isHeap: true }),
 };
 
 export const TYPES = TYPE_REGISTRY;

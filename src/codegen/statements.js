@@ -383,6 +383,9 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
       const discType = stmt.discriminant?._type;
       if (discType?.kind === 'class') {
         // Type-narrowing switch: compare type tag (ptr[0]) to each case class ID
+        // Wrap in a block so that `break` inside a case can exit the switch.
+        const breakLabel = ctx.nextLabel('switch_break');
+        ctx.pushLoop(breakLabel, null);
         let chain = mod.nop();
         for (let i = stmt.cases.length - 1; i >= 0; i--) {
           const c = stmt.cases[i];
@@ -399,7 +402,8 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
           );
           chain = mod.if(tagCheck, body, chain);
         }
-        return chain;
+        ctx.popLoop();
+        return mod.block(breakLabel, [chain], binaryen.none);
       }
       return mod.nop();
     }

@@ -6,6 +6,7 @@
 import { TYPES, CAST_TYPES, PROMOTION_ORDER,
          defaultIntegerType, defaultFloatType, promoteTypes } from './types.js';
 import { resolveStdNamespace, resolveStdDefault, resolveStdCollectionMethod, resolveStdCollectionCtor, resolveStdFunction } from './std.js';
+import { ceErr } from './errors.js';
 
 /**
  * @typedef {import('./types.js').TypeInfo} TypeInfo
@@ -29,6 +30,8 @@ class ScopeChain {
   constructor() {
     /** @type {Map<string, TypeInfo>[]} */
     this._frames = [];
+    /** @type {Set<string>} names declared as const */
+    this._consts = new Set();
   }
 
   push() { this._frames.push(new Map()); }
@@ -37,6 +40,21 @@ class ScopeChain {
   /** @param {string} name @param {TypeInfo} type */
   define(name, type) {
     this._frames[this._frames.length - 1].set(name, type);
+  }
+
+  /** @param {string} name @param {TypeInfo} type */
+  defineConst(name, type) {
+    this._consts.add(name);
+    this.define(name, type);
+  }
+
+  /** @param {string} name @returns {boolean} */
+  isConst(name) {
+    // Only report as const if it resolves in scope AND is in _consts
+    for (let i = this._frames.length - 1; i >= 0; i--) {
+      if (this._frames[i].has(name)) return this._consts.has(name);
+    }
+    return false;
   }
 
   /**
@@ -50,6 +68,17 @@ class ScopeChain {
     return undefined;
   }
 }
+
+// ── Built-in identifiers always valid (CE-V02 whitelist) ─────────────────────
+
+const KNOWN_BUILTINS = new Set([
+  'alloc', 'memory', 'List',
+  'true', 'false', 'null', 'undefined', 'Infinity', 'NaN',
+  'String', 'Math', 'JSON', 'console',
+  // type names (populated lazily from TYPES below, but include common ones upfront)
+  'i8','u8','i16','u16','i32','u32','i64','u64','isize','usize',
+  'f32','f64','bool','str','void','ptr','array','iter','funcref',
+]);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -161,6 +190,8 @@ export function inferTypes(ast, filename = '<input>', opts = {}) {
       stmt = stmt.declaration;
     }
     if (stmt.type !== 'ClassDeclaration' || !stmt.id?.name) return;
+    // List is a built-in generic type — never treated as a user class.
+    if (stmt.id.name === 'List') return;
     if (classes.has(stmt.id.name)) return;
     const typeInfo = {
       kind: 'class', name: stmt.id.name, nullable: true, abstract: false,
@@ -281,20 +312,26 @@ export function inferTypes(ast, filename = '<input>', opts = {}) {
     }
   }
 
+  // inferErrors: accumulated CE-V02 (undeclared identifier) errors
+  const inferErrors = [];
+
   // Iterate until signatures stabilize (fixpoint for recursion).
   let changed = true;
   while (changed) {
     changed = false;
+    inferErrors.length = 0; // reset each iteration; only last pass counts
     const prevReturns = new Map(
       Array.from(signatures.entries(), ([name, sig]) => [name, sig.returnType])
     );
     for (const stmt of ast.body) {
-      inferStatement(stmt, scope, signatures, classes, filename, { currentClass: null, imports });
+      inferStatement(stmt, scope, signatures, classes, filename, { currentClass: null, imports, inferErrors });
     }
     for (const [name, sig] of signatures.entries()) {
       if (prevReturns.get(name) !== sig.returnType) changed = true;
     }
   }
+
+  if (inferErrors.length > 0) throw new Error(inferErrors.join('\n'));
 
   return { ast, signatures, classes, imports };
 }
@@ -339,7 +376,13 @@ function inferStatement(stmt, scope, signatures, classes, filename, ctx) {
         if (decl.init) {
           const t = inferExpr(decl.init, scope, signatures, classes, filename, ctx);
           decl._type = t;
-          if (decl.id?.name) scope.define(decl.id.name, t);
+          if (decl.id?.name) {
+            if (stmt.kind === 'const') {
+              scope.defineConst(decl.id.name, t);
+            } else {
+              scope.define(decl.id.name, t);
+            }
+          }
         }
       }
       break;
@@ -433,7 +476,9 @@ function inferStatement(stmt, scope, signatures, classes, filename, ctx) {
           if (!hasDefault) {
             for (const v of sealedInfo.sealedVariants) {
               if (!coveredVariants.has(v)) {
-                throw new TypeError(`CE-CF07: non-exhaustive switch on sealed union '${discType.name}': variant '${v}' not covered (${filename})`);
+                throw ceErr('CE-CF07',
+                  `non-exhaustive switch on sealed union '${discType.name}': variant '${v}' not covered`,
+                  stmt, filename);
               }
             }
           }
@@ -468,7 +513,7 @@ function inferStatement(stmt, scope, signatures, classes, filename, ctx) {
  */
 function inferFunction(node, scope, signatures, classes, filename, ctx) {
   scope.push();
-  const childCtx = { currentClass: null, imports: ctx.imports };
+  const childCtx = { currentClass: null, imports: ctx.imports, inferErrors: ctx.inferErrors };
 
   // Infer parameter types from their default values
   /** @type {Array<{ name: string, type: TypeInfo }>} */
@@ -500,10 +545,9 @@ function inferFunction(node, scope, signatures, classes, filename, ctx) {
         if (lca) {
           returnType = lca;
         } else {
-          throw new Error(
-            `Type mismatch in return types of '${node.id?.name}': ` +
-            `${returnType.name} vs ${returnTypes[i].name} (${filename}:${node.loc?.start?.line ?? '?'})`
-          );
+          throw ceErr('CE-T07',
+            `return type mismatch in '${node.id?.name ?? 'function'}': ${returnType.name} vs ${returnTypes[i].name}`,
+            node, filename);
         }
       } else {
         returnType = unified;
@@ -544,7 +588,7 @@ function inferClass(node, scope, signatures, classes, filename, ctx) {
     }
   }
 
-  const elCtx = { currentClass: classInfo, imports: ctx.imports };
+  const elCtx = { currentClass: classInfo, imports: ctx.imports, inferErrors: ctx.inferErrors };
 
   for (const element of node.body.body) {
     if (element.type === 'PropertyDefinition') {
@@ -622,7 +666,7 @@ function inferClass(node, scope, signatures, classes, filename, ctx) {
  */
 function inferStaticMethod(fnNode, classInfo, scope, signatures, classes, filename, ctx) {
   scope.push();
-  const childCtx = { currentClass: classInfo, imports: ctx.imports };
+  const childCtx = { currentClass: classInfo, imports: ctx.imports, inferErrors: ctx.inferErrors };
 
   /** @type {Array<{ name: string, type: TypeInfo }>} */
   const params = [];
@@ -666,7 +710,7 @@ function inferStaticMethod(fnNode, classInfo, scope, signatures, classes, filena
 function inferMethod(fnNode, classInfo, scope, signatures, classes, filename, ctx) {
   scope.push();
   scope.define('this', classInfo.type);
-  const childCtx = { currentClass: classInfo, imports: ctx.imports };
+  const childCtx = { currentClass: classInfo, imports: ctx.imports, inferErrors: ctx.inferErrors };
 
   /** @type {Array<{ name: string, type: TypeInfo }>} */
   const params = [];
@@ -690,10 +734,9 @@ function inferMethod(fnNode, classInfo, scope, signatures, classes, filename, ct
     for (let i = 1; i < returnTypes.length; i++) {
       const unified = promoteTypes(returnType, returnTypes[i]);
       if (!unified) {
-        throw new Error(
-          `Type mismatch in return types of method: ${returnType.name} vs ${returnTypes[i].name} ` +
-          `(${filename}:${fnNode.loc?.start?.line ?? '?'})`
-        );
+        throw ceErr('CE-T07',
+          `return type mismatch in method: ${returnType.name} vs ${returnTypes[i].name}`,
+          fnNode, filename);
       }
       returnType = unified;
     }
@@ -737,7 +780,13 @@ function collectReturnTypes(node, out, scope, signatures, classes, filename, ctx
         if (decl.init) {
           const t = inferExpr(decl.init, scope, signatures, classes, filename, ctx);
           decl._type = t;
-          if (decl.id?.name) scope.define(decl.id.name, t);
+          if (decl.id?.name) {
+            if (node.kind === 'const') {
+              scope.defineConst(decl.id.name, t);
+            } else {
+              scope.define(decl.id.name, t);
+            }
+          }
         }
       }
       break;
@@ -817,7 +866,9 @@ function collectReturnTypes(node, out, scope, signatures, classes, filename, ctx
           if (!hasDefault) {
             for (const v of sealedInfo.sealedVariants) {
               if (!coveredVariants.has(v)) {
-                throw new TypeError(`CE-CF07: non-exhaustive switch on sealed union '${discType.name}': variant '${v}' not covered (${filename})`);
+                throw ceErr('CE-CF07',
+                  `non-exhaustive switch on sealed union '${discType.name}': variant '${v}' not covered`,
+                  node, filename);
               }
             }
           }
@@ -885,7 +936,11 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
         t = TYPES.funcref;
         node._fnRef = node.name;
       } else {
-        t = TYPES.void; // unresolved — tolerate in phase 1
+        // CE-V02: undeclared identifier (accumulated, not thrown immediately)
+        if (!ctx.imports?.has(node.name) && !KNOWN_BUILTINS.has(node.name)) {
+          ctx.inferErrors?.push(ceErr('CE-V02', `undeclared identifier '${node.name}'`, node, filename).message);
+        }
+        t = TYPES.void; // unresolved — tolerate for now
       }
       break;
     }
@@ -931,7 +986,13 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
               if (ref?.kind === 'funcref') {
                 node._callIndirect = true;
                 t = TYPES.isize;
+              } else if (CAST_TYPES.has(callee.name) || TYPES[callee.name] || classes.has(callee.name)) {
+                t = TYPES.void; // cast or class ref — already handled above
               } else {
+                // CE-V02: undeclared function identifier
+                if (!ctx.imports?.has(callee.name) && !KNOWN_BUILTINS.has(callee.name)) {
+                  ctx.inferErrors?.push(ceErr('CE-V02', `undeclared identifier '${callee.name}'`, callee, filename).message);
+                }
                 t = TYPES.void;
               }
             }
@@ -1004,18 +1065,24 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
       const right = inferExpr(node.right, scope, signatures, classes, filename, ctx);
 
       const cmpOps = new Set(['===', '!==', '<', '>', '<=', '>=']);
+      const arithOps = new Set(['+','-','*','/','%','**','<<','>>','>>>','&','|','^']);
       if (cmpOps.has(node.operator)) {
         t = TYPES.bool;
       } else if (node.operator === '**') {
         // ** always operates in f64 (calls __jswat_math_pow); coerce both sides
         t = TYPES.f64;
       } else {
+        // CE-T05: bool in arithmetic
+        if (arithOps.has(node.operator)) {
+          if (left === TYPES.bool || right === TYPES.bool) {
+            throw ceErr('CE-T05', `bool cannot be used in arithmetic ('${node.operator}')`, node, filename);
+          }
+        }
         const promoted = promoteTypes(left, right);
         if (!promoted) {
-          throw new Error(
-            `Type error: cannot mix ${left.name} and ${right.name} in '${node.operator}' ` +
-            `without explicit cast (${filename}:${node.loc?.start?.line ?? '?'})`
-          );
+          throw ceErr('CE-T02',
+            `cannot mix ${left.name} and ${right.name} without explicit cast in '${node.operator}'`,
+            node, filename);
         }
         t = promoted;
       }
@@ -1035,6 +1102,10 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
 
     case 'AssignmentExpression':
       {
+        // CE-V01: const reassignment
+        if (node.left.type === 'Identifier' && scope.isConst(node.left.name)) {
+          throw ceErr('CE-V01', `cannot reassign const '${node.left.name}'`, node.left, filename);
+        }
         const leftType = inferExpr(node.left, scope, signatures, classes, filename, ctx);
         t = inferExpr(node.right, scope, signatures, classes, filename, ctx);
         if (node.left.type === 'MemberExpression') {
@@ -1067,9 +1138,17 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
 
     case 'ConditionalExpression': {
       inferExpr(node.test, scope, signatures, classes, filename, ctx);
-      const left  = inferExpr(node.consequent, scope, signatures, classes, filename, ctx);
-      const right = inferExpr(node.alternate,  scope, signatures, classes, filename, ctx);
-      t = promoteTypes(left, right) ?? left;
+      const consType = inferExpr(node.consequent, scope, signatures, classes, filename, ctx);
+      const altType  = inferExpr(node.alternate,  scope, signatures, classes, filename, ctx);
+      // CE-CF06: ternary type mismatch
+      if (consType && altType && consType !== altType &&
+          consType.wasmType !== altType.wasmType &&
+          consType !== TYPES.void && altType !== TYPES.void) {
+        throw ceErr('CE-CF06',
+          `ternary branches have incompatible types: '${consType.name}' vs '${altType.name}'`,
+          node, filename);
+      }
+      t = promoteTypes(consType, altType) ?? consType;
       break;
     }
 
@@ -1097,6 +1176,25 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           inferExpr(node.property, scope, signatures, classes, filename, ctx);
           t = TYPES.isize;
           break;
+        }
+        // CE-A01: bracket notation on non-array/list/str
+        if (node.computed && objType &&
+            objType !== TYPES.unknown && objType !== TYPES.void &&
+            objType.kind !== 'array' && objType.kind !== 'list' && objType.kind !== 'str') {
+          throw ceErr('CE-A01', `bracket notation '[]' is not allowed on type '${objType.name}'`, node, filename);
+        }
+        // List<T> member access: buf[i], buf.length, buf.$ptr, buf.$byteSize
+        if (objType?.kind === 'list') {
+          if (node.computed) {
+            inferExpr(node.property, scope, signatures, classes, filename, ctx);
+            t = objType.elemType;
+            break;
+          }
+          const propName = node.property?.name;
+          if (propName === 'length' || propName === '$ptr' || propName === '$byteSize') {
+            t = TYPES.usize; break;
+          }
+          t = TYPES.void; break;
         }
         if (objType && objType.kind === 'class') {
           const classInfo = classes.get(objType.name);
@@ -1133,7 +1231,16 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
 
     case 'TemplateLiteral':
       for (const expr of node.expressions ?? []) {
-        inferExpr(expr, scope, signatures, classes, filename, ctx);
+        const exprType = inferExpr(expr, scope, signatures, classes, filename, ctx);
+        // CE-T09: class used in template literal without Symbol.toStr
+        if (exprType?.kind === 'class') {
+          const info = classes.get(exprType.name);
+          if (info && !info.methods.has('Symbol.toStr')) {
+            throw ceErr('CE-T09',
+              `class '${exprType.name}' used in template literal has no Symbol.toStr method`,
+              expr, filename);
+          }
+        }
       }
       t = TYPES.str;
       break;
@@ -1150,7 +1257,34 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
       break;
 
     case 'NewExpression':
+      if (node.callee?.type === 'Identifier' && node.callee.name === 'List') {
+        // new List(ElemType, count) — fixed-size typed array (spec §395)
+        const arg0 = node.arguments?.[0];
+        const arg1 = node.arguments?.[1];
+        if (!arg0 || arg0.type !== 'Identifier') {
+          throw ceErr('CE-A11', `List first argument must be an element type name`, node, filename);
+        }
+        const elemType = TYPES[arg0.name];
+        if (!elemType || (!elemType.isInteger && !elemType.isFloat && elemType.kind !== 'bool')) {
+          throw ceErr('CE-A11', `List element type must be a numeric primitive or bool, got '${arg0.name}'`, arg0, filename);
+        }
+        if (arg1) inferExpr(arg1, scope, signatures, classes, filename, ctx);
+        node._listElemType = elemType;
+        node._listCount = arg1 ?? null;
+        // Cache type on node so the fixpoint loop returns the SAME reference each iteration,
+        // preventing the !== comparison from triggering infinite re-inference.
+        if (!node._listType) {
+          node._listType = { kind: 'list', name: 'List', elemType, nullable: true, abstract: false,
+                             wasmType: 'i32', isInteger: false, isFloat: false, isSigned: false, bits: 32, isHeap: true };
+        }
+        t = node._listType;
+        break;
+      }
       if (node.callee?.type === 'Identifier') {
+        // CE-T06: abstract type instantiation
+        if (TYPES[node.callee.name]?.abstract) {
+          throw ceErr('CE-T06', `cannot instantiate abstract type '${node.callee.name}'`, node, filename);
+        }
         if (classes.has(node.callee.name)) {
           const classInfo = classes.get(node.callee.name);
           // Named argument constructor: `new Vec2({ x: 1.0, y: 2.0 })`
@@ -1171,7 +1305,7 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
                 (p.type === 'AssignmentPattern' ? p.left?.name : p.name) === key
               );
               if (!paramExists) {
-                throw new TypeError(`CE-C01: unknown constructor argument '${key}' for class '${node.callee.name}' (${filename})`);
+                throw ceErr('CE-C01', `unknown constructor argument '${key}' for class '${node.callee.name}'`, node, filename);
               }
             }
             // Rewrite arguments in constructor parameter order

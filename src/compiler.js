@@ -102,3 +102,5 @@ export async function compileSource(source, filename = '<input>', opts = {}) {
   return { wat, wasm, binary: wasm, warnings, layoutMap, exportList, wit: wit ?? null };
 }
 
+/** Named alias for compileSource — preferred name for library consumers. */
+export const compile = compileSource;

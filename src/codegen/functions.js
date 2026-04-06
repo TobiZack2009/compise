@@ -77,6 +77,8 @@ export function buildStringTable(ast) {
   /** @param {object} node */
   function visit(node) {
     if (!node || typeof node !== 'object') return;
+    // Import source paths are compile-time only — never used at runtime.
+    if (node.type === 'ImportDeclaration') return;
     if (node.type === 'Literal' && typeof node.value === 'string') {
       if (!strings.has(node.value)) {
         const bytes = encoder.encode(node.value);

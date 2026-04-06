@@ -176,13 +176,11 @@ describe('validator — banned constructs', () => {
     accepts(`function f(x = 0) { if (x instanceof Object) { return 1; } return 0; }`);
   });
 
-  // ── Warnings (no throw) ────────────────────────────────────────────────────
+  // ── CE-V06: var is banned ───────────────────────────────────────────────────
 
-  it('var produces a warning but does not throw', () => {
+  it('var throws CE-V06', () => {
     const ast = parseSource(`function f(x = 0) { var y = x + 1; return y; }`);
-    const { warnings } = validate(ast);
-    assert.ok(warnings.length > 0, 'expected at least one warning');
-    assert.ok(warnings[0].toLowerCase().includes('var'), `expected warning about var, got: ${warnings[0]}`);
+    assert.throws(() => validate(ast), /CE-V06/);
   });
 
 });

@@ -53,6 +53,26 @@ function containsTypeof(node) {
 }
 
 /**
+ * Check for nested destructuring (ArrayPattern/ObjectPattern inside another pattern).
+ * @param {object} id  VariableDeclarator id node
+ * @returns {boolean}
+ */
+function hasNestedDestructuring(id) {
+  if (!id) return false;
+  if (id.type === 'ArrayPattern') {
+    for (const el of id.elements ?? []) {
+      if (el && (el.type === 'ArrayPattern' || el.type === 'ObjectPattern')) return true;
+    }
+  } else if (id.type === 'ObjectPattern') {
+    for (const prop of id.properties ?? []) {
+      const val = prop.value ?? prop;
+      if (val && (val.type === 'ArrayPattern' || val.type === 'ObjectPattern')) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Semantic validation pass.
  * @param {object} ast  acorn Program AST
  * @param {string} [filename='<input>']
@@ -63,10 +83,15 @@ export function validate(ast, filename = '<input>') {
   const errors = [];
   const warnings = [];
 
-  /** @param {string} msg @param {object} node */
-  function err(msg, node) {
+  /**
+   * @param {string} code CE- code
+   * @param {string} msg
+   * @param {object} node
+   */
+  function err(code, msg, node) {
     const line = node?.loc?.start?.line ?? '?';
-    errors.push(`${msg} (${filename}:${line})`);
+    const col  = node?.loc?.start?.column != null ? node.loc.start.column + 1 : '?';
+    errors.push(`${code}: ${msg} (${filename}:${line}:${col})`);
   }
 
   /** @param {string} msg @param {object} node */
@@ -79,7 +104,6 @@ export function validate(ast, filename = '<input>') {
   const importedNames = new Set();
   for (const node of ast.body) {
     if (node.type === 'ImportDeclaration') {
-      // default import
       for (const spec of node.specifiers || []) {
         if (spec.local?.name) importedNames.add(spec.local.name);
       }
@@ -89,17 +113,94 @@ export function validate(ast, filename = '<input>') {
   // Context stack
   let insideClassMethod = 0;  // counter — incremented when entering class method
   let insideClass = 0;        // counter — incremented when entering class body
+  let loopDepth = 0;          // counter for CE-CF04
+
+  // Scope stack for CE-V04 duplicate declaration tracking
+  const scopes = [new Set()];
+
+  function pushScope() { scopes.push(new Set()); }
+  function popScope()  { scopes.pop(); }
+  function currentScope() { return scopes[scopes.length - 1]; }
+
+  function declareInScope(name, node) {
+    const scope = currentScope();
+    if (scope.has(name)) {
+      err('CE-V04', `duplicate declaration '${name}'`, node);
+    } else {
+      scope.add(name);
+    }
+  }
 
   walk(ast, {
     enter: {
       /** @param {object} node */
-      ClassDeclaration(node)  { insideClass++; },
+      ClassDeclaration(node)  {
+        insideClass++;
+        const name = node.id?.name;
+        if (name) {
+          if (name.startsWith('$')) err('CE-V05', `identifier '${name}' must not start with '$'`, node.id ?? node);
+          declareInScope(name, node.id ?? node);
+        }
+      },
       /** @param {object} node */
       ClassExpression(node)   { insideClass++; },
 
       /** @param {object} node */
       MethodDefinition(node) {
         if (insideClass > 0) insideClassMethod++;
+        pushScope();
+      },
+
+      /** @param {object} node */
+      BlockStatement(node) {
+        pushScope();
+        // CE-CF05: unreachable code
+        const terminals = new Set(['ReturnStatement','BreakStatement','ThrowStatement','ContinueStatement']);
+        const body = node.body ?? [];
+        let termIdx = -1;
+        for (let i = 0; i < body.length; i++) {
+          if (terminals.has(body[i].type)) { termIdx = i; break; }
+        }
+        if (termIdx !== -1 && termIdx + 1 < body.length) {
+          err('CE-CF05', 'unreachable code after return/break/throw/continue', body[termIdx + 1]);
+        }
+      },
+
+      // ── Loops (for CE-CF04) ──────────────────────────────────────────────────
+      /** @param {object} node */
+      ForStatement(node)      { loopDepth++; pushScope(); },
+      /** @param {object} node */
+      ForOfStatement(node)    { loopDepth++; },
+      /** @param {object} node */
+      WhileStatement(node)    { loopDepth++; },
+      /** @param {object} node */
+      DoWhileStatement(node)  { loopDepth++; },
+      /** @param {object} node */
+      SwitchStatement(node) {
+        loopDepth++;
+        // CE-CF02: switch fallthrough
+        const cases = node.cases ?? [];
+        for (let i = 0; i < cases.length - 1; i++) {
+          const c = cases[i];
+          const conseq = c.consequent ?? [];
+          if (conseq.length === 0) continue; // empty case — intentional fallthrough
+          const last = conseq[conseq.length - 1];
+          const isTerminal = last.type === 'BreakStatement' ||
+                             last.type === 'ReturnStatement' ||
+                             last.type === 'ThrowStatement';
+          if (!isTerminal) {
+            err('CE-CF02', 'switch case fallthrough is not allowed; add break or return', c);
+          }
+        }
+      },
+
+      /** @param {object} node */
+      BreakStatement(node) {
+        if (loopDepth === 0) err('CE-CF04', 'break outside loop or switch', node);
+      },
+      /** @param {object} node */
+      ContinueStatement(node) {
+        if (loopDepth === 0) err('CE-CF04', 'continue outside loop', node);
       },
 
       // ── Banned expressions ──────────────────────────────────────────────
@@ -108,13 +209,13 @@ export function validate(ast, filename = '<input>') {
       CallExpression(node) {
         // eval(...)
         if (node.callee?.type === 'Identifier' && node.callee.name === 'eval') {
-          err("eval() is not allowed", node);
+          err('CE-A02', 'eval() is not allowed', node);
         }
         // JSON.parse(...)
         if (node.callee?.type === 'MemberExpression' &&
             node.callee.object?.name === 'JSON' &&
             node.callee.property?.name === 'parse') {
-          err("JSON.parse is not allowed", node);
+          err('CE-A02', 'JSON.parse is not allowed', node);
         }
       },
 
@@ -122,7 +223,7 @@ export function validate(ast, filename = '<input>') {
       NewExpression(node) {
         // new Function(...)
         if (node.callee?.type === 'Identifier' && node.callee.name === 'Function') {
-          err("new Function() is not allowed", node);
+          err('CE-A02', 'new Function() is not allowed', node);
         }
         // Named argument constructor: `new Foo({ key: val })` — mark the ObjectExpression as allowed
         if (node.arguments?.length === 1 && node.arguments[0]?.type === 'ObjectExpression') {
@@ -133,7 +234,7 @@ export function validate(ast, filename = '<input>') {
       /** @param {object} node */
       UnaryExpression(node) {
         if (node.operator === 'delete') {
-          err("delete is not allowed", node);
+          err('CE-A06', 'delete is not allowed', node);
         }
       },
 
@@ -141,20 +242,20 @@ export function validate(ast, filename = '<input>') {
       ObjectExpression(node) {
         // Ban standalone object literals, but allow named argument blocks inside `new Foo({...})`
         if (node._namedArgBlock) return;
-        err("Object literals {} are not allowed; use class construction blocks inside new", node);
+        err('CE-A08', 'object literals {} are not allowed; use class construction blocks inside new', node);
       },
 
       /** @param {object} node */
       IfStatement(node) {
         if (containsTypeof(node.test)) {
-          err("typeof in branch condition is not allowed; use instanceof", node);
+          err('CE-T11', 'typeof in branch condition is not allowed; use instanceof', node);
         }
       },
 
       /** @param {object} node */
       Identifier(node) {
-        if (node.name === 'Proxy')   err("Proxy is not allowed", node);
-        if (node.name === 'Reflect') err("Reflect is not allowed", node);
+        if (node.name === 'Proxy')   err('CE-A09', 'Proxy is not allowed', node);
+        if (node.name === 'Reflect') err('CE-A09', 'Reflect is not allowed', node);
       },
 
       /** @param {object} node */
@@ -162,23 +263,42 @@ export function validate(ast, filename = '<input>') {
         // Math.* without import
         if (node.object?.type === 'Identifier' && node.object.name === 'Math') {
           if (!importedNames.has('Math')) {
-            err("Math.* requires importing Math from 'std/math'", node);
+            err('CE-A09', "Math.* requires importing Math from 'std/math'", node);
           }
         }
-        // Bracket (computed) access is supported on arrays; class fields require direct access.
+        // CE-A03: prototype access
+        const propName = node.property?.name;
+        if (propName === '__proto__' || propName === 'prototype') {
+          err('CE-A03', `access to '${propName}' is not allowed`, node);
+        }
       },
 
       /** @param {object} node */
       ThisExpression(node) {
         if (insideClassMethod === 0) {
-          err("'this' is only valid inside class methods", node);
+          err('CE-C05', "'this' is only valid inside class methods", node);
         }
       },
 
       /** @param {object} node */
       VariableDeclaration(node) {
         if (node.kind === 'var') {
-          warn("Consider using 'let' instead of 'var'", node);
+          err('CE-V06', "use 'let' or 'const' instead of 'var'", node);
+        }
+      },
+
+      /** @param {object} node */
+      VariableDeclarator(node) {
+        const id = node.id;
+        if (!id) return;
+        const name = id.name;
+        if (name) {
+          if (name.startsWith('$')) err('CE-V05', `identifier '${name}' must not start with '$'`, id);
+          declareInScope(name, id);
+        }
+        // CE-A04: nested destructuring
+        if (hasNestedDestructuring(id)) {
+          err('CE-A04', 'nested destructuring is not allowed', id);
         }
       },
 
@@ -186,15 +306,23 @@ export function validate(ast, filename = '<input>') {
 
       /** @param {object} node */
       FunctionDeclaration(node) {
+        const name = node.id?.name;
+        if (name) {
+          if (name.startsWith('$')) err('CE-V05', `identifier '${name}' must not start with '$'`, node.id);
+          declareInScope(name, node.id ?? node);
+        }
         checkParams(node.params, node, filename, errors);
+        pushScope();
       },
       /** @param {object} node */
       FunctionExpression(node) {
         checkParams(node.params, node, filename, errors);
+        pushScope();
       },
       /** @param {object} node */
       ArrowFunctionExpression(node) {
         checkParams(node.params, node, filename, errors);
+        pushScope();
       },
     },
 
@@ -204,7 +332,28 @@ export function validate(ast, filename = '<input>') {
       /** @param {object} node */
       ClassExpression(node)   { insideClass--; },
       /** @param {object} node */
-      MethodDefinition(node)  { if (insideClass > 0) insideClassMethod--; },
+      MethodDefinition(node)  {
+        if (insideClass > 0) insideClassMethod--;
+        popScope();
+      },
+      /** @param {object} node */
+      BlockStatement(node)    { popScope(); },
+      /** @param {object} node */
+      ForStatement(node)      { loopDepth--; popScope(); },
+      /** @param {object} node */
+      ForOfStatement(node)    { loopDepth--; },
+      /** @param {object} node */
+      WhileStatement(node)    { loopDepth--; },
+      /** @param {object} node */
+      DoWhileStatement(node)  { loopDepth--; },
+      /** @param {object} node */
+      SwitchStatement(node)   { loopDepth--; },
+      /** @param {object} node */
+      FunctionDeclaration(node) { popScope(); },
+      /** @param {object} node */
+      FunctionExpression(node)  { popScope(); },
+      /** @param {object} node */
+      ArrowFunctionExpression(node) { popScope(); },
     },
   });
 
@@ -223,7 +372,8 @@ function checkParams(params, fnNode, filename, errors) {
   for (const p of params) {
     if (p.type !== 'AssignmentPattern' && p.type !== 'RestElement') {
       const line = p?.loc?.start?.line ?? fnNode?.loc?.start?.line ?? '?';
-      errors.push(`Every parameter must have a default value (${filename}:${line})`);
+      const col  = p?.loc?.start?.column != null ? p.loc.start.column + 1 : '?';
+      errors.push(`CE-F01: every parameter must have a default value (${filename}:${line}:${col})`);
     }
   }
 }

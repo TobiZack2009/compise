@@ -75,6 +75,37 @@ export function genStore(mod, ptr, value, typeInfo, offset = 0) {
 }
 
 /**
+ * Generate a load for a List<T> element at the given index.
+ * Layout: header(12) + length(4) + elements starting at offset 16.
+ * @param {any} mod  binaryen Module
+ * @param {number} listPtr  ExpressionRef (i32 pointer to list)
+ * @param {number} idxExpr  ExpressionRef (i32 index)
+ * @param {TypeInfo} elemType
+ * @returns {number} ExpressionRef
+ */
+export function genListLoad(mod, listPtr, idxExpr, elemType) {
+  const stride = typeSize(elemType);
+  // addr = listPtr + 16 + idx * stride
+  const addr = mod.i32.add(listPtr, mod.i32.add(mod.i32.const(16), mod.i32.mul(idxExpr, mod.i32.const(stride))));
+  return genLoad(mod, addr, elemType, 0);
+}
+
+/**
+ * Generate a store for a List<T> element at the given index.
+ * @param {any} mod  binaryen Module
+ * @param {number} listPtr  ExpressionRef (i32 pointer to list)
+ * @param {number} idxExpr  ExpressionRef (i32 index)
+ * @param {number} valExpr  ExpressionRef (value to store)
+ * @param {TypeInfo} elemType
+ * @returns {number} ExpressionRef
+ */
+export function genListStore(mod, listPtr, idxExpr, valExpr, elemType) {
+  const stride = typeSize(elemType);
+  const addr = mod.i32.add(listPtr, mod.i32.add(mod.i32.const(16), mod.i32.mul(idxExpr, mod.i32.const(stride))));
+  return genStore(mod, addr, valExpr, elemType, 0);
+}
+
+/**
  * Generate a binary operation expression.
  * @param {any} mod  binaryen Module
  * @param {string} op  JS operator string

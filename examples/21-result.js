@@ -19,8 +19,8 @@ function divide(a = 0, b = 0) {
 
 function printResult(r = Result) {
   switch (r) {
-    case Ok:  console.log(`Result: ${String.from(r.value)}`);
-    case Err: console.log(`Error: ${r.message}`);
+    case Ok:  console.log(`Result: ${String.from(r.value)}`); break;
+    case Err: console.log(`Error: ${r.message}`); break;
   }
 }
 
