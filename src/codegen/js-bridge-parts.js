@@ -84,6 +84,12 @@ const _envHooks = {
     if (fd === 2) process.stderr.write(buf);
     else process.stdout.write(buf);
   },
+  __jswat_console_error: (ptr, len) => {
+    console.error(_readStr(ptr, len));
+  },
+  __jswat_stderr_write: (ptr, len) => {
+    throw new Error(_readStr(ptr, len));
+  },
   __jswat_io_read: (buf, maxLen) => {
     // Synchronous stdin read via fd 0 (Node.js).
     if (!_fs) return 0;

@@ -141,6 +141,69 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
     case 'ExpressionStatement':
       return genExprStatement(stmt.expression, filename, ctx);
 
+    case 'ThrowStatement': {
+      const ptr = genExpr(stmt.argument, filename, ctx);
+      return mod.throw('__jswat_exception', [ptr]);
+    }
+
+    case 'TryStatement': {
+      const outerLabel = ctx.nextLabel('exc');
+      const bodyBlock = mod.block(null,
+        stmt.block.body.map(s => genStatement(s, fnReturnType, ctx, filename)),
+        binaryen.none);
+
+      if (!stmt.handler && !stmt.finalizer) return bodyBlock;
+
+      const makeCatchBody = () => {
+        const pop = ctx.localSet('__exc_ptr', mod.i32.pop());
+        const handlerBody = stmt.handler?.body?.body ?? [];
+        const paramName = stmt.handler?.param?.name ?? null;
+        if (!paramName) {
+          return mod.block(null,
+            [pop, ...handlerBody.map(s => genStatement(s, fnReturnType, ctx, filename))],
+            binaryen.none);
+        }
+        const excInfo = ctx._localMap.get('__exc_ptr');
+        if (!excInfo) {
+          return mod.block(null,
+            [pop, ...handlerBody.map(s => genStatement(s, fnReturnType, ctx, filename))],
+            binaryen.none);
+        }
+        const prev = ctx._localMap.get(paramName) ?? null;
+        ctx._localMap.set(paramName, excInfo);
+        const bodyExpr = mod.block(null,
+          [pop, ...handlerBody.map(s => genStatement(s, fnReturnType, ctx, filename))],
+          binaryen.none);
+        if (prev) ctx._localMap.set(paramName, prev);
+        else ctx._localMap.delete(paramName);
+        return bodyExpr;
+      };
+
+      const makeFinally = () =>
+        mod.block(null,
+          (stmt.finalizer?.body ?? []).map(s => genStatement(s, fnReturnType, ctx, filename)),
+          binaryen.none);
+
+      if (stmt.handler && !stmt.finalizer) {
+        return mod.try(outerLabel, bodyBlock, ['__jswat_exception'], [makeCatchBody()], null);
+      }
+
+      if (!stmt.handler) {
+        return mod.block(null, [
+          mod.try(outerLabel, bodyBlock, [], [
+            mod.block(null, [makeFinally(), mod.rethrow(outerLabel)], binaryen.none),
+          ], null),
+          makeFinally(),
+        ], binaryen.none);
+      }
+
+      const innerLabel = ctx.nextLabel('exc_inner');
+      const innerTry = mod.try(innerLabel, bodyBlock, ['__jswat_exception'], [makeCatchBody()], null);
+      const outerBody = mod.block(null, [innerTry, makeFinally()], binaryen.none);
+      const catchAll = mod.block(null, [makeFinally(), mod.rethrow(outerLabel)], binaryen.none);
+      return mod.try(outerLabel, outerBody, [], [catchAll], null);
+    }
+
     case 'BlockStatement': {
       const stmts = stmt.body.map(s => genStatement(s, fnReturnType, ctx, filename));
       if (stmts.length === 0) return mod.nop();

@@ -5,7 +5,14 @@
 
 import { strict as assert } from 'assert';
 import { readFile } from 'fs/promises';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { join } from 'path';
 import { compileSource } from '../src/compiler.js';
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const STD_ROOT = join(ROOT, 'std');
+const readFileStd = p => readFileSync(p, 'utf8');
 
 /**
  * Compile a source file and return the instantiated WASM exports.
@@ -14,7 +21,7 @@ import { compileSource } from '../src/compiler.js';
  */
 async function instantiateFile(path, importObject = undefined) {
   const source = await readFile(new URL('../' + path, import.meta.url), 'utf8');
-  const { wasm } = await compileSource(source, path);
+  const { wasm } = await compileSource(source, path, { readFile: readFileStd, stdRoot: STD_ROOT });
   const { instance } = await WebAssembly.instantiate(wasm, importObject);
   if (instance.exports.__start) instance.exports.__start();
   return instance.exports;
@@ -26,7 +33,7 @@ async function instantiateFile(path, importObject = undefined) {
  * @returns {Promise<WebAssembly.Exports>}
  */
 async function instantiate(source) {
-  const { wasm } = await compileSource(source);
+  const { wasm } = await compileSource(source, '<test>', { readFile: readFileStd, stdRoot: STD_ROOT });
   const { instance } = await WebAssembly.instantiate(wasm);
   if (instance.exports.__start) instance.exports.__start();
   return instance.exports;
@@ -379,7 +386,7 @@ describe('section 21 examples (Phase 2+)', () => {
   it('21-game-loop.js — classes, static fields/methods/getters, inheritance, std/math', async () => {
     let output = '';
     const source = await readFile(new URL('../examples/21-game-loop.js', import.meta.url), 'utf8');
-    const { wasm } = await compileSource(source, '21-game-loop.js');
+    const { wasm } = await compileSource(source, '21-game-loop.js', { readFile: readFileStd, stdRoot: STD_ROOT });
     const importObject = {
       wasi_snapshot_preview1: {
         fd_write(_fd, iovs_ptr, iovs_len, nwritten_ptr) {

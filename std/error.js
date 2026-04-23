@@ -24,3 +24,11 @@ export class ParseError extends AppError {
 export class NotFoundError extends AppError {
   constructor(msg = "") { super(msg); }
 }
+
+export class BoundsError extends AppError {
+  constructor(msg = "") { super(msg); }
+}
+
+export class MathError extends AppError {
+  constructor(msg = "") { super(msg); }
+}

@@ -3,10 +3,17 @@
  */
 
 import { strict as assert } from 'assert';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { join } from 'path';
 import { compileSource } from '../src/compiler.js';
 
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const STD_ROOT = join(ROOT, 'std');
+const readFile = p => readFileSync(p, 'utf8');
+
 async function instantiate(source) {
-  const { wasm } = await compileSource(source);
+  const { wasm } = await compileSource(source, '<test>', { readFile, stdRoot: STD_ROOT });
   const { instance } = await WebAssembly.instantiate(wasm);
   return instance.exports;
 }

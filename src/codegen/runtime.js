@@ -1648,188 +1648,6 @@ export function buildClockFunctions(mod, clockBase) {
   }
 }
 
-// ── std/math ──────────────────────────────────────────────────────────────────
-
-/**
- * Build std/math functions.
- * Native ops are thin wrappers; pow/sin/cos/exp/log use polynomial approximations.
- * @param {any} mod
- */
-export function buildMathFunctions(mod) {
-  // ── Native single-arg wrappers ─────────────────────────────────────────────
-  for (const [name, op] of [
-    ['__jswat_math_sqrt',  'sqrt'],
-    ['__jswat_math_floor', 'floor'],
-    ['__jswat_math_ceil',  'ceil'],
-    ['__jswat_math_abs',   'abs'],
-    ['__jswat_math_trunc', 'trunc'],
-  ]) {
-    mod.addFunction(name, binaryen.createType([f64]), f64, [],
-      mod.return(mod.f64[op](mod.local.get(0, f64))));
-  }
-
-  // ── Native two-arg wrappers ────────────────────────────────────────────────
-  for (const [name, op] of [['__jswat_math_min', 'min'], ['__jswat_math_max', 'max']]) {
-    mod.addFunction(name, binaryen.createType([f64, f64]), f64, [],
-      mod.return(mod.f64[op](mod.local.get(0, f64), mod.local.get(1, f64))));
-  }
-
-  // ── exp(x): Taylor series sum(x^n/n!) for n=0..20 ────────────────────────
-  // params: x(0:f64); locals: result(1:f64), term(2:f64), i(3:i32)
-  {
-    const gx = () => mod.local.get(0, f64);
-    const gr = () => mod.local.get(1, f64);
-    const gt = () => mod.local.get(2, f64);
-    const gi = () => mod.local.get(3, i32);
-    const body = mod.block(null, [
-      mod.local.set(1, mod.f64.const(1.0)),
-      mod.local.set(2, mod.f64.const(1.0)),
-      mod.local.set(3, mod.i32.const(1)),
-      mod.block('exp_done', [
-        mod.loop('exp_loop', mod.block(null, [
-          mod.br_if('exp_done', mod.i32.gt_s(gi(), mod.i32.const(20))),
-          mod.local.set(2, mod.f64.div(mod.f64.mul(gt(), gx()), mod.f64.convert_s.i32(gi()))),
-          mod.local.set(1, mod.f64.add(gr(), gt())),
-          mod.local.set(3, mod.i32.add(gi(), mod.i32.const(1))),
-          mod.br('exp_loop'),
-        ], none)),
-      ], none),
-      mod.return(gr()),
-    ], f64);
-    mod.addFunction('__jswat_math_exp', binaryen.createType([f64]), f64, [f64, f64, i32], body);
-  }
-
-  // ── log(x): 2*atanh((x-1)/(x+1)), atanh(t)=sum(t^(2k+1)/(2k+1)) ─────────
-  // params: x(0:f64); locals: t(1:f64), t2(2:f64), term(3:f64), result(4:f64), k(5:i32)
-  {
-    const gx    = () => mod.local.get(0, f64);
-    const gt    = () => mod.local.get(1, f64);
-    const gt2   = () => mod.local.get(2, f64);
-    const gterm = () => mod.local.get(3, f64);
-    const gr    = () => mod.local.get(4, f64);
-    const gk    = () => mod.local.get(5, i32);
-    const body = mod.block(null, [
-      mod.if(mod.f64.le(gx(), mod.f64.const(0.0)), mod.return(mod.f64.const(0.0))),
-      mod.local.set(1, mod.f64.div(
-        mod.f64.sub(gx(), mod.f64.const(1.0)),
-        mod.f64.add(gx(), mod.f64.const(1.0)))),
-      mod.local.set(2, mod.f64.mul(gt(), gt())),
-      mod.local.set(3, gt()),
-      mod.local.set(4, mod.f64.const(0.0)),
-      mod.local.set(5, mod.i32.const(0)),
-      mod.block('log_done', [
-        mod.loop('log_loop', mod.block(null, [
-          mod.br_if('log_done', mod.i32.gt_s(gk(), mod.i32.const(24))),
-          mod.local.set(4, mod.f64.add(gr(), mod.f64.div(
-            gterm(),
-            mod.f64.convert_s.i32(mod.i32.add(mod.i32.mul(gk(), mod.i32.const(2)), mod.i32.const(1)))))),
-          mod.local.set(3, mod.f64.mul(gterm(), gt2())),
-          mod.local.set(5, mod.i32.add(gk(), mod.i32.const(1))),
-          mod.br('log_loop'),
-        ], none)),
-      ], none),
-      mod.return(mod.f64.mul(mod.f64.const(2.0), gr())),
-    ], f64);
-    mod.addFunction('__jswat_math_log', binaryen.createType([f64]), f64, [f64, f64, f64, f64, i32], body);
-  }
-
-  // ── sin(x): Taylor with arg reduction to [-π, π] ─────────────────────────
-  // params: x(0:f64); locals: k(1:f64), xsq(2:f64), result(3:f64), term(4:f64), n(5:i32), sign(6:f64)
-  {
-    const TWO_PI = 6.283185307179586;
-    const PI     = 3.141592653589793;
-    const gx    = () => mod.local.get(0, f64);
-    const gk    = () => mod.local.get(1, f64);
-    const gxsq  = () => mod.local.get(2, f64);
-    const gr    = () => mod.local.get(3, f64);
-    const gterm = () => mod.local.get(4, f64);
-    const gn    = () => mod.local.get(5, i32);
-    const gsign = () => mod.local.get(6, f64);
-    const body = mod.block(null, [
-      mod.local.set(1, mod.f64.floor(mod.f64.div(gx(), mod.f64.const(TWO_PI)))),
-      mod.local.set(0, mod.f64.sub(gx(), mod.f64.mul(gk(), mod.f64.const(TWO_PI)))),
-      mod.if(mod.f64.gt(gx(), mod.f64.const(PI)),
-        mod.local.set(0, mod.f64.sub(gx(), mod.f64.const(TWO_PI)))),
-      mod.if(mod.f64.lt(gx(), mod.f64.const(-PI)),
-        mod.local.set(0, mod.f64.add(gx(), mod.f64.const(TWO_PI)))),
-      mod.local.set(2, mod.f64.mul(gx(), gx())),
-      mod.local.set(3, mod.f64.const(0.0)),
-      mod.local.set(4, gx()),
-      mod.local.set(5, mod.i32.const(0)),
-      mod.local.set(6, mod.f64.const(1.0)),
-      mod.block('sin_done', [
-        mod.loop('sin_loop', mod.block(null, [
-          mod.br_if('sin_done', mod.i32.gt_s(gn(), mod.i32.const(12))),
-          mod.local.set(3, mod.f64.add(gr(), mod.f64.mul(gsign(), gterm()))),
-          mod.local.set(4, mod.f64.div(
-            mod.f64.mul(gterm(), gxsq()),
-            mod.f64.convert_s.i32(mod.i32.mul(
-              mod.i32.add(mod.i32.mul(gn(), mod.i32.const(2)), mod.i32.const(2)),
-              mod.i32.add(mod.i32.mul(gn(), mod.i32.const(2)), mod.i32.const(3)))))),
-          mod.local.set(6, mod.f64.sub(mod.f64.const(0.0), gsign())),
-          mod.local.set(5, mod.i32.add(gn(), mod.i32.const(1))),
-          mod.br('sin_loop'),
-        ], none)),
-      ], none),
-      mod.return(gr()),
-    ], f64);
-    mod.addFunction('__jswat_math_sin',
-      binaryen.createType([f64]), f64, [f64, f64, f64, f64, i32, f64], body);
-  }
-
-  // ── cos(x): Taylor with arg reduction to [-π, π] ─────────────────────────
-  // params: x(0:f64); locals: k(1:f64), xsq(2:f64), result(3:f64), term(4:f64), n(5:i32), sign(6:f64)
-  {
-    const TWO_PI = 6.283185307179586;
-    const PI     = 3.141592653589793;
-    const gx    = () => mod.local.get(0, f64);
-    const gk    = () => mod.local.get(1, f64);
-    const gxsq  = () => mod.local.get(2, f64);
-    const gr    = () => mod.local.get(3, f64);
-    const gterm = () => mod.local.get(4, f64);
-    const gn    = () => mod.local.get(5, i32);
-    const gsign = () => mod.local.get(6, f64);
-    const body = mod.block(null, [
-      mod.local.set(1, mod.f64.floor(mod.f64.div(gx(), mod.f64.const(TWO_PI)))),
-      mod.local.set(0, mod.f64.sub(gx(), mod.f64.mul(gk(), mod.f64.const(TWO_PI)))),
-      mod.if(mod.f64.gt(gx(), mod.f64.const(PI)),
-        mod.local.set(0, mod.f64.sub(gx(), mod.f64.const(TWO_PI)))),
-      mod.if(mod.f64.lt(gx(), mod.f64.const(-PI)),
-        mod.local.set(0, mod.f64.add(gx(), mod.f64.const(TWO_PI)))),
-      mod.local.set(2, mod.f64.mul(gx(), gx())),
-      mod.local.set(3, mod.f64.const(0.0)),
-      mod.local.set(4, mod.f64.const(1.0)),
-      mod.local.set(5, mod.i32.const(0)),
-      mod.local.set(6, mod.f64.const(1.0)),
-      mod.block('cos_done', [
-        mod.loop('cos_loop', mod.block(null, [
-          mod.br_if('cos_done', mod.i32.gt_s(gn(), mod.i32.const(12))),
-          mod.local.set(3, mod.f64.add(gr(), mod.f64.mul(gsign(), gterm()))),
-          mod.local.set(4, mod.f64.div(
-            mod.f64.mul(gterm(), gxsq()),
-            mod.f64.convert_s.i32(mod.i32.mul(
-              mod.i32.add(mod.i32.mul(gn(), mod.i32.const(2)), mod.i32.const(1)),
-              mod.i32.add(mod.i32.mul(gn(), mod.i32.const(2)), mod.i32.const(2)))))),
-          mod.local.set(6, mod.f64.sub(mod.f64.const(0.0), gsign())),
-          mod.local.set(5, mod.i32.add(gn(), mod.i32.const(1))),
-          mod.br('cos_loop'),
-        ], none)),
-      ], none),
-      mod.return(gr()),
-    ], f64);
-    mod.addFunction('__jswat_math_cos',
-      binaryen.createType([f64]), f64, [f64, f64, f64, f64, i32, f64], body);
-  }
-
-  // ── pow(base, exp) = exp(exp * log(base)) ─────────────────────────────────
-  mod.addFunction('__jswat_math_pow',
-    binaryen.createType([f64, f64]), f64, [],
-    mod.return(mod.call('__jswat_math_exp', [
-      mod.f64.mul(mod.local.get(1, f64),
-        mod.call('__jswat_math_log', [mod.local.get(0, f64)], f64)),
-    ], f64)));
-}
-
 // ── std/iter ──────────────────────────────────────────────────────────────────
 // Iterator struct: [tag:i32 @ 0][state_ptr:i32 @ 4]  (8 bytes)
 // Tags: 0=ArrayIter, 1=MapIter, 2=FilterIter, 3=TakeIter
@@ -3156,6 +2974,12 @@ export function buildJsSystemImports(mod, hasIo, hasFs, hasClock, hasRandom, has
     // __jswat_io_read(buf:i32, maxLen:i32) -> i32  (returns bytes actually read)
     mod.addFunctionImport('__jswat_io_read', 'env', '__jswat_io_read',
       binaryen.createType([i32, i32]), i32);
+    // __jswat_console_error(ptr:i32, len:i32) -> void
+    mod.addFunctionImport('__jswat_console_error', 'env', '__jswat_console_error',
+      binaryen.createType([i32, i32]), none);
+    // __jswat_stderr_write(ptr:i32, len:i32) -> void
+    mod.addFunctionImport('__jswat_stderr_write', 'env', '__jswat_stderr_write',
+      binaryen.createType([i32, i32]), none);
   }
   if (hasClock) {
     mod.addFunctionImport('__jswat_clock_now', 'env', '__jswat_clock_now',
@@ -3231,11 +3055,6 @@ export function buildJsIoFunctions(mod, ioBase) {
     mod.call('__jswat_write_line', [
       mod.i32.const(1), mod.local.get(0, i32), mod.local.get(1, i32)], none));
 
-  mod.addFunction('__jswat_console_error',
-    binaryen.createType([i32, i32]), none, [],
-    mod.call('__jswat_write_line', [
-      mod.i32.const(2), mod.local.get(0, i32), mod.local.get(1, i32)], none));
-
   mod.addFunction('__jswat_stdout_write',
     binaryen.createType([i32, i32]), none, [],
     mod.call('__jswat_write', [
@@ -3245,11 +3064,6 @@ export function buildJsIoFunctions(mod, ioBase) {
     binaryen.createType([i32, i32]), none, [],
     mod.call('__jswat_write_line', [
       mod.i32.const(1), mod.local.get(0, i32), mod.local.get(1, i32)], none));
-
-  mod.addFunction('__jswat_stderr_write',
-    binaryen.createType([i32, i32]), none, [],
-    mod.call('__jswat_write', [
-      mod.i32.const(2), mod.local.get(0, i32), mod.local.get(1, i32)], none));
 
   // __jswat_stdin_read(size:i32) -> i32  (sets __str_len_out = bytes read)
   // params: size(0); locals: buf(1), nread(2)

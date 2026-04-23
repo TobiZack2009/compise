@@ -11,7 +11,7 @@ import { buildClassLayouts } from './classes.js';
 import {
   buildStdStub, buildMemFunctions, buildArrayFunctions, buildStringFunctions,
   buildCollectionsFunctions, buildWasiImports, buildIoFunctions, buildFsFunctions,
-  buildClockFunctions, buildRandomFunctions, buildMathFunctions, buildIterFunctions,
+  buildClockFunctions, buildRandomFunctions, buildIterFunctions,
   buildPoolFunctions, buildArenaFunctions, buildRcFunctions, buildParseFunctions,
   buildProcessFunctions, buildEncodingFunctions,
   buildRawAllocFunctions, buildJsSystemImports, buildJsIoFunctions, buildJsClockFunctions,
@@ -91,17 +91,20 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   mod.addGlobal('__str_len_out', binaryen.i32, true, mod.i32.const(0));
   mod.addGlobalExport('__str_len_out', '__str_len_out');  // expose to JS for str-returning exports
 
+  /** Quick AST walk to detect try/throw usage */
+  function astHasExceptions(node) {
+    if (!node || typeof node !== 'object') return false;
+    if (node.type === 'TryStatement' || node.type === 'ThrowStatement') return true;
+    return Object.values(node).some(v =>
+      Array.isArray(v) ? v.some(astHasExceptions) : astHasExceptions(v));
+  }
+
   // ── Feature detection (must precede table creation) ───────────────────────
   const stdStubs = collectStdStubs(imports);
+  const hasExceptions =
+    astHasExceptions(ast) ||
+    stdModules.some(({ ast: stdAst }) => astHasExceptions(stdAst));
   const hasArray = astHasArray(ast);
-
-  /** Quick AST walk to detect binary ** operator */
-  function astHasPow(node) {
-    if (!node || typeof node !== 'object') return false;
-    if (node.type === 'BinaryExpression' && node.operator === '**') return true;
-    return Object.values(node).some(v =>
-      Array.isArray(v) ? v.some(astHasPow) : astHasPow(v));
-  }
 
   function astHasStrMethods(node) {
     if (!node || typeof node !== 'object') return false;
@@ -172,9 +175,6 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
     n.startsWith('__jswat_stack_') ||
     n.startsWith('__jswat_deque_'));
 
-  const hasMath = Array.from(stdStubs).some(n => n.startsWith('__jswat_math_')) ||
-    astHasPow(ast);
-
   // Pool / arena: detect from std module @external declarations in signatures
   const hasPool = Array.from(signatures.values()).some(sig => sig.external?.name?.startsWith('__jswat_pool_'));
   const hasArena = Array.from(signatures.values()).some(sig => sig.external?.name?.startsWith('__jswat_arena_'));
@@ -240,7 +240,6 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   if (hasString)      buildStringFunctions(mod);
   if (hasArray)       buildArrayFunctions(mod);
   if (hasCollections) buildCollectionsFunctions(mod);
-  if (hasMath)        buildMathFunctions(mod);
   if (hasIter)        { if (!hasArray) buildArrayFunctions(mod); buildIterFunctions(mod); }
   if (hasPool)        buildPoolFunctions(mod);
   if (hasArena)       buildArenaFunctions(mod);
@@ -263,7 +262,6 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
       stub.startsWith('__jswat_stack_') ||
       stub.startsWith('__jswat_deque_')
     )) continue;
-    if (hasMath     && stub.startsWith('__jswat_math_'))    continue;
     if (hasIter     && stub.startsWith('__jswat_iter_'))    continue;
     if (hasProcess  && stub.startsWith('__jswat_process_')) continue;
     if (hasEncoding && (stub.startsWith('__jswat_base64_') || stub.startsWith('__jswat_utf8_'))) continue;
@@ -459,7 +457,17 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   }
 
   // ── Emit ──────────────────────────────────────────────────────────────────
-  mod.setFeatures(binaryen.Features.BulkMemory | binaryen.Features.MutableGlobals);
+  if (hasExceptions) {
+    // __jswat_exception tag for WASM exception handling (payload: i32 ptr)
+    mod.addTag('__jswat_exception', binaryen.createType([binaryen.i32]), binaryen.createType([]));
+    if (typeof mod.addTagExport === 'function') {
+      mod.addTagExport('__jswat_exception', '__jswat_exception');
+    }
+  }
+
+  const baseFeatures = binaryen.Features.BulkMemory | binaryen.Features.MutableGlobals;
+  const features = hasExceptions ? (baseFeatures | binaryen.Features.ExceptionHandling) : baseFeatures;
+  mod.setFeatures(features);
   const wat    = mod.emitText();
   const binary = mod.emitBinary();
   mod.dispose();

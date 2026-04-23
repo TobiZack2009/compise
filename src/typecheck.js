@@ -73,12 +73,44 @@ class ScopeChain {
 
 const KNOWN_BUILTINS = new Set([
   'alloc', 'memory', 'List',
+  'unreachable',
   'true', 'false', 'null', 'undefined', 'Infinity', 'NaN',
   'String', 'Math', 'JSON', 'console',
   // type names (populated lazily from TYPES below, but include common ones upfront)
   'i8','u8','i16','u16','i32','u32','i64','u64','isize','usize',
   'f32','f64','bool','str','void','ptr','array','iter','funcref',
 ]);
+
+/**
+ * Validate a catch chain for exhaustiveness.
+ * @param {object[]} stmts
+ * @param {string|null} paramName
+ * @param {object} handlerNode
+ * @param {string} filename
+ */
+function checkCatchChain(stmts, paramName, handlerNode, filename) {
+  const topIf = stmts.find(s => s.type === 'IfStatement');
+  if (!topIf) return;
+
+  let node = topIf;
+  while (node.alternate?.type === 'IfStatement') node = node.alternate;
+
+  const lastTestIsAppError =
+    node.test?.operator === 'instanceof' && node.test?.right?.name === 'AppError';
+  const elseIsRethrow =
+    (node.alternate?.type === 'ThrowStatement' &&
+      node.alternate.argument?.name === paramName) ||
+    (node.alternate?.type === 'BlockStatement' &&
+      node.alternate.body.length === 1 &&
+      node.alternate.body[0]?.type === 'ThrowStatement' &&
+      node.alternate.body[0]?.argument?.name === paramName);
+
+  if (!lastTestIsAppError && !elseIsRethrow) {
+    throw ceErr('CE-CF09',
+      `catch chain must end with 'else throw ${paramName ?? 'e'}' or 'instanceof AppError'`,
+      handlerNode, filename);
+  }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -390,6 +422,27 @@ function inferStatement(stmt, scope, signatures, classes, filename, ctx) {
     case 'ExpressionStatement':
       inferExpr(stmt.expression, scope, signatures, classes, filename, ctx);
       break;
+
+    case 'ThrowStatement':
+      inferExpr(stmt.argument, scope, signatures, classes, filename, ctx);
+      break;
+
+    case 'TryStatement': {
+      for (const s of stmt.block.body) inferStatement(s, scope, signatures, classes, filename, ctx);
+      if (stmt.handler) {
+        scope.push();
+        if (stmt.handler.param?.name) {
+          scope.define(stmt.handler.param.name, TYPES.unknown);
+        }
+        for (const s of stmt.handler.body.body) inferStatement(s, scope, signatures, classes, filename, ctx);
+        checkCatchChain(stmt.handler.body.body, stmt.handler.param?.name ?? null, stmt.handler, filename);
+        scope.pop();
+      }
+      if (stmt.finalizer) {
+        for (const s of stmt.finalizer.body) inferStatement(s, scope, signatures, classes, filename, ctx);
+      }
+      break;
+    }
 
     case 'ReturnStatement':
       if (stmt.argument) {
@@ -795,6 +848,27 @@ function collectReturnTypes(node, out, scope, signatures, classes, filename, ctx
       inferExpr(node.expression, scope, signatures, classes, filename, ctx);
       break;
 
+    case 'ThrowStatement':
+      inferExpr(node.argument, scope, signatures, classes, filename, ctx);
+      break;
+
+    case 'TryStatement': {
+      for (const s of node.block.body) collectReturnTypes(s, out, scope, signatures, classes, filename, ctx);
+      if (node.handler) {
+        scope.push();
+        if (node.handler.param?.name) {
+          scope.define(node.handler.param.name, TYPES.unknown);
+        }
+        for (const s of node.handler.body.body) collectReturnTypes(s, out, scope, signatures, classes, filename, ctx);
+        checkCatchChain(node.handler.body.body, node.handler.param?.name ?? null, node.handler, filename);
+        scope.pop();
+      }
+      if (node.finalizer) {
+        for (const s of node.finalizer.body) collectReturnTypes(s, out, scope, signatures, classes, filename, ctx);
+      }
+      break;
+    }
+
     case 'IfStatement':
       inferExpr(node.test, scope, signatures, classes, filename, ctx);
       collectReturnTypes(node.consequent,  out, scope, signatures, classes, filename, ctx);
@@ -1066,10 +1140,12 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
 
       const cmpOps = new Set(['===', '!==', '<', '>', '<=', '>=']);
       const arithOps = new Set(['+','-','*','/','%','**','<<','>>','>>>','&','|','^']);
-      if (cmpOps.has(node.operator)) {
+      if (node.operator === 'instanceof') {
+        t = TYPES.bool;
+      } else if (cmpOps.has(node.operator)) {
         t = TYPES.bool;
       } else if (node.operator === '**') {
-        // ** always operates in f64 (calls __jswat_math_pow); coerce both sides
+        // ** always operates in f64 (calls Math.pow); coerce both sides
         t = TYPES.f64;
       } else {
         // CE-T05: bool in arithmetic

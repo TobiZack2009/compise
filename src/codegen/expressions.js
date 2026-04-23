@@ -25,6 +25,7 @@ export function collectLocals(body, params, returnType = null) {
   const seen = new Set(paramNames);
   let needsTmp = false;
   let needsStrScratch = false;
+  let needsExcPtr = false;
   let forOfCounter = 0;
 
   /** @param {object} node */
@@ -81,6 +82,9 @@ export function collectLocals(body, params, returnType = null) {
         }
       }
     }
+    if (node.type === 'TryStatement' && node.handler) {
+      needsExcPtr = true;
+    }
     if (node.type === 'ThisExpression') {
       if (!seen.has('this')) {
         seen.add('this');
@@ -115,6 +119,10 @@ export function collectLocals(body, params, returnType = null) {
     seen.add('__str_tmp__len');
     locals.push({ name: '__str_tmp',     type: TYPES.isize });
     locals.push({ name: '__str_tmp__len', type: TYPES.isize });
+  }
+  if (needsExcPtr && !seen.has('__exc_ptr')) {
+    seen.add('__exc_ptr');
+    locals.push({ name: '__exc_ptr', type: TYPES.isize });
   }
 
   // Collect heap-typed locals (class/array/list) for RC management.
@@ -304,6 +312,16 @@ export function genExpr(node, filename, ctx) {
       return ctx.localGet(node.name);
 
     case 'BinaryExpression': {
+      if (node.operator === 'instanceof') {
+        const className = node.right?.name ?? '';
+        const layout = ctx._layouts.get(className);
+        const expectedId = layout?.classId ?? -1;
+        if (expectedId < 0) return mod.i32.const(0);
+        return mod.i32.eq(
+          mod.i32.load(8, 0, genExpr(node.left, filename, ctx)),
+          mod.i32.const(expectedId)
+        );
+      }
       const left = genExpr(node.left, filename, ctx);
       const right = genExpr(node.right, filename, ctx);
       const opType = node.left._type ?? node._type;
@@ -358,6 +376,9 @@ export function genExpr(node, filename, ctx) {
         return mod.call(`${parentName}__ctor`, [ctx.localGet('this'), ...argExprs], binaryen.none);
       }
       if (callee.type === 'Identifier') {
+        if (callee.name === 'unreachable') {
+          return mod.unreachable();
+        }
         // ptr(x) — null typed raw pointer (the address 0 or the given value as i32)
         if (callee.name === 'ptr') {
           return mod.i32.const(0);
@@ -582,24 +603,54 @@ export function genExpr(node, filename, ctx) {
         if (className) {
           const ci = ctx._classes?.get(className);
           if (ci?.staticMethods?.has(methodName)) {
+            const methodSig = ci.staticMethods.get(methodName)?.signature;
             const argExprs = [];
+            let methodArgIdx = 0;
             for (const arg of node.arguments) {
               if (arg._type?.kind === 'str') {
                 const [p, l] = genStrExprAsPair(arg, filename, ctx); argExprs.push(p, l);
               } else {
-                argExprs.push(genExpr(arg, filename, ctx));
+                const expr = genExpr(arg, filename, ctx);
+                const expectedType = methodSig?.params?.[methodArgIdx]?.type;
+                if (expectedType && arg._type && expectedType !== arg._type) {
+                  const actualWt = binaryen.getExpressionType(expr);
+                  const expectedWt = toBinType(expectedType);
+                  argExprs.push(actualWt !== expectedWt ? genCast(mod, expr, arg._type, expectedType) : expr);
+                } else {
+                  argExprs.push(expr);
+                }
               }
+              methodArgIdx++;
             }
             const retType = node._type ? toBinType(node._type) : binaryen.none;
             return mod.call(`${className}__sm_${methodName}`, argExprs, retType);
           }
         }
+        let resolvedClassName = className;
+        if (!resolvedClassName && callee.object?.type === 'Identifier') {
+          const directName = callee.object.name;
+          if (ctx._classes?.has(directName)) resolvedClassName = directName;
+        }
+        if (!resolvedClassName && callee.object?.type === 'MemberExpression') {
+          const objObj = callee.object.object;
+          const objProp = callee.object.property;
+          const baseType = objObj?._type;
+          const baseName = baseType?.kind === 'class'
+            ? baseType.name
+            : (objObj?.type === 'Identifier' && ctx._classes?.has(objObj.name) ? objObj.name : null);
+          const fieldName = objProp?.name;
+          if (baseName && fieldName) {
+            const ci = ctx._classes?.get(baseName);
+            const fieldType = ci?.staticFields?.get(fieldName);
+            if (fieldType?.kind === 'class') resolvedClassName = fieldType.name;
+          }
+        }
         const objExpr = genExpr(callee.object, filename, ctx);
-        if (!className || !methodName) {
+        if (!resolvedClassName || !methodName) {
           throw new CodegenError(`Unsupported method call (${filename})`);
         }
-        const fnName = `${className}_${methodName}`;
-        const methodSig = ctx._classes?.get(className)?.methods?.get(methodName)?.signature;
+        const fnName = `${resolvedClassName}_${methodName}`;
+        const methodSig = ctx._classes?.get(resolvedClassName)?.methods?.get(methodName)?.signature;
         const argExprs = [];
         let methodArgIdx = 0;
         for (const arg of node.arguments) {
