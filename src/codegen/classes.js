@@ -21,14 +21,41 @@ import { typeSize, resolveFieldType } from './types.js';
 
 /**
  * @param {Map<string, import('../typecheck.js').ClassInfo>} classes
- * @returns {Map<string, { classId: number, size: number, fields: Map<string, { offset: number, type: TypeInfo }> }>}
+ * @returns {Map<string, { classId: number, maxClassId: number, size: number, fields: Map<string, { offset: number, type: TypeInfo }> }>}
  */
 export function buildClassLayouts(classes) {
   const layouts = new Map();
   let nextClassId = 1;
 
-  // Process classes in topological order — parents before children — so each
-  // child can look up its parent's already-computed layout.
+  // ── Phase 1: DFS class ID assignment ───────────────────────────────────────
+  // Build parent→children map so we can do DFS from roots.
+  // DFS pre-order guarantees: all descendants of a class get *contiguous* IDs
+  // immediately after the class's own ID. This makes `instanceof` a range check:
+  //   class_id >= parent.classId && class_id <= parent.maxClassId
+  const children = new Map();   // parent name → [child names]
+  for (const [name, info] of classes) {
+    const p = info.superClassName;
+    if (p && classes.has(p)) {
+      if (!children.has(p)) children.set(p, []);
+      children.get(p).push(name);
+    }
+  }
+
+  const idMap = new Map();  // name → assigned classId
+  function assignId(name) {
+    if (idMap.has(name)) return;
+    idMap.set(name, nextClassId++);
+    for (const child of (children.get(name) ?? [])) assignId(child);
+  }
+  // Assign from roots first (classes whose parent is absent from `classes`)
+  for (const [name, info] of classes) {
+    if (!info.superClassName || !classes.has(info.superClassName)) assignId(name);
+  }
+  // Catch any remainder (e.g. cycle — shouldn't happen)
+  for (const name of classes.keys()) assignId(name);
+
+  // ── Phase 2: Layout construction in topological order ──────────────────────
+  // Process parents before children so each child can inherit the parent layout.
   const processed = new Set();
 
   function processClass(name) {
@@ -39,7 +66,7 @@ export function buildClassLayouts(classes) {
     if (classInfo.superClassName) processClass(classInfo.superClassName);
     processed.add(name);
 
-    const classId   = nextClassId++;
+    const classId   = idMap.get(name) ?? nextClassId++;
     const fields    = new Map();
 
     // ── Inherit parent layout (prefix) ───────────────────────────────────────
@@ -74,10 +101,27 @@ export function buildClassLayouts(classes) {
       offset += size;
     }
 
-    layouts.set(name, { classId, size: offset, fields });
+    layouts.set(name, { classId, maxClassId: classId, size: offset, fields });
   }
 
   for (const name of classes.keys()) processClass(name);
+
+  // ── Phase 3: Compute maxClassId (max ID in each class's subtree) ───────────
+  // Walk bottom-up: each parent's maxClassId = max(own classId, children's maxClassId)
+  // Process in reverse insertion order so children (higher IDs) are visited first.
+  const layoutNames = [...layouts.keys()].reverse();
+  for (const name of layoutNames) {
+    const layout = layouts.get(name);
+    if (!layout) continue;
+    const classInfo = classes.get(name);
+    const parentName = classInfo?.superClassName;
+    if (parentName) {
+      const parentLayout = layouts.get(parentName);
+      if (parentLayout && layout.maxClassId > parentLayout.maxClassId) {
+        parentLayout.maxClassId = layout.maxClassId;
+      }
+    }
+  }
 
   return layouts;
 }

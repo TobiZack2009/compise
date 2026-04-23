@@ -227,8 +227,10 @@ export function genWasmIntrinsicCall(fnName, args, filename, ctx) {
   }
 
   // Generic intrinsic (e.g. i32_clz -> mod.i32.clz)
+  // Reinterpret ops: i64_reinterpret_f64 → mod.i64.reinterpret (strip _<type> suffix)
+  const binaryenMethod = methodName.startsWith('reinterpret_') ? 'reinterpret' : methodName;
   const argExprs = args.map(arg => genExpr(arg, filename, ctx));
-  return mod[wt][methodName](...argExprs);
+  return mod[wt][binaryenMethod](...argExprs);
 }
 
 /**
@@ -315,12 +317,26 @@ export function genExpr(node, filename, ctx) {
       if (node.operator === 'instanceof') {
         const className = node.right?.name ?? '';
         const layout = ctx._layouts.get(className);
-        const expectedId = layout?.classId ?? -1;
-        if (expectedId < 0) return mod.i32.const(0);
-        return mod.i32.eq(
-          mod.i32.load(8, 0, genExpr(node.left, filename, ctx)),
-          mod.i32.const(expectedId)
-        );
+        if (!layout) return mod.i32.const(0);
+        const { classId, maxClassId = classId } = layout;
+        if (classId === maxClassId) {
+          // Leaf class (no subclasses in this build) — simple equality check
+          return mod.i32.eq(
+            mod.i32.load(8, 0, genExpr(node.left, filename, ctx)),
+            mod.i32.const(classId)
+          );
+        }
+        // Class with subclasses — range check using contiguous DFS-assigned IDs:
+        //   class_id >= classId && class_id <= maxClassId
+        // Evaluate left expression once into __tmp, then load class_id from it.
+        return mod.block(null, [
+          ctx.localSet('__tmp', genExpr(node.left, filename, ctx)),
+          ctx.localSet('__tmp', mod.i32.load(8, 0, ctx.localGet('__tmp'))),
+          mod.i32.and(
+            mod.i32.ge_u(ctx.localGet('__tmp'), mod.i32.const(classId)),
+            mod.i32.le_u(ctx.localGet('__tmp'), mod.i32.const(maxClassId))
+          ),
+        ], binaryen.i32);
       }
       const left = genExpr(node.left, filename, ctx);
       const right = genExpr(node.right, filename, ctx);

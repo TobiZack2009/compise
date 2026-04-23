@@ -87,6 +87,9 @@ const _envHooks = {
   __jswat_console_error: (ptr, len) => {
     console.error(_readStr(ptr, len));
   },
+  __jswat_console_warn: (ptr, len) => {
+    console.warn(_readStr(ptr, len));
+  },
   __jswat_stderr_write: (ptr, len) => {
     throw new Error(_readStr(ptr, len));
   },

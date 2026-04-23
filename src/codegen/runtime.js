@@ -40,7 +40,7 @@ export function buildStdStub(mod, name) {
     return;
   }
   // str-taking stubs accept (ptr:i32, len:i32) per fat-pointer convention.
-  const hasStrArg  = name.includes('write') || name.includes('log') || name.includes('error');
+  const hasStrArg  = name.includes('write') || name.includes('log') || name.includes('error') || name.includes('warn');
   const returnsPtr = name.includes('read') || name.includes('from');
   const params = hasStrArg ? binaryen.createType([i32, i32]) : binaryen.createType([]);
   const result = returnsPtr ? i32 : none;
@@ -1275,6 +1275,12 @@ export function buildIoFunctions(mod, ioBase) {
 
   // __jswat_console_error(ptr:i32, len:i32) -> void
   mod.addFunction('__jswat_console_error',
+    binaryen.createType([i32, i32]), none, [],
+    mod.call('__jswat_write_line', [
+      mod.i32.const(2), mod.local.get(0, i32), mod.local.get(1, i32)], none));
+
+  // __jswat_console_warn(ptr:i32, len:i32) -> void  (writes to stderr like error)
+  mod.addFunction('__jswat_console_warn',
     binaryen.createType([i32, i32]), none, [],
     mod.call('__jswat_write_line', [
       mod.i32.const(2), mod.local.get(0, i32), mod.local.get(1, i32)], none));
@@ -3054,6 +3060,11 @@ export function buildJsIoFunctions(mod, ioBase) {
     binaryen.createType([i32, i32]), none, [],
     mod.call('__jswat_write_line', [
       mod.i32.const(1), mod.local.get(0, i32), mod.local.get(1, i32)], none));
+
+  mod.addFunction('__jswat_console_warn',
+    binaryen.createType([i32, i32]), none, [],
+    mod.call('__jswat_write_line', [
+      mod.i32.const(2), mod.local.get(0, i32), mod.local.get(1, i32)], none));
 
   mod.addFunction('__jswat_stdout_write',
     binaryen.createType([i32, i32]), none, [],
