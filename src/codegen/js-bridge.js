@@ -148,7 +148,10 @@ export function generateBridge(binary, exportList, opts = {}) {
     parts.push(BRIDGE_ENV_NODE);
 
     if (isBundle) {
-      const base64 = Buffer.from(binary).toString('base64');
+      // Cross-platform base64 encoding: Node.js Buffer or browser btoa
+      const base64 = typeof Buffer !== 'undefined'
+        ? Buffer.from(binary).toString('base64')
+        : btoa(Array.from(binary, b => String.fromCharCode(b)).join(''));
       parts.push(BRIDGE_INIT_BUNDLE(base64));
     } else {
       parts.push(BRIDGE_INIT_ESM_SIDECAR(wasmFilename));

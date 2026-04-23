@@ -9,3 +9,4 @@
 export { compile, compileSource, watToWasm, wasmToWat } from './compiler.js';
 export { parseSource } from './parser.js';
 export { validate } from './validator.js';
+export { generateBridge } from './codegen/js-bridge.js';

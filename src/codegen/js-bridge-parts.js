@@ -77,12 +77,28 @@ export const BRIDGE_ENV_NODE = `\
 const _isNode = typeof process !== 'undefined' && process.versions && process.versions.node;
 const _fs = _isNode ? (await import('fs')) : null;
 const _crypto = _isNode ? (await import('crypto')) : null;
+const _lineBuf = ['', ''];  // line buffers for fd=1 and fd=2 (browser only)
 
 const _envHooks = {
   __jswat_io_write: (ptr, len, fd) => {
-    const buf = Buffer.from(_ex.memory.buffer, ptr, len);
-    if (fd === 2) process.stderr.write(buf);
-    else process.stdout.write(buf);
+    if (_isNode) {
+      const buf = Buffer.from(_ex.memory.buffer, ptr, len);
+      if (fd === 2) process.stderr.write(buf);
+      else process.stdout.write(buf);
+    } else {
+      const str = _readStr(ptr, len);
+      const idx = fd === 2 ? 1 : 0;
+      _lineBuf[idx] += str;
+      const nl = _lineBuf[idx].lastIndexOf('\\n');
+      if (nl >= 0) {
+        const lines = _lineBuf[idx].slice(0, nl).split('\\n');
+        _lineBuf[idx] = _lineBuf[idx].slice(nl + 1);
+        for (const line of lines) {
+          if (fd === 2) console.error(line);
+          else console.log(line);
+        }
+      }
+    }
   },
   __jswat_console_error: (ptr, len) => {
     console.error(_readStr(ptr, len));

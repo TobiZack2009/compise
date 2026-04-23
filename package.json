@@ -8,7 +8,23 @@
   "scripts": {
     "check": "node ./src/cli.js check src/main.js",
     "build": "node ./src/cli.js build src/main.js -o dist/app.wasm",
-    "test": "mocha"
+
+    "test":            "mocha",
+    "test:math":       "mocha --no-config --timeout 10000 test/std-math.test.js",
+    "test:errors":     "mocha --no-config --timeout 10000 test/errors.test.js",
+    "test:examples":   "mocha --no-config --timeout 10000 test/examples.test.js",
+    "test:exceptions": "mocha --no-config --timeout 10000 test/exceptions.test.js",
+    "test:gc":         "mocha --no-config --timeout 10000 test/gc.test.js",
+    "test:lang":       "mocha --no-config --timeout 10000 test/language-features.test.js",
+    "test:list":       "mocha --no-config --timeout 10000 test/list.test.js",
+    "test:std":        "mocha --no-config --timeout 10000 'test/std-*.test.js'",
+    "test:wasi":       "mocha --no-config --timeout 10000 'test/wasi-*.test.js'",
+    "test:core":       "mocha --no-config --timeout 10000 test/codegen.test.js test/typecheck.test.js test/validator.test.js",
+    "test:js":         "mocha --no-config --timeout 10000 test/js-targets.test.js",
+    "test:rc":         "mocha --no-config --timeout 10000 test/gc.test.js test/rc-memory.test.js",
+
+    "build:lib":       "rollup -c rollup.config.js",
+    "build:editor":    "node editor/bundle-std.js && rollup -c rollup.config.js"
   },
   "dependencies": {
     "acorn": "^8.11.3",
@@ -16,7 +32,12 @@
     "wabt": "^1.0.35"
   },
   "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.2",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-replace": "^6.0.3",
     "chai": "^4.4.1",
-    "mocha": "^10.2.0"
+    "mocha": "^10.2.0",
+    "rollup": "^4.60.2",
+    "rollup-plugin-node-polyfills": "^0.2.1"
   }
 }
