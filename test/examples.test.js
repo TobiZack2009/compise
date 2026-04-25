@@ -420,3 +420,109 @@ describe('section 21 examples (Phase 2+)', () => {
   });
 
 });
+
+// ── Enum tests ────────────────────────────────────────────────────────────────
+
+describe('enums — basic', () => {
+  it('auto-assigned integer variants resolve to correct constants', async () => {
+    const exp = await instantiate(`
+      const Direction = enum({ North, South, East, West });
+      //@export
+      function north() { return Direction.North; }
+      //@export
+      function south() { return Direction.South; }
+      //@export
+      function east() { return Direction.East; }
+      //@export
+      function west() { return Direction.West; }
+    `);
+    assert.equal(exp.north(), 0);
+    assert.equal(exp.south(), 1);
+    assert.equal(exp.east(), 2);
+    assert.equal(exp.west(), 3);
+  });
+
+  it('typed valued variants (isize-typed)', async () => {
+    const exp = await instantiate(`
+      const Status = enum({ OK: isize(200), NotFound: isize(404), Error: isize(500) });
+      //@export
+      function ok() { return Status.OK; }
+      //@export
+      function notFound() { return Status.NotFound; }
+      //@export
+      function err() { return Status.Error; }
+    `);
+    assert.equal(exp.ok(), 200);
+    assert.equal(exp.notFound(), 404);
+    assert.equal(exp.err(), 500);
+  });
+
+  it('u8-typed enum variants', async () => {
+    const exp = await instantiate(`
+      const Toggle = enum({ off: u8(0), on: u8(1) });
+      //@export
+      function getOff() { return Toggle.off; }
+      //@export
+      function getOn() { return Toggle.on; }
+    `);
+    assert.equal(exp.getOff(), 0);
+    assert.equal(exp.getOn(), 1);
+  });
+
+  it('.value accessor is a no-op', async () => {
+    const exp = await instantiate(`
+      const Toggle = enum({ off: u8(0), on: u8(1) });
+      //@export
+      function getOnValue() { return Toggle.on.value; }
+    `);
+    assert.equal(exp.getOnValue(), 1);
+  });
+
+  it('enum variants usable in local variables', async () => {
+    const exp = await instantiate(`
+      const Direction = enum({ North, South, East, West });
+      //@export
+      function test() {
+        const d = Direction.East;
+        return d;
+      }
+    `);
+    assert.equal(exp.test(), 2);
+  });
+
+  it('enum switch dispatches to correct case', async () => {
+    const exp = await instantiate(`
+      const Direction = enum({ North, South, East, West });
+      //@export
+      function describe(d = 0) {
+        switch (d) {
+          case Direction.North: return 10;
+          case Direction.South: return 20;
+          case Direction.East:  return 30;
+          case Direction.West:  return 40;
+        }
+        return -1;
+      }
+    `);
+    assert.equal(exp.describe(0), 10);
+    assert.equal(exp.describe(1), 20);
+    assert.equal(exp.describe(2), 30);
+    assert.equal(exp.describe(3), 40);
+  });
+
+  it('enum switch with default case', async () => {
+    const exp = await instantiate(`
+      const Direction = enum({ North, South, East, West });
+      //@export
+      function describe(d = 0) {
+        switch (d) {
+          case Direction.North: return 1;
+          default: return 0;
+        }
+        return -1;
+      }
+    `);
+    assert.equal(exp.describe(0), 1);
+    assert.equal(exp.describe(2), 0);
+  });
+});

@@ -237,7 +237,7 @@ export function generateWat(ast, signatures, classes, imports, filename = '<inpu
   // wasi_snapshot_preview1 on wasip1 or from env on JS targets.
   if (!isUnknown && hasRandom) buildRandomFunctions(mod, ioBase + 192);
   if (hasMem)         buildMemFunctions(mod);
-  if (hasString)      buildStringFunctions(mod);
+  buildStringFunctions(mod);  // always — console.log dispatch needs string conversion fns
   if (hasArray)       buildArrayFunctions(mod);
   if (hasCollections) buildCollectionsFunctions(mod);
   if (hasIter)        { if (!hasArray) buildArrayFunctions(mod); buildIterFunctions(mod); }

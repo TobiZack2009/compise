@@ -313,4 +313,39 @@ describe('typecheck CE codes', () => {
       `function f(x = 0) { const arr = new List(i32, 10); }`
     ));
   });
+
+  describe('CE-CF03 — non-exhaustive enum switch', () => {
+    it('missing variant throws CE-CF03', () => rejectsTypecheck(`
+      const Direction = enum({ North, South, East, West });
+      function f(d = 0) {
+        switch (d) {
+          case Direction.North: return 1;
+          case Direction.South: return 2;
+        }
+        return 0;
+      }
+    `, 'CE-CF03'));
+    it('exhaustive enum switch is OK', () => acceptsTypecheck(`
+      const Direction = enum({ North, South, East, West });
+      function f(d = 0) {
+        switch (d) {
+          case Direction.North: return 1;
+          case Direction.South: return 2;
+          case Direction.East:  return 3;
+          case Direction.West:  return 4;
+        }
+        return 0;
+      }
+    `));
+    it('enum switch with default is OK (default satisfies exhaustiveness)', () => acceptsTypecheck(`
+      const Direction = enum({ North, South, East, West });
+      function f(d = 0) {
+        switch (d) {
+          case Direction.North: return 1;
+          default: return 0;
+        }
+        return 0;
+      }
+    `));
+  });
 });

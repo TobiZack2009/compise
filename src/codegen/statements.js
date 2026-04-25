@@ -115,6 +115,8 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
       const stmts = [];
       for (const decl of stmt.declarations) {
         if (decl.init) {
+          // Enum declarations are compile-time only — no WASM code emitted
+          if (decl._type?.kind === 'enumDescriptor') continue;
           if (decl.init._type?.kind === 'str') {
             // Str fat pointer: set both `name` (ptr) and `name__len` (len).
             const [ptrRef, lenRef] = genStrExprAsPair(decl.init, filename, ctx);
@@ -464,6 +466,37 @@ export function genStatement(stmt, fnReturnType, ctx, filename) {
             mod.i32.const(caseLayout.classId)
           );
           chain = mod.if(tagCheck, body, chain);
+        }
+        ctx.popLoop();
+        return mod.block(breakLabel, [chain], binaryen.none);
+      }
+      // Enum switch: cases are MemberExpressions with _enumVariant (e.g. Direction.North)
+      const isEnumSwitch = stmt.cases.some(c => c.test?._enumVariant !== undefined);
+      if (isEnumSwitch) {
+        const breakLabel = ctx.nextLabel('switch_break');
+        ctx.pushLoop(breakLabel, null);
+        let chain = mod.nop();
+        for (let i = stmt.cases.length - 1; i >= 0; i--) {
+          const c = stmt.cases[i];
+          if (!c.test) {
+            // default case
+            const bodyStmts = c.consequent.map(s => genStatement(s, fnReturnType, ctx, filename));
+            chain = bodyStmts.length === 0 ? mod.nop()
+                  : bodyStmts.length === 1 ? bodyStmts[0]
+                  : mod.block(null, bodyStmts, binaryen.none);
+            continue;
+          }
+          const variant = c.test._enumVariant;
+          if (!variant) continue;
+          const bodyStmts = c.consequent.map(s => genStatement(s, fnReturnType, ctx, filename));
+          const body = bodyStmts.length === 0 ? mod.nop()
+                     : bodyStmts.length === 1 ? bodyStmts[0]
+                     : mod.block(null, bodyStmts, binaryen.none);
+          const isI64 = variant.type?.wasmType === 'i64';
+          const cond = isI64
+            ? mod.i64.eq(genExpr(stmt.discriminant, filename, ctx), mod.i64.const(variant.value, 0))
+            : mod.i32.eq(genExpr(stmt.discriminant, filename, ctx), mod.i32.const(variant.value));
+          chain = mod.if(cond, body, chain);
         }
         ctx.popLoop();
         return mod.block(breakLabel, [chain], binaryen.none);

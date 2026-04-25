@@ -32,15 +32,18 @@ export function collectLocals(body, params, returnType = null) {
   function visit(node) {
     if (!node || typeof node !== 'object') return;
     if (node.type === 'VariableDeclarator' && node.id?.name && node._type) {
-      const name = node.id.name;
-      if (!seen.has(name)) {
-        seen.add(name);
-        locals.push({ name, type: node._type });
-        // Each str-typed local gets a shadow `name__len` local for the fat pointer len.
-        if (node._type?.kind === 'str') {
-          seen.add(name + '__len');
-          locals.push({ name: name + '__len', type: TYPES.isize });
-          needsStrScratch = true;
+      // Enum descriptors are compile-time only — no WASM local needed
+      if (node._type?.kind !== 'enumDescriptor') {
+        const name = node.id.name;
+        if (!seen.has(name)) {
+          seen.add(name);
+          locals.push({ name, type: node._type });
+          // Each str-typed local gets a shadow `name__len` local for the fat pointer len.
+          if (node._type?.kind === 'str') {
+            seen.add(name + '__len');
+            locals.push({ name: name + '__len', type: TYPES.isize });
+            needsStrScratch = true;
+          }
         }
       }
     }
@@ -567,6 +570,38 @@ export function genExpr(node, filename, ctx) {
           const def = resolveStdDefault(ctx._imports, callee.object.name, methodName);
           const std = ns ?? def;
           if (std) {
+            // Special case: console.log/error/warn with a non-str primitive arg.
+            // Dispatch to a typed string-conversion function, then write the line.
+            const CONSOLE_STUBS = new Set(['__jswat_console_log', '__jswat_console_error', '__jswat_console_warn']);
+            if (CONSOLE_STUBS.has(std.stub) && node.arguments.length >= 1) {
+              const arg = node.arguments[0];
+              const argType = arg._type;
+              if (argType && argType.kind !== 'str') {
+                const argExpr = genExpr(arg, filename, ctx);
+                let strPtr;
+                if (argType.kind === 'bool') {
+                  strPtr = mod.call('__jswat_string_from_bool', [argExpr], binaryen.i32);
+                } else if (argType.wasmType === 'i64') {
+                  strPtr = mod.call(
+                    argType.isSigned ? '__jswat_string_from_i64' : '__jswat_string_from_u64',
+                    [argExpr], binaryen.i32);
+                } else if (argType.wasmType === 'f64') {
+                  strPtr = mod.call('__jswat_string_from_f64', [argExpr], binaryen.i32);
+                } else if (argType.wasmType === 'f32') {
+                  strPtr = mod.call('__jswat_string_from_f64', [mod.f64.promote(argExpr)], binaryen.i32);
+                } else {
+                  // i32-based integers and other primitives
+                  strPtr = mod.call(
+                    argType.isSigned ? '__jswat_string_from_i32' : '__jswat_string_from_u32',
+                    [argExpr], binaryen.i32);
+                }
+                return mod.call(std.stub, [
+                  strPtr,
+                  mod.global.get('__str_len_out', binaryen.i32),
+                ], binaryen.none);
+              }
+            }
+
             // Build expanded arg list: str args become two i32 args (ptr, len).
             const argExprs = [];
             let paramIdx = 0;
@@ -891,6 +926,15 @@ export function genExpr(node, filename, ctx) {
       return ctx.localGet('this');
 
     case 'MemberExpression': {
+      // Enum variant constant: Direction.North → i32.const(0)
+      if (node._enumVariant) {
+        const { value, type } = node._enumVariant;
+        return type?.wasmType === 'i64' ? mod.i64.const(value, 0) : mod.i32.const(value);
+      }
+      // Enum .value accessor no-op: Direction.North.value → evaluate Direction.North
+      if (node._enumValueNoOp) {
+        return genExpr(node.object, filename, ctx);
+      }
       // ClassName.stride — compile-time size constant
       if (!node.computed && node.object?.type === 'Identifier' &&
           node.property?.name === 'stride') {

@@ -55,6 +55,7 @@ export function parseSource(source, filename = '<input>') {
       ecmaVersion: 2022,
       sourceType: 'module',
       locations: true,
+      allowReserved: true,
       onComment(isBlock, text, _start, _end, startLoc) {
         if (isBlock) return;
         const line = startLoc?.line ?? 0;

@@ -217,6 +217,12 @@ export function validate(ast, filename = '<input>') {
             node.callee.property?.name === 'parse') {
           err('CE-A02', 'JSON.parse is not allowed', node);
         }
+        // enum({ ... }) — mark the ObjectExpression argument as allowed
+        if (node.callee?.type === 'Identifier' && node.callee.name === 'enum') {
+          for (const arg of node.arguments ?? []) {
+            if (arg.type === 'ObjectExpression') arg._namedArgBlock = true;
+          }
+        }
       },
 
       /** @param {object} node */

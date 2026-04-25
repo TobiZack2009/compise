@@ -17,6 +17,7 @@ export const STD_NAMESPACES = {
     console: {
       log:   { params: [TYPES.str], returnType: TYPES.void, stub: '__jswat_console_log' },
       error: { params: [TYPES.str], returnType: TYPES.void, stub: '__jswat_console_error' },
+      warn:  { params: [TYPES.str], returnType: TYPES.void, stub: '__jswat_console_warn' },
     },
     stdout: {
       write: { params: [TYPES.str], returnType: TYPES.void, stub: '__jswat_stdout_write' },

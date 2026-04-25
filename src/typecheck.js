@@ -72,7 +72,7 @@ class ScopeChain {
 // ── Built-in identifiers always valid (CE-V02 whitelist) ─────────────────────
 
 const KNOWN_BUILTINS = new Set([
-  'alloc', 'memory', 'List',
+  'alloc', 'memory', 'List', 'enum',
   'unreachable',
   'true', 'false', 'null', 'undefined', 'Infinity', 'NaN',
   'String', 'Math', 'JSON', 'console',
@@ -406,6 +406,63 @@ function inferStatement(stmt, scope, signatures, classes, filename, ctx) {
     case 'VariableDeclaration':
       for (const decl of stmt.declarations) {
         if (decl.init) {
+          // Detect enum() declaration: const Direction = enum({ North, South, East, West })
+          if (decl.init.type === 'CallExpression' && decl.init.callee?.name === 'enum') {
+            const objArg = decl.init.arguments?.[0];
+            if (objArg?.type === 'ObjectExpression') {
+              const variants = new Map();
+              let autoVal = 0;
+              let underlyingType = TYPES.isize; // default underlying type
+              for (const prop of objArg.properties) {
+                const variantName = prop.key?.name ?? prop.key?.value;
+                if (!variantName) continue;
+                let value, vtype;
+                const propVal = prop.value;
+                if (propVal?.type === 'CallExpression' && CAST_TYPES.has(propVal.callee?.name)) {
+                  // Valued: { OK: isize(200) }
+                  const callee = propVal.callee.name;
+                  const arg = propVal.arguments?.[0];
+                  const argVal = arg?.type === 'Literal' ? Number(arg.value) : autoVal;
+                  vtype = TYPES[callee];
+                  underlyingType = vtype;
+                  value = argVal;
+                  autoVal = argVal + 1;
+                } else if (propVal?.type === 'AssignmentPattern' &&
+                           propVal.right?.type === 'CallExpression' &&
+                           CAST_TYPES.has(propVal.right.callee?.name)) {
+                  // Shorthand default: { OK = isize(200) } — acorn produces AssignmentPattern
+                  const callee = propVal.right.callee.name;
+                  const arg = propVal.right.arguments?.[0];
+                  const argVal = arg?.type === 'Literal' ? Number(arg.value) : autoVal;
+                  vtype = TYPES[callee];
+                  underlyingType = vtype;
+                  value = argVal;
+                  autoVal = argVal + 1;
+                } else {
+                  // Shorthand: { North } — auto-assign
+                  value = autoVal++;
+                  vtype = underlyingType;
+                }
+                variants.set(variantName, { value, type: vtype });
+              }
+              const enumDescriptor = {
+                kind: 'enumDescriptor',
+                name: decl.id?.name ?? '<enum>',
+                underlyingType,
+                variants,
+              };
+              decl._type = enumDescriptor;
+              decl.init._enumInfo = enumDescriptor;
+              if (decl.id?.name) {
+                if (stmt.kind === 'const') {
+                  scope.defineConst(decl.id.name, enumDescriptor);
+                } else {
+                  scope.define(decl.id.name, enumDescriptor);
+                }
+              }
+              continue;
+            }
+          }
           const t = inferExpr(decl.init, scope, signatures, classes, filename, ctx);
           decl._type = t;
           if (decl.id?.name) {
@@ -520,6 +577,31 @@ function inferStatement(stmt, scope, signatures, classes, filename, ctx) {
       const discType = inferExpr(stmt.discriminant, scope, signatures, classes, filename, ctx);
       const discName = stmt.discriminant?.name;
 
+      // Infer all case tests first (needed for _enumVariant annotation)
+      for (const c of stmt.cases) {
+        if (c.test) inferExpr(c.test, scope, signatures, classes, filename, ctx);
+      }
+      // CE-CF03: enum switch must be exhaustive (detect via case test _enumVariant)
+      const firstEnumCase = stmt.cases.find(c => c.test?._enumVariant !== undefined);
+      if (firstEnumCase) {
+        const enumInScope = scope.lookup(firstEnumCase.test?.object?.name);
+        if (enumInScope?.kind === 'enumDescriptor') {
+          const hasDefault = stmt.cases.some(c => !c.test);
+          if (!hasDefault) {
+            const coveredVariants = new Set(
+              stmt.cases.filter(c => c.test?._enumVariant !== undefined)
+                        .map(c => c.test.property?.name)
+            );
+            for (const [variantName] of enumInScope.variants) {
+              if (!coveredVariants.has(variantName)) {
+                throw ceErr('CE-CF03',
+                  `non-exhaustive switch on enum '${enumInScope.name}': variant '${variantName}' not covered`,
+                  stmt, filename);
+              }
+            }
+          }
+        }
+      }
       // CE-CF07: sealed union switch must be exhaustive (no default allowed either)
       if (discType?.kind === 'class') {
         const sealedInfo = classes.get(discType.name);
@@ -831,6 +913,60 @@ function collectReturnTypes(node, out, scope, signatures, classes, filename, ctx
     case 'VariableDeclaration':
       for (const decl of node.declarations) {
         if (decl.init) {
+          // Enum declarations are compile-time only — share logic with inferStatement
+          if (decl.init.type === 'CallExpression' && decl.init.callee?.name === 'enum') {
+            const objArg = decl.init.arguments?.[0];
+            if (objArg?.type === 'ObjectExpression') {
+              const variants = new Map();
+              let autoVal = 0;
+              let underlyingType = TYPES.isize;
+              for (const prop of objArg.properties) {
+                const variantName = prop.key?.name ?? prop.key?.value;
+                if (!variantName) continue;
+                let value, vtype;
+                const propVal = prop.value;
+                if (propVal?.type === 'CallExpression' && CAST_TYPES.has(propVal.callee?.name)) {
+                  const callee = propVal.callee.name;
+                  const arg = propVal.arguments?.[0];
+                  const argVal = arg?.type === 'Literal' ? Number(arg.value) : autoVal;
+                  vtype = TYPES[callee];
+                  underlyingType = vtype;
+                  value = argVal;
+                  autoVal = argVal + 1;
+                } else if (propVal?.type === 'AssignmentPattern' &&
+                           propVal.right?.type === 'CallExpression' &&
+                           CAST_TYPES.has(propVal.right.callee?.name)) {
+                  const callee = propVal.right.callee.name;
+                  const arg = propVal.right.arguments?.[0];
+                  const argVal = arg?.type === 'Literal' ? Number(arg.value) : autoVal;
+                  vtype = TYPES[callee];
+                  underlyingType = vtype;
+                  value = argVal;
+                  autoVal = argVal + 1;
+                } else {
+                  value = autoVal++;
+                  vtype = underlyingType;
+                }
+                variants.set(variantName, { value, type: vtype });
+              }
+              const enumDescriptor = {
+                kind: 'enumDescriptor',
+                name: decl.id?.name ?? '<enum>',
+                underlyingType,
+                variants,
+              };
+              decl._type = enumDescriptor;
+              decl.init._enumInfo = enumDescriptor;
+              if (decl.id?.name) {
+                if (node.kind === 'const') {
+                  scope.defineConst(decl.id.name, enumDescriptor);
+                } else {
+                  scope.define(decl.id.name, enumDescriptor);
+                }
+              }
+              continue;
+            }
+          }
           const t = inferExpr(decl.init, scope, signatures, classes, filename, ctx);
           decl._type = t;
           if (decl.id?.name) {
@@ -931,6 +1067,32 @@ function collectReturnTypes(node, out, scope, signatures, classes, filename, ctx
     case 'SwitchStatement': {
       const discType = inferExpr(node.discriminant, scope, signatures, classes, filename, ctx);
       const discName = node.discriminant?.name;
+      // Infer all case tests first (needed for _enumVariant and exhaustiveness checks)
+      for (const c of node.cases) {
+        if (c.test) inferExpr(c.test, scope, signatures, classes, filename, ctx);
+      }
+      // CE-CF03: enum switch must be exhaustive
+      // Detect enum switch by checking if any case test has _enumVariant (discriminant is isize, not enumDescriptor)
+      const firstEnumCase = node.cases.find(c => c.test?._enumVariant !== undefined);
+      if (firstEnumCase) {
+        const enumInScope = scope.lookup(firstEnumCase.test?.object?.name);
+        if (enumInScope?.kind === 'enumDescriptor') {
+          const hasDefault = node.cases.some(c => !c.test);
+          if (!hasDefault) {
+            const coveredVariants = new Set(
+              node.cases.filter(c => c.test?._enumVariant !== undefined)
+                        .map(c => c.test.property?.name)
+            );
+            for (const [variantName] of enumInScope.variants) {
+              if (!coveredVariants.has(variantName)) {
+                throw ceErr('CE-CF03',
+                  `non-exhaustive switch on enum '${enumInScope.name}': variant '${variantName}' not covered`,
+                  node, filename);
+              }
+            }
+          }
+        }
+      }
       // CE-CF07: sealed union switch must be exhaustive
       if (discType?.kind === 'class') {
         const sealedInfo = classes.get(discType.name);
@@ -1248,6 +1410,26 @@ function inferExpr(node, scope, signatures, classes, filename, ctx) {
           t = TYPES.usize; break;
         }
         const objType = inferExpr(node.object, scope, signatures, classes, filename, ctx);
+        // Enum variant access: Direction.North → underlying primitive type
+        if (objType?.kind === 'enumDescriptor' && !node.computed) {
+          const variantName = node.property?.name;
+          const variant = objType.variants?.get(variantName);
+          if (variant) {
+            node._enumVariant = variant;
+            t = variant.type;
+            break;
+          }
+          t = TYPES.void;
+          break;
+        }
+        // .value accessor on a primitive — enum variant no-op: Direction.North.value
+        if (!node.computed && node.property?.name === 'value' && objType &&
+            objType.kind !== 'class' && objType.kind !== 'enumDescriptor' &&
+            objType !== TYPES.void && objType !== TYPES.unknown && objType !== TYPES.str) {
+          node._enumValueNoOp = true;
+          t = objType;
+          break;
+        }
         if (node.computed && objType?.kind === 'array') {
           inferExpr(node.property, scope, signatures, classes, filename, ctx);
           t = TYPES.isize;

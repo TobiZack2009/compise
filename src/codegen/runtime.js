@@ -362,6 +362,357 @@ export function buildStringFunctions(mod) {
     binaryen.createType([i32]), i32,
     [i32, i32, i32, i32, i32, i32], body);
 
+  // ── __jswat_string_from_u32(n: i32) -> i32 ──────────────────────────────────
+  // Formats unsigned i32 as decimal. Same algorithm as i32 but no sign handling.
+  // params: n(0:i32); locals: tmp(1:i32), len(2:i32), ptr(3:i32), wr(4:i32)
+  {
+    const gN   = () => mod.local.get(0, i32);
+    const gTmp = () => mod.local.get(1, i32);
+    const gLen = () => mod.local.get(2, i32);
+    const gPtr = () => mod.local.get(3, i32);
+    const gWr  = () => mod.local.get(4, i32);
+    const u32body = mod.block(null, [
+      mod.if(
+        mod.i32.eqz(gN()),
+        mod.local.set(2, mod.i32.const(1)),
+        mod.block(null, [
+          mod.local.set(2, mod.i32.const(0)),
+          mod.local.set(1, gN()),
+          mod.block('u32cd', [
+            mod.loop('u32cl', mod.block(null, [
+              mod.br_if('u32cd', mod.i32.eqz(gTmp())),
+              mod.local.set(1, mod.i32.div_u(gTmp(), mod.i32.const(10))),
+              mod.local.set(2, mod.i32.add(gLen(), mod.i32.const(1))),
+              mod.br('u32cl'),
+            ], none)),
+          ], none),
+        ], none)
+      ),
+      mod.local.set(3, mod.call('__jswat_alloc_bytes', [gLen(), mod.i32.const(0)], i32)),
+      mod.local.set(4, mod.i32.sub(mod.i32.add(gPtr(), gLen()), mod.i32.const(1))),
+      mod.if(
+        mod.i32.eqz(gN()),
+        mod.i32.store8(0, 0, gWr(), mod.i32.const(48)),
+        mod.block(null, [
+          mod.local.set(1, gN()),
+          mod.block('u32wd', [
+            mod.loop('u32wl', mod.block(null, [
+              mod.br_if('u32wd', mod.i32.eqz(gTmp())),
+              mod.i32.store8(0, 0, gWr(),
+                mod.i32.add(mod.i32.rem_u(gTmp(), mod.i32.const(10)), mod.i32.const(48))),
+              mod.local.set(4, mod.i32.sub(gWr(), mod.i32.const(1))),
+              mod.local.set(1, mod.i32.div_u(gTmp(), mod.i32.const(10))),
+              mod.br('u32wl'),
+            ], none)),
+          ], none),
+        ], none)
+      ),
+      mod.global.set('__str_len_out', gLen()),
+      mod.return(gPtr()),
+    ], i32);
+    mod.addFunction('__jswat_string_from_u32',
+      binaryen.createType([i32]), i32, [i32, i32, i32, i32], u32body);
+  }
+
+  // ── __jswat_string_from_bool(n: i32) -> i32 ─────────────────────────────────
+  // 0 → "false", nonzero → "true"
+  // params: n(0:i32); locals: ptr(1:i32)
+  {
+    const gN   = () => mod.local.get(0, i32);
+    const gPtr = () => mod.local.get(1, i32);
+    const boolBody = mod.block(null, [
+      mod.if(
+        mod.i32.eqz(gN()),
+        // false: 'f','a','l','s','e'
+        mod.block(null, [
+          mod.local.set(1, mod.call('__jswat_alloc_bytes', [mod.i32.const(5), mod.i32.const(0)], i32)),
+          mod.i32.store8(0, 0, gPtr(), mod.i32.const(102)),
+          mod.i32.store8(1, 0, gPtr(), mod.i32.const(97)),
+          mod.i32.store8(2, 0, gPtr(), mod.i32.const(108)),
+          mod.i32.store8(3, 0, gPtr(), mod.i32.const(115)),
+          mod.i32.store8(4, 0, gPtr(), mod.i32.const(101)),
+          mod.global.set('__str_len_out', mod.i32.const(5)),
+          mod.return(gPtr()),
+        ], none),
+      ),
+      // true: 't','r','u','e'
+      mod.local.set(1, mod.call('__jswat_alloc_bytes', [mod.i32.const(4), mod.i32.const(0)], i32)),
+      mod.i32.store8(0, 0, gPtr(), mod.i32.const(116)),
+      mod.i32.store8(1, 0, gPtr(), mod.i32.const(114)),
+      mod.i32.store8(2, 0, gPtr(), mod.i32.const(117)),
+      mod.i32.store8(3, 0, gPtr(), mod.i32.const(101)),
+      mod.global.set('__str_len_out', mod.i32.const(4)),
+      mod.return(gPtr()),
+    ], i32);
+    mod.addFunction('__jswat_string_from_bool',
+      binaryen.createType([i32]), i32, [i32], boolBody);
+  }
+
+  // ── __jswat_string_from_i64(n: i64) -> i32 ──────────────────────────────────
+  // Formats signed i64 as decimal string.
+  // params: n(0:i64); locals: isNeg(1:i32), abs(2:i64), tmp(3:i64), len(4:i32), ptr(5:i32), wr(6:i32)
+  {
+    const gN     = () => mod.local.get(0, i64);
+    const gIsNeg = () => mod.local.get(1, i32);
+    const gAbs   = () => mod.local.get(2, i64);
+    const gTmp   = () => mod.local.get(3, i64);
+    const gLen   = () => mod.local.get(4, i32);
+    const gPtr   = () => mod.local.get(5, i32);
+    const gWr    = () => mod.local.get(6, i32);
+    const z64 = () => mod.i64.const(0, 0);
+    const t64 = () => mod.i64.const(10, 0);
+    const i64body = mod.block(null, [
+      // isNeg = n < 0; abs = isNeg ? -n : n
+      mod.local.set(1, mod.i64.lt_s(gN(), z64())),
+      mod.if(
+        gIsNeg(),
+        mod.local.set(2, mod.i64.sub(z64(), gN())),
+        mod.local.set(2, gN()),
+      ),
+      // Count digits
+      mod.if(
+        mod.i64.eqz(gAbs()),
+        mod.local.set(4, mod.i32.const(1)),
+        mod.block(null, [
+          mod.local.set(4, mod.i32.const(0)),
+          mod.local.set(3, gAbs()),
+          mod.block('i64cd', [
+            mod.loop('i64cl', mod.block(null, [
+              mod.br_if('i64cd', mod.i64.eqz(gTmp())),
+              mod.local.set(3, mod.i64.div_u(gTmp(), t64())),
+              mod.local.set(4, mod.i32.add(gLen(), mod.i32.const(1))),
+              mod.br('i64cl'),
+            ], none)),
+          ], none),
+        ], none)
+      ),
+      mod.if(gIsNeg(), mod.local.set(4, mod.i32.add(gLen(), mod.i32.const(1)))),
+      mod.local.set(5, mod.call('__jswat_alloc_bytes', [gLen(), mod.i32.const(0)], i32)),
+      mod.local.set(6, mod.i32.sub(mod.i32.add(gPtr(), gLen()), mod.i32.const(1))),
+      mod.if(
+        mod.i64.eqz(gAbs()),
+        mod.i32.store8(0, 0, gWr(), mod.i32.const(48)),
+        mod.block(null, [
+          mod.local.set(3, gAbs()),
+          mod.block('i64wd', [
+            mod.loop('i64wl', mod.block(null, [
+              mod.br_if('i64wd', mod.i64.eqz(gTmp())),
+              mod.i32.store8(0, 0, gWr(),
+                mod.i32.add(mod.i32.wrap(mod.i64.rem_u(gTmp(), t64())), mod.i32.const(48))),
+              mod.local.set(6, mod.i32.sub(gWr(), mod.i32.const(1))),
+              mod.local.set(3, mod.i64.div_u(gTmp(), t64())),
+              mod.br('i64wl'),
+            ], none)),
+          ], none),
+        ], none)
+      ),
+      mod.if(gIsNeg(), mod.i32.store8(0, 0, gPtr(), mod.i32.const(45))),
+      mod.global.set('__str_len_out', gLen()),
+      mod.return(gPtr()),
+    ], i32);
+    mod.addFunction('__jswat_string_from_i64',
+      binaryen.createType([i64]), i32, [i32, i64, i64, i32, i32, i32], i64body);
+  }
+
+  // ── __jswat_string_from_u64(n: i64) -> i32 ──────────────────────────────────
+  // Formats unsigned i64 as decimal string (treats parameter as u64).
+  // params: n(0:i64); locals: tmp(1:i64), len(2:i32), ptr(3:i32), wr(4:i32)
+  {
+    const gN   = () => mod.local.get(0, i64);
+    const gTmp = () => mod.local.get(1, i64);
+    const gLen = () => mod.local.get(2, i32);
+    const gPtr = () => mod.local.get(3, i32);
+    const gWr  = () => mod.local.get(4, i32);
+    const t64 = () => mod.i64.const(10, 0);
+    const u64body = mod.block(null, [
+      mod.if(
+        mod.i64.eqz(gN()),
+        mod.local.set(2, mod.i32.const(1)),
+        mod.block(null, [
+          mod.local.set(2, mod.i32.const(0)),
+          mod.local.set(1, gN()),
+          mod.block('u64cd', [
+            mod.loop('u64cl', mod.block(null, [
+              mod.br_if('u64cd', mod.i64.eqz(gTmp())),
+              mod.local.set(1, mod.i64.div_u(gTmp(), t64())),
+              mod.local.set(2, mod.i32.add(gLen(), mod.i32.const(1))),
+              mod.br('u64cl'),
+            ], none)),
+          ], none),
+        ], none)
+      ),
+      mod.local.set(3, mod.call('__jswat_alloc_bytes', [gLen(), mod.i32.const(0)], i32)),
+      mod.local.set(4, mod.i32.sub(mod.i32.add(gPtr(), gLen()), mod.i32.const(1))),
+      mod.if(
+        mod.i64.eqz(gN()),
+        mod.i32.store8(0, 0, gWr(), mod.i32.const(48)),
+        mod.block(null, [
+          mod.local.set(1, gN()),
+          mod.block('u64wd', [
+            mod.loop('u64wl', mod.block(null, [
+              mod.br_if('u64wd', mod.i64.eqz(gTmp())),
+              mod.i32.store8(0, 0, gWr(),
+                mod.i32.add(mod.i32.wrap(mod.i64.rem_u(gTmp(), t64())), mod.i32.const(48))),
+              mod.local.set(4, mod.i32.sub(gWr(), mod.i32.const(1))),
+              mod.local.set(1, mod.i64.div_u(gTmp(), t64())),
+              mod.br('u64wl'),
+            ], none)),
+          ], none),
+        ], none)
+      ),
+      mod.global.set('__str_len_out', gLen()),
+      mod.return(gPtr()),
+    ], i32);
+    mod.addFunction('__jswat_string_from_u64',
+      binaryen.createType([i64]), i32, [i64, i32, i32, i32], u64body);
+  }
+
+  // ── __jswat_string_from_f64(n: f64) -> i32 ──────────────────────────────────
+  // Formats f64 as decimal string (up to 6 fractional digits, trailing zeros trimmed).
+  // Handles NaN, +/-Infinity. Limitation: very large values (>9.2e18) may trap.
+  // params: n(0:f64); locals: ptr(1:i32), wr(2:i32), intPart(3:i64), fracInt(4:i64),
+  //         tmp64(5:i64), intStart(6:i32), i(7:i32), j(8:i32), tmp8(9:i32)
+  {
+    const gN        = () => mod.local.get(0, f64);
+    const gPtr      = () => mod.local.get(1, i32);
+    const gWr       = () => mod.local.get(2, i32);
+    const gInt      = () => mod.local.get(3, i64);
+    const gFrac     = () => mod.local.get(4, i64);
+    const gTmp64    = () => mod.local.get(5, i64);
+    const gIntStart = () => mod.local.get(6, i32);
+    const gI        = () => mod.local.get(7, i32);
+    const gJ        = () => mod.local.get(8, i32);
+    const gTmp8     = () => mod.local.get(9, i32);
+    const t64  = () => mod.i64.const(10, 0);
+    const z64  = () => mod.i64.const(0, 0);
+    const m64  = () => mod.i64.const(1000000, 0);
+    const adv  = () => mod.local.set(2, mod.i32.add(gWr(), mod.i32.const(1)));
+    // Reverse bytes in [gIntStart, gWr) using gI, gJ, gTmp8
+    const reversal = (sL, lL) => mod.block(sL, [
+      mod.local.set(7, gIntStart()),
+      mod.local.set(8, mod.i32.sub(gWr(), mod.i32.const(1))),
+      mod.loop(lL, mod.block(null, [
+        mod.br_if(sL, mod.i32.ge_s(gI(), gJ())),
+        mod.local.set(9, mod.i32.load8_u(0, 0, gI())),
+        mod.i32.store8(0, 0, gI(), mod.i32.load8_u(0, 0, gJ())),
+        mod.i32.store8(0, 0, gJ(), gTmp8()),
+        mod.local.set(7, mod.i32.add(gI(), mod.i32.const(1))),
+        mod.local.set(8, mod.i32.sub(gJ(), mod.i32.const(1))),
+        mod.br(lL),
+      ], none)),
+    ], none);
+
+    const f64body = mod.block(null, [
+      mod.local.set(1, mod.call('__jswat_alloc_bytes', [mod.i32.const(28), mod.i32.const(0)], i32)),
+      mod.local.set(2, gPtr()),
+      // NaN: n != n
+      mod.if(mod.f64.ne(gN(), gN()), mod.block(null, [
+        mod.i32.store8(0, 0, gWr(), mod.i32.const(78)),  // N
+        mod.i32.store8(1, 0, gWr(), mod.i32.const(97)),  // a
+        mod.i32.store8(2, 0, gWr(), mod.i32.const(78)),  // N
+        mod.global.set('__str_len_out', mod.i32.const(3)),
+        mod.return(gPtr()),
+      ], none)),
+      // +Infinity
+      mod.if(mod.f64.gt(gN(), mod.f64.const(1.7976931348623157e308)), mod.block(null, [
+        mod.i32.store8(0, 0, gWr(), mod.i32.const(73)),   // I
+        mod.i32.store8(1, 0, gWr(), mod.i32.const(110)),  // n
+        mod.i32.store8(2, 0, gWr(), mod.i32.const(102)),  // f
+        mod.i32.store8(3, 0, gWr(), mod.i32.const(105)),  // i
+        mod.i32.store8(4, 0, gWr(), mod.i32.const(110)),  // n
+        mod.i32.store8(5, 0, gWr(), mod.i32.const(105)),  // i
+        mod.i32.store8(6, 0, gWr(), mod.i32.const(116)),  // t
+        mod.i32.store8(7, 0, gWr(), mod.i32.const(121)),  // y
+        mod.global.set('__str_len_out', mod.i32.const(8)),
+        mod.return(gPtr()),
+      ], none)),
+      // -Infinity
+      mod.if(mod.f64.lt(gN(), mod.f64.const(-1.7976931348623157e308)), mod.block(null, [
+        mod.i32.store8(0, 0, gWr(), mod.i32.const(45)),   // -
+        mod.i32.store8(1, 0, gWr(), mod.i32.const(73)),   // I
+        mod.i32.store8(2, 0, gWr(), mod.i32.const(110)),  // n
+        mod.i32.store8(3, 0, gWr(), mod.i32.const(102)),  // f
+        mod.i32.store8(4, 0, gWr(), mod.i32.const(105)),  // i
+        mod.i32.store8(5, 0, gWr(), mod.i32.const(110)),  // n
+        mod.i32.store8(6, 0, gWr(), mod.i32.const(105)),  // i
+        mod.i32.store8(7, 0, gWr(), mod.i32.const(116)),  // t
+        mod.i32.store8(8, 0, gWr(), mod.i32.const(121)),  // y
+        mod.global.set('__str_len_out', mod.i32.const(9)),
+        mod.return(gPtr()),
+      ], none)),
+      // Sign
+      mod.if(mod.f64.lt(gN(), mod.f64.const(0.0)), mod.block(null, [
+        mod.i32.store8(0, 0, gWr(), mod.i32.const(45)),  // '-'
+        adv(),
+        mod.local.set(0, mod.f64.neg(gN())),
+      ], none)),
+      // intPart = i64(floor(n))
+      mod.local.set(3, mod.i64.trunc_s.f64(mod.f64.floor(gN()))),
+      // fracInt = round((n - f64(intPart)) * 1e6)
+      mod.local.set(4, mod.i64.trunc_s.f64(
+        mod.f64.add(
+          mod.f64.mul(mod.f64.sub(gN(), mod.f64.convert_s.i64(gInt())), mod.f64.const(1000000.0)),
+          mod.f64.const(0.5)
+        )
+      )),
+      // Carry if fracInt >= 1e6
+      mod.if(mod.i64.ge_u(gFrac(), m64()), mod.block(null, [
+        mod.local.set(3, mod.i64.add(gInt(), mod.i64.const(1, 0))),
+        mod.local.set(4, z64()),
+      ], none)),
+      // Write integer digits LSB-first then reverse
+      mod.local.set(6, gWr()),
+      mod.if(
+        mod.i64.eqz(gInt()),
+        mod.block(null, [mod.i32.store8(0, 0, gWr(), mod.i32.const(48)), adv()], none),
+        mod.block(null, [
+          mod.local.set(5, gInt()),
+          mod.block('f64id', [mod.loop('f64il', mod.block(null, [
+            mod.br_if('f64id', mod.i64.eqz(gTmp64())),
+            mod.i32.store8(0, 0, gWr(),
+              mod.i32.add(mod.i32.wrap(mod.i64.rem_u(gTmp64(), t64())), mod.i32.const(48))),
+            adv(),
+            mod.local.set(5, mod.i64.div_u(gTmp64(), t64())),
+            mod.br('f64il'),
+          ], none))], none),
+        ], none)
+      ),
+      reversal('f64rv', 'f64rl'),
+      // Write fractional part if nonzero
+      mod.if(mod.i64.gt_u(gFrac(), z64()), mod.block(null, [
+        mod.i32.store8(0, 0, gWr(), mod.i32.const(46)),  // '.'
+        adv(),
+        mod.local.set(6, gWr()),  // fracStart (for trailing-zero trim)
+        // Write 6 digits MSB-first: div starts at 100000 and halves each step
+        mod.local.set(5, mod.i64.const(100000, 0)),
+        mod.block('f64fd', [mod.loop('f64fl', mod.block(null, [
+          mod.br_if('f64fd', mod.i64.eqz(gTmp64())),
+          mod.i32.store8(0, 0, gWr(),
+            mod.i32.add(mod.i32.wrap(mod.i64.div_u(gFrac(), gTmp64())), mod.i32.const(48))),
+          adv(),
+          mod.local.set(4, mod.i64.rem_u(gFrac(), gTmp64())),
+          mod.local.set(5, mod.i64.div_u(gTmp64(), t64())),
+          mod.br('f64fl'),
+        ], none))], none),
+        // Trim trailing zeros
+        mod.block('f64tz', [mod.loop('f64tl', mod.block(null, [
+          mod.br_if('f64tz', mod.i32.le_s(gWr(), gIntStart())),
+          mod.br_if('f64tz', mod.i32.ne(
+            mod.i32.load8_u(0, 0, mod.i32.sub(gWr(), mod.i32.const(1))),
+            mod.i32.const(48)
+          )),
+          mod.local.set(2, mod.i32.sub(gWr(), mod.i32.const(1))),
+          mod.br('f64tl'),
+        ], none))], none),
+      ], none)),
+      mod.global.set('__str_len_out', mod.i32.sub(gWr(), gPtr())),
+      mod.return(gPtr()),
+    ], i32);
+    mod.addFunction('__jswat_string_from_f64',
+      binaryen.createType([f64]), i32,
+      [i32, i32, i64, i64, i64, i32, i32, i32, i32], f64body);
+  }
+
   // __jswat_str_length(ptr:i32, len:i32) -> i32  — just return the len param
   mod.addFunction('__jswat_str_length',
     binaryen.createType([i32, i32]), i32, [],

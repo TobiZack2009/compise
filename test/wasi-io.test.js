@@ -51,4 +51,41 @@ describe('std/io with WASI', function() {
     const out = run(source, { input: 'Echo test' });
     assert.ok(out.includes('Echo test'), `expected echo, got: ${out}`);
   });
+
+  it('console.log(i32) prints signed integer', function() {
+    const out = run('import { console } from "std/io"; console.log(-42);');
+    assert.ok(out.trim() === '-42', `expected -42, got: ${out.trim()}`);
+  });
+
+  it('console.log(u32) prints unsigned integer', function() {
+    const out = run('import { console } from "std/io"; console.log(u32(4294967295));');
+    assert.ok(out.trim() === '4294967295', `expected 4294967295, got: ${out.trim()}`);
+  });
+
+  it('console.log(i64) prints 64-bit integer', function() {
+    const out = run('import { console } from "std/io"; console.log(i64(9007199254740993));');
+    assert.ok(out.trim() === '9007199254740993', `expected 9007199254740993, got: ${out.trim()}`);
+  });
+
+  it('console.log(f64) prints float', function() {
+    const out = run('import { console } from "std/io"; console.log(3.14);');
+    assert.ok(out.trim() === '3.14', `expected 3.14, got: ${out.trim()}`);
+  });
+
+  it('console.log(f64) trims trailing zeros', function() {
+    const out = run('import { console } from "std/io"; console.log(1.5);');
+    assert.ok(out.trim() === '1.5', `expected 1.5, got: ${out.trim()}`);
+  });
+
+  it('console.log(f64) prints integer-valued floats without decimal', function() {
+    const out = run('import { console } from "std/io"; console.log(f64(42));');
+    assert.ok(out.trim() === '42', `expected 42, got: ${out.trim()}`);
+  });
+
+  it('console.log(bool) prints true/false', function() {
+    const out1 = run('import { console } from "std/io"; console.log(true);');
+    const out2 = run('import { console } from "std/io"; console.log(false);');
+    assert.ok(out1.trim() === 'true', `expected true, got: ${out1.trim()}`);
+    assert.ok(out2.trim() === 'false', `expected false, got: ${out2.trim()}`);
+  });
 });
